@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PortalControl</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2330; --line: #2b3442; --text: #e6edf3;
+    --muted: #8b98a8; --accent: #4c9aff; --green: #3fb950; --amber: #d29922; --red: #f85149;
+    --blue: #58a6ff; --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 14px/1.45 system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--accent); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; flex: 1; }
+  .chip { font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--line);
+    padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .chip b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--green); } .dot.off { background: var(--red); }
+  button { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line);
+    padding: 5px 11px; border-radius: 6px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.danger { color: var(--red); }
+  button.danger.armed { background: var(--red); color: #fff; border-color: var(--red); }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  main { flex: 1; overflow: auto; padding: 18px 20px; min-height: 120px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+    display: flex; flex-direction: column; gap: 10px; }
+  .card.selected { border-color: var(--accent); }
+  .card h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .card h2 .mode { font-size: 10px; color: var(--muted); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; }
+  .path { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  .path b { color: var(--text); font-weight: 500; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; border: 1px solid transparent; letter-spacing: .3px; }
+  .b-green { color: var(--green); border-color: #238636; background: #12261a; }
+  .b-amber { color: var(--amber); border-color: #9e6a03; background: #2a2110; }
+  .b-red { color: var(--red); border-color: #da3633; background: #2d1416; }
+  .b-blue { color: var(--blue); border-color: #1f6feb; background: #101e33; }
+  .b-grey { color: var(--muted); border-color: var(--line); background: var(--panel2); }
+  .pulse { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  .facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; }
+  .facts dt { color: var(--muted); } .facts dd { margin: 0; word-break: break-word; }
+  .facts code { font-family: var(--mono); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+  #console { height: 34vh; min-height: 160px; border-top: 1px solid var(--line); background: #090c10;
+    display: flex; flex-direction: column; }
+  #console .bar { display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: var(--panel);
+    border-bottom: 1px solid var(--line); font-size: 12px; }
+  #console .bar .title { font-weight: 600; flex: 1; }
+  #term { flex: 1; overflow: auto; margin: 0; padding: 10px 14px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all; }
+  #term .stderr { color: #ffa198; } #term .system { color: var(--blue); }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+    padding: 0; width: min(640px, 94vw); max-height: 88vh; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog .head { padding: 14px 18px; border-bottom: 1px solid var(--line); font-weight: 600; display: flex; }
+  dialog .head span { flex: 1; }
+  dialog .body { padding: 16px 18px; overflow: auto; max-height: 66vh; }
+  dialog .foot { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=number], select { width: 100%; font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--text); font-size: 13px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .err { color: var(--red); font-size: 12px; flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td code { font-family: var(--mono); }
+  h3 { font-size: 13px; margin: 16px 0 8px; } h3:first-child { margin-top: 0; }
+  #toast { position: fixed; right: 18px; top: 14px; background: var(--panel2); border: 1px solid var(--line);
+    padding: 9px 14px; border-radius: 8px; display: none; max-width: 420px; z-index: 10; }
+  #toast.bad { border-color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Portal<span>Control</span></h1>
+  <div class="chips" id="chips"></div>
+  <button class="primary" id="btn-add">+ Add target</button>
+</header>
+
+<main><div class="grid" id="grid"></div></main>
+
+<section id="console">
+  <div class="bar">
+    <span class="title" id="term-title">Console &mdash; select a target</span>
+    <label class="check" style="margin:0"><input type="checkbox" id="autoscroll" checked> follow</label>
+    <button class="small" id="btn-clear">Clear</button>
+  </div>
+  <pre id="term"></pre>
+</section>
+
+<dialog id="dlg-target">
+  <form method="dialog" id="form-target">
+    <div class="head"><span id="dlg-target-title">Add target</span></div>
+    <div class="body">
+      <label for="f-name">Name</label>
+      <input type="text" id="f-name" required maxlength="100" placeholder="Claims Portal">
+      <label for="f-dir">Working directory (absolute path on this machine)</label>
+      <input type="text" id="f-dir" required placeholder="C:\Users\ICT\Projects\claims_portal  or  /Users/ict/projects/claims_portal">
+      <div class="row">
+        <div>
+          <label for="f-script">Script (inside the directory)</label>
+          <input type="text" id="f-script" required placeholder="deploy.bat / deploy.sh">
+        </div>
+        <div>
+          <label for="f-branch">Git branch to track</label>
+          <input type="text" id="f-branch" placeholder="main">
+        </div>
+      </div>
+      <label for="f-health">Health URL (optional)</label>
+      <input type="text" id="f-health" placeholder="http://127.0.0.1:8000/">
+      <div class="row">
+        <div>
+          <label for="f-mode">Run mode</label>
+          <select id="f-mode">
+            <option value="TASK">Task &mdash; runs to completion, killed at timeout</option>
+            <option value="SERVICE">Service &mdash; long-running, stays up until stopped</option>
+          </select>
+        </div>
+        <div>
+          <label for="f-timeout">Task timeout (seconds)</label>
+          <input type="number" id="f-timeout" min="1" max="86400" value="300">
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" id="f-autostart"> Start this target automatically when PortalControl starts</label>
+    </div>
+    <div class="foot">
+      <span class="err" id="form-err"></span>
+      <button type="button" id="btn-cancel">Cancel</button>
+      <button type="submit" class="primary" id="btn-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-info">
+  <div class="head"><span id="info-title"></span><button class="small" id="btn-info-close">Close</button></div>
+  <div class="body" id="info-body"></div>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const MAX_LINES = 3000;
+let targets = [];
+let selected = null;
+let editingId = null;
+let ws = null, wsUp = false, refreshTimer = null, sys = null;
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "disabled") el.disabled = true;
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = bad ? "bad" : "";
+  t.style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.style.display = "none"), bad ? 6000 : 2500);
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text }; }
+  if (!res.ok) throw new Error((data && data.error) || res.status + " " + res.statusText);
+  return data;
+}
+
+async function act(fn, okMsg) {
+  try { await fn(); if (okMsg) toast(okMsg); } catch (e) { toast(e.message, true); }
+  scheduleRefresh(50);
+}
+
+function fmtDuration(ms) {
+  if (ms === null || ms === undefined) return "-";
+  if (ms < 1000) return ms + " ms";
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + " s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+}
+function fmtUptime(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+}
+const short = (sha) => (sha ? sha.slice(0, 8) : "-");
+
+function badge(text, cls, title, pulse) {
+  return h("span", { class: "badge " + cls + (pulse ? " pulse" : ""), title }, text);
+}
+
+function healthBadge(t) {
+  if (!t.health_url) return badge("NO PROBE", "b-grey", "No health URL configured");
+  const x = t.health;
+  if (!x) return badge("CHECKING", "b-grey", t.health_url);
+  const cls = { LIVE: "b-green", SLOW: "b-amber", DOWN: "b-red" }[x.status] || "b-grey";
+  const tip = [t.health_url, x.http_status ? "HTTP " + x.http_status : null,
+    x.latency_ms !== null ? x.latency_ms + " ms" : null, x.detail, "checked " + x.checked_at + " UTC"]
+    .filter(Boolean).join(" | ");
+  return badge(x.status + (x.latency_ms !== null && x.status !== "DOWN" ? " " + x.latency_ms + "ms" : ""), cls, tip);
+}
+
+function gitBadge(t) {
+  const g = t.git;
+  if (!g) return badge("GIT ...", "b-grey", "Inspecting repository");
+  if (!g.is_repo) return badge("NOT A REPO", "b-grey", g.error || "No .git directory in the working directory");
+  const cls = { UP_TO_DATE: "b-green", UPDATES_AVAILABLE: "b-blue", DIRTY: "b-amber" }[g.status];
+  return badge(g.status.replaceAll("_", " "), cls, "Local HEAD vs origin/" + g.tracked_branch);
+}
+
+function runBadge(t) {
+  if (t.running) return badge("RUNNING", "b-blue", "pid " + t.running.pid, true);
+  if (!t.last_run) return badge("NEVER RUN", "b-grey");
+  return badge("LAST: " + t.last_run.status, t.last_run.status === "SUCCESS" ? "b-green" : "b-red",
+    t.last_run.executed_at + " UTC");
+}
+
+function scanBadge(t) {
+  if (t.scan_running) return badge("SCANNING", "b-blue", "bandit + pip-audit running", true);
+  if (!t.scan) return null;
+  const bad = t.scan.critical_issues_found + t.scan.vulnerable_packages_found;
+  return badge("SEC " + t.scan.critical_issues_found + " crit / " + t.scan.vulnerable_packages_found + " vuln pkg",
+    bad ? "b-red" : "b-green", "Scanned " + t.scan.scanned_at + " UTC");
+}
+
+function facts(t) {
+  const rows = [];
+  const g = t.git;
+  if (g && g.is_repo) {
+    rows.push(["Git", h("span", {},
+      h("code", {}, short(g.head)), " on ", g.checked_out_branch || "detached HEAD",
+      " \u00b7 origin/" + g.tracked_branch + " ", h("code", {}, short(g.remote_head)),
+      " \u00b7 " + g.behind + " behind, " + g.ahead + " ahead",
+      g.dirty_files ? " \u00b7 " + g.dirty_files + " changed file(s)" : "")]);
+    rows.push(["Fetch", g.fetch_error ? "failed: " + g.fetch_error : (g.last_fetch ? g.last_fetch + " UTC" : "pending")]);
+  }
+  if (t.running) rows.push(["Process", "pid " + t.running.pid + " \u00b7 up " + fmtUptime(t.running.uptime_secs)]);
+  else if (t.last_run) rows.push(["Last run", t.last_run.triggered_by + " \u00b7 " + fmtDuration(t.last_run.duration_ms) +
+    (t.last_run.exit_code !== null ? " \u00b7 exit " + t.last_run.exit_code : "")]);
+  if (t.autostart) rows.push(["Autostart", "starts with PortalControl"]);
+  return h("dl", { class: "facts" }, rows.map(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
+}
+
+function card(t) {
+  const del = h("button", { class: "small danger", onclick: (e) => {
+    const b = e.currentTarget;
+    if (!b.classList.contains("armed")) {
+      b.classList.add("armed"); b.textContent = "Confirm delete";
+      setTimeout(() => { b.classList.remove("armed"); b.textContent = "Delete"; }, 3000);
+      return;
+    }
+    act(() => api("DELETE", "/api/targets/" + t.id), "Target deleted");
+    if (selected === t.id) select(null);
+  } }, "Delete");
+
+  return h("div", { class: "card" + (selected === t.id ? " selected" : ""), "data-id": t.id },
+    h("h2", {}, t.name, h("span", { class: "mode" }, t.run_mode)),
+    h("div", { class: "path" }, t.working_directory, " \u279c ", h("b", {}, t.script_name)),
+    h("div", { class: "badges" }, healthBadge(t), gitBadge(t), runBadge(t), scanBadge(t)),
+    facts(t),
+    h("div", { class: "actions" },
+      t.running
+        ? h("button", { class: "small danger", onclick: () => act(() => api("POST", "/api/targets/" + t.id + "/stop"), "Stopping...") }, "Stop")
+        : h("button", { class: "small primary", onclick: () => { select(t.id, true); act(() => api("POST", "/api/targets/" + t.id + "/run"), "Started"); } },
+            t.run_mode === "SERVICE" ? "Start" : "Run"),
+      h("button", { class: "small", onclick: () => select(t.id) }, "Logs"),
+      h("button", { class: "small", disabled: t.scan_running, onclick: () => { select(t.id); act(() => api("POST", "/api/targets/" + t.id + "/scan"), "Security scan started"); } }, "Scan"),
+      t.scan ? h("button", { class: "small", onclick: () => showScan(t) }, "Report") : null,
+      h("button", { class: "small", onclick: () => act(() => api("POST", "/api/targets/" + t.id + "/git/refresh"), "Fetched") }, "Fetch"),
+      h("button", { class: "small", onclick: () => showHistory(t) }, "History"),
+      h("button", { class: "small", onclick: () => openForm(t) }, "Edit"),
+      del));
+}
+
+function render() {
+  const grid = $("grid");
+  if (!targets.length) {
+    grid.replaceChildren(h("div", { class: "empty", style: "grid-column:1/-1" },
+      "No targets registered yet. Use \u201c+ Add target\u201d to point PortalControl at a project directory."));
+  } else {
+    grid.replaceChildren(...targets.map(card));
+  }
+  const chips = $("chips");
+  const c = (label, value) => h("span", { class: "chip" }, label + " ", h("b", {}, value));
+  chips.replaceChildren(
+    h("span", { class: "chip" }, h("span", { class: "dot " + (wsUp ? "on" : "off") }), wsUp ? "live stream" : "reconnecting"),
+    ...(sys ? [c("host", sys.os + "/" + sys.arch), c("shell", sys.shell), c("bind", sys.bind),
+      c("targets", sys.targets), c("running", sys.active_runs), c("threads", sys.worker_threads),
+      c("uptime", fmtUptime(sys.uptime_secs)), c("v", sys.version)] : []));
+}
+
+async function refresh() {
+  try {
+    [targets, sys] = await Promise.all([api("GET", "/api/targets"), api("GET", "/api/system")]);
+    render();
+  } catch (e) { /* server restarting; the poll will retry */ }
+}
+function scheduleRefresh(ms) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, ms === undefined ? 250 : ms);
+}
+
+// ---- console -------------------------------------------------------------
+function appendLine(line, stream) {
+  const term = $("term");
+  term.append(h("span", { class: stream || "stdout" }, line + "\n"));
+  while (term.childNodes.length > MAX_LINES) term.firstChild.remove();
+  if ($("autoscroll").checked) term.scrollTop = term.scrollHeight;
+}
+
+async function select(id, fresh) {
+  selected = id;
+  const t = targets.find((x) => x.id === id);
+  $("term-title").textContent = t ? "Console \u2014 " + t.name : "Console \u2014 select a target";
+  $("term").replaceChildren();
+  render();
+  if (!t || fresh) return;
+  try {
+    const data = await api("GET", "/api/targets/" + id + "/logs");
+    if (selected !== id) return;
+    if (data.logs) data.logs.replace(/\n$/, "").split("\n").forEach((l) =>
+      appendLine(l, l.startsWith("[portalcontrol]") ? "system" : "stdout"));
+    else appendLine("(no output yet)", "system");
+  } catch (e) { appendLine("failed to load logs: " + e.message, "stderr"); }
+}
+
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { wsUp = true; refresh(); };
+  ws.onclose = () => { wsUp = false; render(); setTimeout(connect, 2000); };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.type === "log") { if (m.target_id === selected) appendLine(m.line, m.stream); return; }
+    if (m.type === "lagged") { appendLine("[portalcontrol] " + m.skipped + " line(s) skipped (slow client)", "system"); return; }
+    if (m.type === "hello") return;
+    scheduleRefresh();
+  };
+}
+
+// ---- add / edit ------------------------------------------------------------
+function openForm(t) {
+  editingId = t ? t.id : null;
+  $("dlg-target-title").textContent = t ? "Edit target" : "Add target";
+  $("f-name").value = t ? t.name : "";
+  $("f-dir").value = t ? t.working_directory : "";
+  $("f-script").value = t ? t.script_name : (sys && sys.os === "windows" ? "deploy.bat" : "deploy.sh");
+  $("f-branch").value = t ? t.git_branch : "main";
+  $("f-health").value = t && t.health_url ? t.health_url : "";
+  $("f-mode").value = t ? t.run_mode : "TASK";
+  $("f-timeout").value = t ? t.timeout_secs : 300;
+  $("f-autostart").checked = !!(t && t.autostart);
+  $("form-err").textContent = "";
+  $("dlg-target").showModal();
+}
+
+$("form-target").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {
+    name: $("f-name").value, working_directory: $("f-dir").value, script_name: $("f-script").value,
+    git_branch: $("f-branch").value, health_url: $("f-health").value, run_mode: $("f-mode").value,
+    timeout_secs: parseInt($("f-timeout").value, 10) || 300, autostart: $("f-autostart").checked,
+  };
+  try {
+    if (editingId) await api("PUT", "/api/targets/" + editingId, body);
+    else await api("POST", "/api/targets", body);
+    $("dlg-target").close();
+    toast(editingId ? "Target updated" : "Target added");
+    scheduleRefresh(50);
+  } catch (err) { $("form-err").textContent = err.message; }
+});
+$("btn-cancel").onclick = () => $("dlg-target").close();
+$("btn-add").onclick = () => openForm(null);
+$("btn-clear").onclick = () => $("term").replaceChildren();
+$("btn-info-close").onclick = () => $("dlg-info").close();
+
+// ---- history / scan report -------------------------------------------------
+function table(headers, rows) {
+  return h("table", {}, h("thead", {}, h("tr", {}, headers.map((x) => h("th", {}, x)))),
+    h("tbody", {}, rows.map((r) => h("tr", {}, r.map((x) => h("td", {}, x))))));
+}
+
+async function showHistory(t) {
+  $("info-title").textContent = "Execution history \u2014 " + t.name;
+  $("info-body").replaceChildren("Loading...");
+  $("dlg-info").showModal();
+  try {
+    const runs = await api("GET", "/api/targets/" + t.id + "/history");
+    $("info-body").replaceChildren(runs.length ? table(
+      ["#", "Started (UTC)", "Trigger", "Status", "Exit", "Duration", ""],
+      runs.map((r) => [r.id, r.executed_at, r.triggered_by,
+        badge(r.status, r.status === "SUCCESS" ? "b-green" : r.status === "RUNNING" ? "b-blue" : "b-red"),
+        r.exit_code === null ? "-" : r.exit_code, fmtDuration(r.duration_ms),
+        h("button", { class: "small", onclick: async () => {
+          const full = await api("GET", "/api/runs/" + r.id);
+          $("dlg-info").close(); selected = t.id; render();
+          $("term-title").textContent = "Console \u2014 " + t.name + " (run #" + r.id + ")";
+          $("term").replaceChildren();
+          (full.captured_logs || "(no output captured)").replace(/\n$/, "").split("\n").forEach((l) =>
+            appendLine(l, l.startsWith("[portalcontrol]") ? "system" : "stdout"));
+        } }, "Logs")])) : "No runs yet.");
+  } catch (e) { $("info-body").replaceChildren("Failed: " + e.message); }
+}
+
+async function showScan(t) {
+  $("info-title").textContent = "Security report \u2014 " + t.name;
+  $("info-body").replaceChildren("Loading...");
+  $("dlg-info").showModal();
+  try {
+    const s = await api("GET", "/api/targets/" + t.id + "/scan");
+    if (!s) { $("info-body").replaceChildren("No scan yet."); return; }
+    const p = s.raw_payload || {};
+    const out = [h("div", { class: "hint" }, "Scanned " + s.scanned_at + " UTC")];
+
+    out.push(h("h3", {}, "Static analysis (bandit)"));
+    if (p.bandit_error) out.push(h("div", { class: "err" }, p.bandit_error));
+    else {
+      const sev = p.bandit_severity || {};
+      out.push(h("div", { class: "badges" }, badge((sev.high || 0) + " HIGH", sev.high ? "b-red" : "b-grey"),
+        badge((sev.medium || 0) + " MEDIUM", sev.medium ? "b-amber" : "b-grey"), badge((sev.low || 0) + " LOW", "b-grey")));
+      const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+      const res = ((p.bandit && p.bandit.results) || []).slice()
+        .sort((a, b) => (order[a.issue_severity] ?? 3) - (order[b.issue_severity] ?? 3)).slice(0, 200);
+      if (res.length) out.push(table(["Severity", "Test", "Location", "Issue"], res.map((r) => [
+        badge(r.issue_severity, { HIGH: "b-red", MEDIUM: "b-amber" }[r.issue_severity] || "b-grey"),
+        h("code", {}, r.test_id || ""),
+        h("code", {}, String(r.filename || "").replace(t.working_directory, ".") + ":" + r.line_number),
+        r.issue_text || ""])));
+      else out.push(h("div", { class: "hint" }, "No issues found."));
+    }
+
+    out.push(h("h3", {}, "Dependencies (pip-audit) \u2014 " + (p.pip_audit_mode || "")));
+    if (p.pip_audit_error) out.push(h("div", { class: "err" }, p.pip_audit_error));
+    else {
+      const deps = (p.pip_audit && (p.pip_audit.dependencies || p.pip_audit)) || [];
+      const vuln = deps.filter((d) => d.vulns && d.vulns.length);
+      out.push(h("div", { class: "hint" }, deps.length + " package(s) audited, " + vuln.length + " vulnerable."));
+      if (vuln.length) out.push(table(["Package", "Version", "Advisories", "Fixed in"], vuln.map((d) => [
+        d.name, h("code", {}, d.version), d.vulns.map((v) => v.id).join(", "),
+        [...new Set(d.vulns.flatMap((v) => v.fix_versions || []))].join(", ") || "-"])));
+    }
+    $("info-body").replaceChildren(...out);
+  } catch (e) { $("info-body").replaceChildren("Failed: " + e.message); }
+}
+
+connect();
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+[package]
+name = "portalcontrol"
+version = "0.1.0"
+edition = "2021"
+description = "PortalControl-Core: native cross-platform automation supervisor"
+license = "MIT"
+
+[[bin]]
+name = "portalcontrol"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "time", "sync", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# libgit2 is compiled in, so no system Git install is needed.
+[target.'cfg(windows)'.dependencies]
+git2 = { version = "0.20", default-features = false, features = ["https", "vendored-libgit2"] }
+winreg = "0.55"
+
+[target.'cfg(not(windows))'.dependencies]
+git2 = { version = "0.20", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
