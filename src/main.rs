@@ -6,6 +6,7 @@
 //! scans. See `prd.md` and `README.md`.
 
 mod api;
+mod auth;
 mod automation;
 mod autostart;
 mod backup;
@@ -40,6 +41,7 @@ COMMANDS:
     install-autostart     Start PortalControl automatically at login
     uninstall-autostart   Remove the login autostart entry
     autostart-status      Show whether autostart is installed
+    reset-password        Remove the dashboard password (stop the manager first)
 
 OPTIONS:
     --bind <IP>           Address to listen on (default 127.0.0.1).
@@ -125,6 +127,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--detach" => opts.detach = true,
             "--open" => opts.open = true,
             "serve" | "stop" | "install-autostart" | "uninstall-autostart" | "autostart-status"
+            | "reset-password"
                 if !command_seen =>
             {
                 opts.command = arg.clone();
@@ -195,6 +198,7 @@ fn main() -> ExitCode {
             None => println!("Autostart is not installed."),
         }),
         "stop" => stop_remote(&opts),
+        "reset-password" => reset_password(&opts),
         _ => {
             if opts.detach {
                 detach(&args)
@@ -251,13 +255,60 @@ fn detach(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// File in the data directory holding the running manager's control token.
+/// Being able to read it proves local access to this user's files.
+const CONTROL_TOKEN_FILE: &str = "control.token";
+
+/// Remove the dashboard password directly in the database. This needs
+/// access to this machine's files, which is the recovery path when the
+/// password is forgotten. The manager caches the password, so it must be
+/// stopped first.
+fn reset_password(opts: &Opts) -> Result<(), String> {
+    let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
+    let db_path = data_dir.join("portalcontrol.db");
+    if !db_path.is_file() {
+        return Err(format!("no database found at {}", db_path.display()));
+    }
+    if std::net::TcpStream::connect_timeout(&opts.addr(), Duration::from_millis(500)).is_ok() {
+        return Err(format!(
+            "PortalControl is running at {}. Stop it first (portalcontrol stop), then run reset-password again.",
+            opts.addr()
+        ));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let db = db::Db::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
+    let had = rt.block_on(db.get_setting(auth::PASSWORD_KEY))?.is_some();
+    rt.block_on(db.set_setting(auth::PASSWORD_KEY, None))?;
+    println!(
+        "{}",
+        if had {
+            "The dashboard password was removed. Start PortalControl and set a new one under Settings."
+        } else {
+            "No dashboard password was set."
+        }
+    );
+    Ok(())
+}
+
 fn stop_remote(opts: &Opts) -> Result<(), String> {
     let url = format!("http://{}/api/system/shutdown", opts.addr());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    match rt.block_on(health::http_request("POST", &url, Duration::from_secs(5))) {
+    // Authenticates the request when a dashboard password is set.
+    let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
+    let token = std::fs::read_to_string(data_dir.join(CONTROL_TOKEN_FILE)).unwrap_or_default();
+    let token: String = token.trim().chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let headers = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-PortalControl-Token: {token}\r\n")
+    };
+    match rt.block_on(health::http_request_with("POST", &url, Duration::from_secs(5), &headers)) {
         Ok(Some(200)) => {
             println!("PortalControl at {} is shutting down.", opts.addr());
             Ok(())
@@ -316,6 +367,12 @@ fn serve(opts: Opts) -> Result<(), String> {
         let state = AppState::new(db, addr);
         let _ = state.data_dir.set(data_dir.clone());
         let _ = state.serve_args.set(opts.passthrough_args());
+        if let Some(hash) = state.db.get_setting(auth::PASSWORD_KEY).await? {
+            state.auth.set_hash(Some(hash));
+        }
+        if let Err(e) = std::fs::write(data_dir.join(CONTROL_TOKEN_FILE), &state.auth.control_token) {
+            log(&format!("could not write the control token file: {e}"));
+        }
 
         git::init();
         git::spawn_worker(state.clone());

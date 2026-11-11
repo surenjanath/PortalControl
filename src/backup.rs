@@ -220,6 +220,7 @@ mod tests {
             webhook_token: None,
             db_file: db_file.map(str::to_string),
             backup_on_deploy: true,
+            start_order: 0,
         }
     }
 

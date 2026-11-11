@@ -40,6 +40,8 @@ policy), and targets that share a **project** name belong together:
   requirements → `manage.py qcluster`) and **Celery** (a `celery.py` next to
   `settings.py` → worker, plus beat when a beat schedule is configured). They are
   offered as tick boxes on *New target* and under *Configuration → Related Processes*.
+  For Node projects the `start`, `dev` and `worker` scripts of `package.json` are
+  offered the same way.
 - Adding one registers a second service in the same project with restart-on-crash
   on. If no launcher exists yet, a small script (`portalcontrol_qcluster.bat` / `.sh`)
   is created in the project folder; it only runs the detected command, uses the
@@ -47,6 +49,45 @@ policy), and targets that share a **project** name belong together:
   overwritten. This is the one case where PortalControl writes into a project folder.
 - Any other kind of process can be added by hand: create a script for it and register
   it as a target with the same project name.
+
+## Password protection
+
+By default there is no login, which suits a single-user machine on `127.0.0.1`. Under
+*Settings → Access* you can set a password; from then on the dashboard, its API and the
+live stream all require signing in.
+
+- The password is stored only as a salted PBKDF2-HMAC-SHA256 hash.
+- Sessions last 7 days, are held in memory (so everyone signs in again after a
+  restart), and all end when the password changes.
+- Five wrong passwords lock sign-in for a minute.
+- Deploy webhooks keep working: the token in their URL is their own credential.
+- `portalcontrol stop` keeps working on this machine through a control token the
+  manager writes to its data directory.
+- **Forgot it?** On this machine: `portalcontrol stop`, then
+  `portalcontrol reset-password`, then start PortalControl and set a new one.
+
+Set a password before binding to a LAN or Tailscale address. The connection itself is
+plain HTTP, so use it over a network you trust (Tailscale encrypts the link for you).
+
+## Start order
+
+Each target has a **start order** (*Configuration → Advanced*). *Start all* on the
+project page starts the stopped targets from the lowest number up and waits for each to
+be ready before the next begins: a task must finish successfully, a service must stay
+up and, when it has a health URL, answer it. If a step fails the sequence stops and the
+later steps are not started. Typical use: a migration task at 0, the web server at 1,
+the queue cluster at 2. *Stop all* stops them in reverse order.
+
+## Rollback
+
+*Roll back to this* appears next to earlier commits in *Git Source* and on the page of
+an earlier deployment. It moves the working tree back to that commit and runs the
+script (a running service is restarted). Like Pull it refuses to lose work: tracked
+files must be unmodified and the branch must have no unpushed commits, and it only goes
+to commits that are on `origin/<branch>`, so **Pull** always brings you forward again.
+Auto-deploy is switched off by a rollback, otherwise the next fetch would undo it.
+Only code is rolled back; migrations already applied to the database are not reversed
+(restore a database snapshot for that).
 
 ## Quick commands
 
@@ -57,6 +98,7 @@ type it finds in the folder:
 | --- | --- |
 | Django (`manage.py`) | System check, Show migrations, Check for model changes, Apply migrations, Collect static files, Clear expired sessions |
 | Python (`requirements.txt`) | Install requirements, List outdated packages |
+| Node (`package.json`) | Install packages, Clean install (with a lock file), and the `build`, `lint`, `test`, `typecheck` and `migrate` scripts when the project defines them |
 
 A command runs in the working directory with the target's environment variables, using
 the project's virtualenv when it has one. It streams to the log and is recorded under
@@ -172,6 +214,7 @@ stop                  Stop a running manager (same --bind/--port)
 install-autostart     Start PortalControl automatically at login
 uninstall-autostart   Remove the login autostart entry
 autostart-status      Show whether autostart is installed
+reset-password        Remove the dashboard password (stop the manager first)
 
 --bind <IP>           Address to listen on (default 127.0.0.1)
 --port <PORT>         Port to listen on (default 7878)
@@ -259,8 +302,9 @@ internet:
 - Output is streamed line by line; lines are capped at 8 KB and only the last 2,000
   lines (512 KB) of a run are kept for the history.
 
-There is no login: anyone who can reach the bound address can run the registered
-scripts. Keep it on `127.0.0.1` unless the network (e.g. your tailnet) is trusted.
+Without a password, anyone who can reach the bound address can run the registered
+scripts. Keep it on `127.0.0.1`, or set a password (see *Password protection*) before
+binding it to a network such as your tailnet.
 
 ## HTTP API
 
@@ -283,6 +327,11 @@ scripts. Keep it on `127.0.0.1` unless the network (e.g. your tailnet) is truste
 | GET | `/api/targets/{id}/metrics` | CPU / memory samples of the process tree |
 | POST / DELETE | `/api/targets/{id}/webhook` | Generate / disable the deploy webhook token |
 | GET / POST | `/api/webhooks/deploy/{token}` | Deploy via webhook |
+| GET | `/api/auth/status` | Whether a password is set and whether this client is signed in |
+| POST | `/api/auth/login`, `/api/auth/logout`, `/api/auth/password` | Sign in / out; set, change or remove the password |
+| POST | `/api/targets/{id}/rollback` | Move to an earlier commit (`{"sha": …}`) and deploy it |
+| POST | `/api/projects/{name}/start`, `/stop` | Start a project in order / stop it in reverse |
+| GET | `/assets/{file}` | The dashboard's stylesheet and scripts |
 | GET | `/api/targets/{id}/commands` | Quick commands available for the target |
 | POST | `/api/targets/{id}/commands/{command}`, `/commands/stop` | Run a quick command / stop the running one |
 | GET / POST | `/api/targets/{id}/backups` | List database snapshots / take one now |
@@ -306,5 +355,30 @@ cargo run -- --port 7979 --data-dir ./dev-data
 ```
 
 The source is in `src/` (`runner.rs`, `git.rs`, `health.rs`, `security.rs`,
-`automation.rs`, `metrics.rs`, `backup.rs`, `api.rs`, `db.rs`, `autostart.rs`, `net.rs`) and the dashboard is the single file
-`web/index.html`, embedded into the binary at compile time.
+`automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api.rs`, `db.rs`,
+`autostart.rs`, `net.rs`).
+
+The dashboard lives in `web/` and is compiled into the binary (`ASSETS` in
+`src/api.rs`), so the result is still one executable. It is plain HTML, CSS and
+JavaScript with no build step and no dependencies:
+
+| File | What it holds |
+| --- | --- |
+| `index.html` | The page shell: sidebar and main containers, and the script tags |
+| `login.html`, `js/login.js` | The sign-in page |
+| `styles.css` | All styling, with the dark and light colour tokens at the top |
+| `js/core.js` | DOM helpers, icons, the API client, formatters, shared state, target status and actions |
+| `js/components.js` | Charts, the log viewer, and small pieces (tables, tiles, deployment rows) |
+| `js/router.js` | Hash routing, the view lifecycle and the sidebar |
+| `js/pages-home.js` | Dashboard and Projects |
+| `js/pages-project.js` | Project page (grouped terminals) and New target |
+| `js/target.js` | The target page frame: header, tabs, saving |
+| `js/target-config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, …) |
+| `js/target-tabs.js` | Deployments, Commands, Logs, Metrics and Security tabs |
+| `js/pages-global.js` | Deployments, Security, Activity and Settings pages |
+| `js/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
+
+The scripts are ordinary (non-module) scripts loaded in that order and share one global
+scope. To add a script or stylesheet, put it in `web/`, reference it from the HTML and
+add it to `ASSETS`; a test fails if the HTML references a file that is not embedded.
+After changing anything in `web/`, rebuild: the files are read at compile time.

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · PortalControl</title>
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<main style="min-height:100%;display:flex;align-items:center;justify-content:center;padding:20px">
+  <form id="login" class="box" style="width:min(380px,100%);padding:26px">
+    <div class="brand" style="padding:0;font-size:22px">Portal<span>Control</span></div>
+    <p class="sub" style="margin:4px 0 20px">Sign in to manage this machine's projects.</p>
+    <label class="f"><span>Password</span>
+      <input type="password" id="password" autocomplete="current-password" autofocus required></label>
+    <div class="formfoot"><button class="btn hl" type="submit" id="submit">Sign in</button><span class="errtxt" id="error" role="alert"></span></div>
+    <p class="hint" style="margin-top:18px">Forgot it? On this machine run <span class="mono">portalcontrol stop</span>, then
+      <span class="mono">portalcontrol reset-password</span>, and start PortalControl again.</p>
+  </form>
+</main>
+<script src="/assets/js/login.js"></script>
+</body>
+</html>

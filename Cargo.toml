@@ -1,6 +1,6 @@
 [package]
 name = "portalcontrol"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "PortalControl-Core: native cross-platform automation supervisor"
 license = "MIT"
@@ -19,6 +19,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CPU / memory of the host and of each supervised process tree.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# Password hashing and random tokens for the optional dashboard login.
+pbkdf2 = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
 
 # libgit2 is compiled in, so no system Git install is needed.
 [target.'cfg(windows)'.dependencies]

@@ -79,6 +79,16 @@ pub async fn http_request(
     url: &str,
     timeout: Duration,
 ) -> Result<Option<u16>, String> {
+    http_request_with(method, url, timeout, "").await
+}
+
+/// Like `http_request`, with extra request header lines (each ending in `\r\n`).
+pub async fn http_request_with(
+    method: &str,
+    url: &str,
+    timeout: Duration,
+    extra_headers: &str,
+) -> Result<Option<u16>, String> {
     let u = parse_url(url)?;
     let work = async {
         let mut stream = TcpStream::connect((u.host.as_str(), u.port))
@@ -94,7 +104,7 @@ pub async fn http_request(
         };
         let req = format!(
             "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: PortalControl/{}\r\n\
-             Accept: */*\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+             Accept: */*\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n",
             u.path,
             env!("CARGO_PKG_VERSION")
         );

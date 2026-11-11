@@ -5,7 +5,7 @@ use crate::db::Target;
 use crate::git::{self, GitInfo};
 use crate::runner;
 use crate::state::AppState;
-use crate::util::{log, now_ms};
+use crate::util::log;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use std::path::Path;
 use std::sync::Arc;
@@ -298,21 +298,199 @@ pub async fn auto_deploy(state: &Arc<AppState>, target: &Target, info: &GitInfo)
     }
 }
 
+/// Roll a target back to an earlier commit and deploy it. Auto-deploy is
+/// switched off, otherwise the next fetch would pull straight forward again.
+pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Result<i64, String> {
+    let is_service = target.run_mode == "SERVICE";
+    if !is_service && is_running(state, target.id).await {
+        return Err("target is already running".into());
+    }
+    let (dir, branch, wanted) = (
+        target.working_directory.clone(),
+        target.git_branch.clone(),
+        sha.to_string(),
+    );
+    let outcome = tokio::task::spawn_blocking(move || git::rollback_to(Path::new(&dir), &branch, &wanted))
+        .await
+        .map_err(|e| format!("git worker failed: {e}"))?
+        .map_err(|e| format!("rollback failed: {e}"))?;
+    let short = |s: &Option<String>| s.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("?").to_string();
+    if target.auto_deploy {
+        state.db.set_auto_deploy(target.id, false).await?;
+    }
+    state.activity(
+        "warn",
+        "git",
+        Some(target.id),
+        format!(
+            "Rolled back {} commit(s): {} \u{2192} {}{}",
+            outcome.commits,
+            short(&outcome.from),
+            short(&outcome.to),
+            if target.auto_deploy { ". Auto-deploy was switched off." } else { "" }
+        ),
+    );
+    git::refresh_target(
+        state,
+        target.id,
+        target.working_directory.clone(),
+        target.git_branch.clone(),
+        false,
+    )
+    .await;
+    if is_service && is_running(state, target.id).await {
+        runner::restart(state, target, "ROLLBACK").await
+    } else {
+        runner::start_run(state, target, "ROLLBACK").await
+    }
+}
+
+// --------------------------------------------------------- project start --
+
+/// Targets of a project in start order (then by id).
+pub async fn project_members(state: &Arc<AppState>, project: &str) -> Result<Vec<Target>, String> {
+    let mut members: Vec<Target> = state
+        .db
+        .list_targets()
+        .await?
+        .into_iter()
+        .filter(|t| t.project == project)
+        .collect();
+    members.sort_by_key(|t| (t.start_order, t.id));
+    Ok(members)
+}
+
+async fn last_run_succeeded(state: &Arc<AppState>, target_id: i64, run_id: i64) -> bool {
+    matches!(state.db.get_run(run_id).await, Ok(Some(r)) if r.target_id == target_id && r.status == "SUCCESS")
+}
+
+/// Wait until a just-started step is ready for the next one to begin:
+/// a task must finish successfully, a service must stay up and (when it has
+/// a health URL) answer its probe.
+async fn wait_until_ready(state: &Arc<AppState>, target: &Target, run_id: i64) -> Result<(), String> {
+    let is_service = target.run_mode == "SERVICE";
+    let limit = if is_service {
+        Duration::from_secs(90)
+    } else {
+        Duration::from_secs(target.timeout_secs + 15)
+    };
+    let started = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let running = is_running(state, target.id).await;
+        if !is_service {
+            if !running {
+                return if last_run_succeeded(state, target.id, run_id).await {
+                    Ok(())
+                } else {
+                    Err("its run failed".into())
+                };
+            }
+        } else {
+            if !running {
+                return Err("it exited right after starting".into());
+            }
+            match target.health_url.as_deref() {
+                None if started.elapsed() >= Duration::from_secs(3) => return Ok(()),
+                Some(_) => {
+                    let healthy = state
+                        .health
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&target.id).map(|h| h.status != "DOWN"))
+                        .unwrap_or(false);
+                    if healthy {
+                        return Ok(());
+                    }
+                }
+                None => {}
+            }
+        }
+        if started.elapsed() > limit {
+            return Err(if is_service {
+                "its health check did not come up in 90 seconds".into()
+            } else {
+                "it did not finish in time".into()
+            });
+        }
+    }
+}
+
+/// Start every stopped target of a project one after another, in start
+/// order, waiting for each to be ready. Stops at the first step that fails.
+pub fn start_project(state: &Arc<AppState>, project: String) -> Result<(), String> {
+    {
+        let mut busy = state.starting_projects.lock().unwrap_or_else(|p| p.into_inner());
+        if !busy.insert(project.clone()) {
+            return Err("this project is already being started".into());
+        }
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let members = project_members(&state, &project).await.unwrap_or_default();
+        let total = members.len();
+        let mut started = 0;
+        let mut failure: Option<String> = None;
+        for (i, target) in members.iter().enumerate() {
+            if is_running(&state, target.id).await {
+                continue;
+            }
+            let run_id = match runner::start_run(&state, target, "MANUAL").await {
+                Ok(id) => id,
+                Err(e) => {
+                    failure = Some(format!("'{}' could not be started: {e}", target.name));
+                    break;
+                }
+            };
+            started += 1;
+            // Nothing waits on the last step.
+            if i + 1 < total {
+                if let Err(e) = wait_until_ready(&state, target, run_id).await {
+                    failure = Some(format!("'{}' is not ready: {e}", target.name));
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(why) => state.activity(
+                "error",
+                "project",
+                None,
+                format!("Start of project '{project}' stopped: {why}. Later steps were not started."),
+            ),
+            None => state.activity(
+                "ok",
+                "project",
+                None,
+                format!("Project '{project}': {started} process(es) started in order"),
+            ),
+        }
+        state
+            .starting_projects
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&project);
+    });
+    Ok(())
+}
+
+/// Stop every running target of a project, last-started first.
+pub async fn stop_project(state: &Arc<AppState>, project: &str) -> Result<usize, String> {
+    let mut stopped = 0;
+    for target in project_members(state, project).await?.iter().rev() {
+        runner::stop_run(state, runner::command_slot(target.id)).await;
+        if runner::stop_run(state, target.id).await {
+            stopped += 1;
+        }
+    }
+    Ok(stopped)
+}
+
 // --------------------------------------------------------------- webhooks --
 
-/// A 128-bit random token (hex) for a deploy webhook URL. `RandomState` is
-/// seeded from the operating system's random source.
+/// A 128-bit random token (hex) for a deploy webhook URL.
 pub fn new_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let mut out = String::with_capacity(32);
-    for i in 0..2u64 {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(now_ms() ^ i);
-        hasher.write_u32(std::process::id());
-        out.push_str(&format!("{:016x}", hasher.finish()));
-    }
-    out
+    crate::auth::random_hex(16)
 }
 
 // ----------------------------------------------------------------- worker --

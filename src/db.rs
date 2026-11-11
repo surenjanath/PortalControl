@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS security_scan_reports (
     FOREIGN KEY(target_id) REFERENCES portal_targets(id) ON DELETE CASCADE
 );
 
+-- Manager-wide settings (for example the dashboard password hash)
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_history_target ON process_execution_history(target_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_scans_target ON security_scan_reports(target_id, id DESC);
 "#;
@@ -67,6 +73,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("process_execution_history", "label", "TEXT"),
     ("portal_targets", "db_file", "TEXT"),
     ("portal_targets", "backup_on_deploy", "INTEGER NOT NULL DEFAULT 0"),
+    ("portal_targets", "start_order", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Execution-history rows kept per target; older ones are pruned.
@@ -95,6 +102,8 @@ pub struct Target {
     /// SQLite database inside the working directory that is backed up.
     pub db_file: Option<String>,
     pub backup_on_deploy: bool,
+    /// Position in the project's start sequence (lower starts first).
+    pub start_order: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -128,6 +137,8 @@ pub struct TargetInput {
     pub db_file: Option<String>,
     #[serde(default)]
     pub backup_on_deploy: Option<bool>,
+    #[serde(default)]
+    pub start_order: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,7 +178,7 @@ pub struct Db {
 
 const TARGET_COLS: &str = "id, name, working_directory, script_name, git_branch, \
      current_git_status, created_at, health_url, run_mode, autostart, timeout_secs, \
-     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy";
+     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order";
 
 const RUN_COLS: &str = "h.id, h.target_id, h.triggered_by, h.status, h.exit_code, h.duration_ms, \
      h.executed_at, h.commit_sha, h.commit_message, h.label";
@@ -199,6 +210,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         webhook_token: r.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
         db_file: r.get::<_, Option<String>>(18)?.filter(|s| !s.is_empty()),
         backup_on_deploy: r.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
+        start_order: r.get::<_, Option<i64>>(20)?.unwrap_or(0),
     })
 }
 
@@ -346,8 +358,8 @@ impl Db {
             c.execute(
                 "INSERT INTO portal_targets (name, working_directory, script_name, git_branch, \
                  health_url, run_mode, autostart, timeout_secs, description, project, env_vars, \
-                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy, start_order) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     t.name,
                     t.working_directory,
@@ -365,6 +377,7 @@ impl Db {
                     t.auto_restart.unwrap_or(false) as i64,
                     t.db_file,
                     t.backup_on_deploy.unwrap_or(false) as i64,
+                    t.start_order.unwrap_or(0),
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -378,7 +391,7 @@ impl Db {
                 "UPDATE portal_targets SET name=?1, working_directory=?2, script_name=?3, \
                  git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8, \
                  description=?9, project=?10, env_vars=?11, schedule=?12, auto_deploy=?13, \
-                 auto_restart=?14, db_file=?15, backup_on_deploy=?16 WHERE id=?17",
+                 auto_restart=?14, db_file=?15, backup_on_deploy=?16, start_order=?17 WHERE id=?18",
                 params![
                     t.name,
                     t.working_directory,
@@ -396,6 +409,7 @@ impl Db {
                     t.auto_restart.unwrap_or(false) as i64,
                     t.db_file,
                     t.backup_on_deploy.unwrap_or(false) as i64,
+                    t.start_order.unwrap_or(0),
                     id
                 ],
             )?;
@@ -414,6 +428,41 @@ impl Db {
             c.execute(
                 "UPDATE portal_targets SET current_git_status=?1 WHERE id=?2",
                 params![status, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_setting(&self, key: &'static str) -> Result<Option<String>, String> {
+        self.call(move |c| {
+            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0))
+                .optional()
+        })
+        .await
+    }
+
+    /// Store a setting, or remove it when `value` is `None`.
+    pub async fn set_setting(&self, key: &'static str, value: Option<String>) -> Result<(), String> {
+        self.call(move |c| {
+            match value {
+                Some(v) => c.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![key, v],
+                )?,
+                None => c.execute("DELETE FROM settings WHERE key=?1", [key])?,
+            };
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_auto_deploy(&self, id: i64, on: bool) -> Result<(), String> {
+        self.call(move |c| {
+            c.execute(
+                "UPDATE portal_targets SET auto_deploy=?1 WHERE id=?2",
+                params![on as i64, id],
             )?;
             Ok(())
         })

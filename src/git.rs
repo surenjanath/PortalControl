@@ -400,6 +400,76 @@ pub fn pull_ff(dir: &Path, branch: &str) -> Result<PullOutcome, String> {
     })
 }
 
+/// Roll the checked-out branch back to an earlier commit and update the
+/// working tree to match. Like `pull_ff` it refuses anything that could lose
+/// work: the tracked branch must be checked out, tracked files must be
+/// unmodified, HEAD must have no commits missing from origin, and the commit
+/// must be part of `origin/<branch>` (so *Pull* can always bring it forward
+/// again). No network access.
+pub fn rollback_to(dir: &Path, branch: &str, sha: &str) -> Result<PullOutcome, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let err = |e: git2::Error| e.message().to_string();
+    let target = Oid::from_str(sha.trim()).map_err(|_| "that is not a valid commit id".to_string())?;
+    repo.find_commit(target)
+        .map_err(|_| "that commit does not exist in this repository".to_string())?;
+
+    let head = repo.head().map_err(err)?;
+    if !head.is_branch() || head.shorthand() != Some(branch) {
+        return Err(format!(
+            "the checked-out branch is '{}', not the tracked branch '{branch}'",
+            head.shorthand().unwrap_or("detached HEAD")
+        ));
+    }
+    let head_oid = head.target().ok_or("HEAD does not point at a commit")?;
+    if head_oid == target {
+        return Ok(PullOutcome {
+            updated: false,
+            from: Some(head_oid.to_string()),
+            to: Some(target.to_string()),
+            commits: 0,
+        });
+    }
+    let remote_oid = repo
+        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
+        .map_err(|_| format!("origin has no branch '{branch}', so a rollback could not be undone"))?;
+    let on_origin = |oid: Oid| oid == remote_oid || repo.graph_descendant_of(remote_oid, oid).unwrap_or(false);
+    if !on_origin(head_oid) {
+        return Err("the local branch has commits that are not on origin; a rollback would lose them".into());
+    }
+    if !on_origin(target) {
+        return Err(format!("that commit is not part of origin/{branch}"));
+    }
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let modified = repo.statuses(Some(&mut opts)).map_err(err)?.len();
+    if modified > 0 {
+        return Err(format!(
+            "{modified} tracked file(s) have local changes; commit or discard them before rolling back"
+        ));
+    }
+
+    let object = repo.find_object(target, None).map_err(err)?;
+    let mut checkout = CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&object, Some(&mut checkout))
+        .map_err(|e| format!("checkout failed: {}", e.message()))?;
+    let refname = format!("refs/heads/{branch}");
+    repo.find_reference(&refname)
+        .and_then(|mut r| r.set_target(target, "portalcontrol: rollback"))
+        .map_err(err)?;
+    repo.set_head(&refname).map_err(err)?;
+    let (_, behind) = repo.graph_ahead_behind(target, head_oid).unwrap_or((0, 0));
+    Ok(PullOutcome {
+        updated: true,
+        from: Some(head_oid.to_string()),
+        to: Some(target.to_string()),
+        commits: behind,
+    })
+}
+
 /// Inspect (optionally fetching first) one target and publish the result.
 pub async fn refresh_target(
     state: &Arc<AppState>,
@@ -716,6 +786,46 @@ mod tests {
 
         // So does tracking a branch that is not the one checked out.
         assert!(pull_ff(clone_dir.path(), "release").unwrap_err().contains("tracked branch"));
+    }
+
+    #[test]
+    fn rollback_goes_back_and_pull_brings_it_forward_again() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = init_repo(origin_dir.path());
+        let first = origin.head().unwrap().target().unwrap();
+        std::fs::write(origin_dir.path().join("app.py"), "print('v2')\n").unwrap();
+        std::fs::write(origin_dir.path().join("extra.py"), "print('extra')\n").unwrap();
+        let second = commit_all(&origin, "second");
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::clone(origin_dir.path().to_str().unwrap(), clone_dir.path()).unwrap();
+        let dir = clone_dir.path();
+        std::fs::write(dir.join("db.sqlite3"), "local data").unwrap();
+
+        // Back to the first commit: files follow, untracked data is untouched.
+        let out = rollback_to(dir, "main", &first.to_string()).unwrap();
+        assert!(out.updated);
+        assert_eq!(out.commits, 1);
+        assert!(std::fs::read_to_string(dir.join("app.py")).unwrap().contains("v1"));
+        assert!(!dir.join("extra.py").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("db.sqlite3")).unwrap(), "local data");
+        let info = inspect(dir, "main");
+        assert_eq!(info.head, Some(first.to_string()));
+        assert_eq!((info.ahead, info.behind), (0, 1));
+        assert!(!rollback_to(dir, "main", &first.to_string()).unwrap().updated);
+
+        // Pull undoes the rollback.
+        assert!(pull_ff(dir, "main").unwrap().updated);
+        assert_eq!(inspect(dir, "main").head, Some(second.to_string()));
+        assert!(dir.join("extra.py").exists());
+
+        // Refusals: bad ids, local edits, unpushed commits, commits not on origin.
+        assert!(rollback_to(dir, "main", "not-a-sha").is_err());
+        assert!(rollback_to(dir, "main", &"0".repeat(40)).is_err());
+        std::fs::write(dir.join("app.py"), "print('mine')\n").unwrap();
+        assert!(rollback_to(dir, "main", &first.to_string()).unwrap_err().contains("local changes"));
+        let local = commit_all(&clone, "local only");
+        assert!(rollback_to(dir, "main", &first.to_string()).unwrap_err().contains("not on origin"));
+        assert_eq!(inspect(dir, "main").head, Some(local.to_string()));
     }
 
     #[test]

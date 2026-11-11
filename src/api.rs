@@ -6,11 +6,14 @@
 use crate::automation::{self, Cron};
 use crate::db::{Target, TargetInput};
 use crate::state::AppState;
-use crate::{autostart, backup, git, health, net, runner, security};
+use crate::{auth, autostart, backup, git, health, net, runner, security};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN, X_CONTENT_TYPE_OPTIONS};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+    X_CONTENT_TYPE_OPTIONS,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,7 +25,29 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
+// The dashboard is compiled into the binary: one page shell, one stylesheet
+// and a handful of scripts, each small enough to read in one sitting.
 const INDEX_HTML: &str = include_str!("../web/index.html");
+const LOGIN_HTML: &str = include_str!("../web/login.html");
+const CSS: &str = "text/css; charset=utf-8";
+const JS: &str = "text/javascript; charset=utf-8";
+const ASSETS: &[(&str, &str, &str)] = &[
+    ("styles.css", CSS, include_str!("../web/styles.css")),
+    ("js/core.js", JS, include_str!("../web/js/core.js")),
+    ("js/components.js", JS, include_str!("../web/js/components.js")),
+    ("js/router.js", JS, include_str!("../web/js/router.js")),
+    ("js/pages-home.js", JS, include_str!("../web/js/pages-home.js")),
+    ("js/pages-project.js", JS, include_str!("../web/js/pages-project.js")),
+    ("js/target.js", JS, include_str!("../web/js/target.js")),
+    ("js/target-config.js", JS, include_str!("../web/js/target-config.js")),
+    ("js/target-tabs.js", JS, include_str!("../web/js/target-tabs.js")),
+    ("js/pages-global.js", JS, include_str!("../web/js/pages-global.js")),
+    ("js/app.js", JS, include_str!("../web/js/app.js")),
+    ("js/login.js", JS, include_str!("../web/js/login.js")),
+];
+/// No inline scripts are allowed; inline `style` attributes are.
+const CONTENT_POLICY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; \
+     connect-src 'self' ws: wss:; img-src 'self' data:; frame-ancestors 'none'";
 
 type AppResult = Result<Response, Response>;
 type Params = Query<HashMap<String, String>>;
@@ -90,15 +115,194 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/system/shutdown", post(shutdown))
         .route("/ws", get(ws_upgrade))
-        .layer(middleware::from_fn(guard))
+        .route("/assets/{*path}", get(asset))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/password", post(auth_password))
+        .route("/api/targets/{id}/rollback", post(rollback_target))
+        .route("/api/projects/{name}/start", post(project_start))
+        .route("/api/projects/{name}/stop", post(project_stop))
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+fn html_page(body: &'static str) -> Response {
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CONTENT_SECURITY_POLICY, CONTENT_POLICY),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn asset(Path(path): Path<String>) -> Response {
+    match ASSETS.iter().find(|(name, _, _)| *name == path) {
+        // `no-cache`: the browser revalidates, so a new build is picked up at once.
+        Some((_, mime, body)) => ([(CONTENT_TYPE, *mime), (CACHE_CONTROL, "no-cache")], *body).into_response(),
+        None => fail(StatusCode::NOT_FOUND, "no such asset"),
+    }
+}
+
+// ------------------------------------------------------------------- auth --
+
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| auth::cookie_value(c, auth::SESSION_COOKIE))
+        .map(str::to_string)
+}
+
+fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    if let Some(token) = headers.get(auth::CONTROL_HEADER).and_then(|v| v.to_str().ok()) {
+        if state.auth.control_token_matches(token) {
+            return true;
+        }
+    }
+    session_token(headers).map(|t| state.auth.session_valid(&t)).unwrap_or(false)
+}
+
+/// Paths that must work without a session: static files, the sign-in calls
+/// and deploy webhooks (whose URL token is their own credential).
+fn is_public_path(path: &str) -> bool {
+    path.starts_with("/assets/")
+        || path == "/api/auth/status"
+        || path == "/api/auth/login"
+        || path.starts_with("/api/webhooks/deploy/")
+}
+
+fn session_cookie(token: &str, max_age_secs: u64) -> String {
+    format!(
+        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}",
+        auth::SESSION_COOKIE
+    )
+}
+
+fn with_cookie(mut res: Response, cookie: String) -> Response {
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
+        res.headers_mut().insert(SET_COOKIE, v);
+    }
+    res
+}
+
+async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult {
+    let password_set = state.auth.password_set();
+    Ok(ok(json!({
+        "password_set": password_set,
+        "authenticated": !password_set || is_authenticated(&state, &headers),
+        "min_password_chars": auth::MIN_PASSWORD_CHARS,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+async fn verify(state: &Arc<AppState>, password: String) -> bool {
+    let Some(hash) = state.auth.current_hash() else { return false };
+    tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> AppResult {
+    if !state.auth.password_set() {
+        return Ok(ok(json!({"authenticated": true})));
+    }
+    if let Some(secs) = state.auth.locked_for() {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many wrong passwords; try again in {secs} seconds"),
+        ));
+    }
+    if !verify(&state, req.password).await {
+        state.auth.note_failure();
+        state.activity("warn", "auth", None, "Failed sign-in attempt");
+        return Err(fail(StatusCode::UNAUTHORIZED, "wrong password"));
+    }
+    state.auth.clear_failures();
+    let token = state.auth.create_session();
+    Ok(with_cookie(
+        ok(json!({"authenticated": true})),
+        session_cookie(&token, auth::SESSION_TTL.as_secs()),
+    ))
+}
+
+async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult {
+    if let Some(token) = session_token(&headers) {
+        state.auth.end_session(&token);
+    }
+    Ok(with_cookie(ok(json!({"authenticated": false})), session_cookie("", 0)))
+}
+
+#[derive(serde::Deserialize)]
+struct PasswordRequest {
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    new: String,
+}
+
+/// Set, change or (with an empty new password) remove the dashboard password.
+async fn auth_password(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PasswordRequest>,
+) -> AppResult {
+    if state.auth.password_set() {
+        if let Some(secs) = state.auth.locked_for() {
+            return Err(fail(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many wrong passwords; try again in {secs} seconds"),
+            ));
+        }
+        if !verify(&state, req.current).await {
+            state.auth.note_failure();
+            return Err(fail(StatusCode::FORBIDDEN, "the current password is wrong"));
+        }
+        state.auth.clear_failures();
+    }
+    if req.new.is_empty() {
+        state.db.set_setting(auth::PASSWORD_KEY, None).await.map_err(internal)?;
+        state.auth.set_hash(None);
+        state.activity("warn", "auth", None, "Dashboard password removed");
+        return Ok(with_cookie(ok(json!({"password_set": false})), session_cookie("", 0)));
+    }
+    auth::validate_new_password(&req.new).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let new = req.new;
+    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&new))
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    state
+        .db
+        .set_setting(auth::PASSWORD_KEY, Some(hash.clone()))
+        .await
+        .map_err(internal)?;
+    // Everyone else is signed out; the caller gets a fresh session.
+    state.auth.set_hash(Some(hash));
+    let token = state.auth.create_session();
+    state.activity("info", "auth", None, "Dashboard password set");
+    Ok(with_cookie(
+        ok(json!({"password_set": true})),
+        session_cookie(&token, auth::SESSION_TTL.as_secs()),
+    ))
 }
 
 /// Sandbox guard (PRD section 5). Because this server can execute scripts,
 /// every request must be addressed to localhost / a private IP, and a browser
 /// request must originate from the dashboard itself. This blocks DNS
 /// rebinding and cross-site requests from pages on the public internet.
-async fn guard(req: Request, next: Next) -> Response {
+///
+/// When a dashboard password is set, everything except the public paths
+/// also needs a signed-in session (or the local CLI's control token).
+async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let host = req
         .headers()
         .get(HOST)
@@ -114,6 +318,14 @@ async fn guard(req: Request, next: Next) -> Response {
             return fail(StatusCode::FORBIDDEN, "cross-origin requests are not allowed");
         }
     }
+    let path = req.uri().path();
+    if state.auth.password_set() && !is_public_path(path) && !is_authenticated(&state, req.headers()) {
+        return if path == "/" {
+            html_page(LOGIN_HTML)
+        } else {
+            fail(StatusCode::UNAUTHORIZED, "sign in required")
+        };
+    }
     let mut res = next.run(req).await;
     res.headers_mut()
         .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -121,18 +333,7 @@ async fn guard(req: Request, next: Next) -> Response {
 }
 
 async fn index() -> Response {
-    (
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                CONTENT_SECURITY_POLICY,
-                "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; \
-                 connect-src 'self' ws: wss:; img-src 'self' data:; frame-ancestors 'none'",
-            ),
-        ],
-        INDEX_HTML,
-    )
-        .into_response()
+    html_page(INDEX_HTML)
 }
 
 // ------------------------------------------------------------- validation --
@@ -213,6 +414,11 @@ fn clean_input(mut t: TargetInput) -> Result<TargetInput, String> {
         _ => None,
     };
     t.backup_on_deploy = Some(t.backup_on_deploy.unwrap_or(false) && t.db_file.is_some());
+    let order = t.start_order.unwrap_or(0);
+    if !(0..=999).contains(&order) {
+        return Err("start order must be between 0 and 999".into());
+    }
+    t.start_order = Some(order);
     Ok(t)
 }
 
@@ -469,6 +675,49 @@ async fn deploy_target(
     reset_restart_state(&state, id);
     let pull = q.get("pull").map(|v| v != "0" && v != "false").unwrap_or(true);
     run_response(automation::deploy(&state, &t, "MANUAL", pull).await)
+}
+
+#[derive(serde::Deserialize)]
+struct RollbackRequest {
+    sha: String,
+}
+
+/// Check out an earlier commit of the tracked branch and deploy it.
+async fn rollback_target(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<RollbackRequest>,
+) -> AppResult {
+    let t = load_target(&state, id).await?;
+    reset_restart_state(&state, id);
+    match automation::rollback(&state, &t, &req.sha).await {
+        Err(e) if e.contains("rollback failed") => Err(fail(StatusCode::CONFLICT, e)),
+        other => run_response(other),
+    }
+}
+
+/// Start a project's stopped targets one after another, in start order.
+async fn project_start(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> AppResult {
+    let members = automation::project_members(&state, &name).await.map_err(internal)?;
+    if members.is_empty() {
+        return Err(fail(StatusCode::NOT_FOUND, "no target belongs to this project"));
+    }
+    for t in &members {
+        reset_restart_state(&state, t.id);
+    }
+    let order: Vec<&str> = members.iter().map(|t| t.name.as_str()).collect();
+    match automation::start_project(&state, name.clone()) {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({"starting": order}))).into_response()),
+        Err(e) => Err(fail(StatusCode::CONFLICT, e)),
+    }
+}
+
+async fn project_stop(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> AppResult {
+    for t in automation::project_members(&state, &name).await.map_err(internal)? {
+        reset_restart_state(&state, t.id);
+    }
+    let stopped = automation::stop_project(&state, &name).await.map_err(internal)?;
+    Ok(ok(json!({"stopping": stopped})))
 }
 
 async fn target_logs(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
@@ -825,13 +1074,122 @@ const PYTHON_COMMANDS: &[QuickCommand] = &[
     QuickCommand { id: "pip-outdated", label: "List outdated packages", description: "Show installed packages that have newer releases.", args: &["-m", "pip", "list", "--outdated"], changes: false, backup_first: false },
 ];
 
-fn detect_commands(dir: &std::path::Path) -> Vec<&'static QuickCommand> {
-    let mut out: Vec<&'static QuickCommand> = Vec::new();
+/// A quick command resolved for one project: which program runs it and with
+/// which arguments.
+#[derive(Debug, Clone)]
+struct ResolvedCommand {
+    id: String,
+    label: String,
+    description: String,
+    program: String,
+    args: Vec<String>,
+    changes: bool,
+    backup_first: bool,
+}
+
+impl ResolvedCommand {
+    fn shown(&self) -> String {
+        let program = self.program.strip_suffix(".cmd").unwrap_or(&self.program);
+        format!("{program} {}", self.args.join(" "))
+    }
+}
+
+fn npm_program() -> &'static str {
+    if cfg!(windows) {
+        "npm.cmd"
+    } else {
+        "npm"
+    }
+}
+
+/// Names of the scripts defined in `package.json`, limited to plain names.
+fn package_scripts(dir: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else { return Vec::new() };
+    if text.len() > 1024 * 1024 {
+        return Vec::new();
+    }
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    parsed
+        .get("scripts")
+        .and_then(Value::as_object)
+        .map(|scripts| {
+            scripts
+                .keys()
+                .filter(|k| {
+                    !k.is_empty()
+                        && k.len() <= 40
+                        && k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// npm scripts offered as quick commands when the project defines them.
+const NPM_SCRIPTS: &[(&str, &str, &str, bool)] = &[
+    ("build", "Build", "Run the project's build script.", true),
+    ("lint", "Lint", "Run the project's lint script.", false),
+    ("test", "Test", "Run the project's test script.", false),
+    ("typecheck", "Type check", "Run the project's typecheck script.", false),
+    ("migrate", "Run migrations", "Run the project's migrate script.", true),
+];
+
+fn detect_commands(dir: &std::path::Path) -> Vec<ResolvedCommand> {
+    let mut out = Vec::new();
+    let python = project_python(dir);
+    let mut from_python = |list: &[QuickCommand]| {
+        for c in list {
+            out.push(ResolvedCommand {
+                id: c.id.to_string(),
+                label: c.label.to_string(),
+                description: c.description.to_string(),
+                program: python.clone(),
+                args: c.args.iter().map(|a| a.to_string()).collect(),
+                changes: c.changes,
+                backup_first: c.backup_first,
+            });
+        }
+    };
     if dir.join("manage.py").is_file() {
-        out.extend(DJANGO_COMMANDS);
+        from_python(DJANGO_COMMANDS);
     }
     if dir.join("requirements.txt").is_file() {
-        out.extend(PYTHON_COMMANDS);
+        from_python(PYTHON_COMMANDS);
+    }
+
+    if dir.join("package.json").is_file() {
+        let npm = |id: &str, label: &str, description: &str, args: &[&str], changes: bool| ResolvedCommand {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            program: npm_program().to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            changes,
+            backup_first: false,
+        };
+        out.push(npm(
+            "npm-install",
+            "Install packages",
+            "npm install: install the dependencies listed in package.json.",
+            &["install"],
+            true,
+        ));
+        if dir.join("package-lock.json").is_file() {
+            out.push(npm(
+                "npm-ci",
+                "Clean install",
+                "npm ci: delete node_modules and install exactly what package-lock.json lists.",
+                &["ci"],
+                true,
+            ));
+        }
+        let defined = package_scripts(dir);
+        for (script, label, description, changes) in NPM_SCRIPTS {
+            if defined.iter().any(|s| s == script) {
+                out.push(npm(&format!("npm-run-{script}"), label, description, &["run", script], *changes));
+            }
+        }
     }
     out
 }
@@ -847,7 +1205,7 @@ async fn list_commands(State(state): State<Arc<AppState>>, Path(id): Path<i64>) 
                 "id": c.id,
                 "label": c.label,
                 "description": c.description,
-                "command": format!("{python} {}", c.args.join(" ")),
+                "command": c.shown(),
                 "changes": c.changes,
                 "backup_first": c.backup_first && t.backup_on_deploy,
             })
@@ -868,8 +1226,7 @@ async fn run_command(
     if cmd.backup_first && t.backup_on_deploy {
         backup::before_run(&state, &t).await;
     }
-    let args: Vec<String> = cmd.args.iter().map(|a| a.to_string()).collect();
-    run_response(runner::start_command(&state, &t, cmd.label, &project_python(&dir), &args).await)
+    run_response(runner::start_command(&state, &t, &cmd.label, &cmd.program, &cmd.args).await)
 }
 
 async fn stop_command(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
@@ -1069,9 +1426,35 @@ fn project_python(dir: &std::path::Path) -> String {
     "python".to_string()
 }
 
+/// Long-running npm scripts that are worth supervising as a process.
+const NPM_PROCESSES: &[(&str, &str, &str)] = &[
+    ("start", "npm_start", "npm start"),
+    ("dev", "npm_dev", "npm dev server"),
+    ("worker", "npm_worker", "npm worker"),
+];
+
+/// Every companion process PortalControl recognises in a project folder.
+fn detect_workers(dir: &std::path::Path) -> Vec<Worker> {
+    let mut out = detect_django_workers(dir);
+    let ext = if cfg!(windows) { "bat" } else { "sh" };
+    let defined = package_scripts(dir);
+    for (script, kind, label) in NPM_PROCESSES {
+        if defined.iter().any(|s| s == script) {
+            out.push(Worker {
+                kind: *kind,
+                label: *label,
+                command: format!("npm run {script}"),
+                script: format!("portalcontrol_{kind}.{ext}"),
+                why: format!("\"{script}\" script in package.json"),
+            });
+        }
+    }
+    out
+}
+
 /// Look for task-queue workers that belong to a Django project: Django-Q
 /// (`manage.py qcluster`) and Celery (worker, and beat when it is configured).
-fn detect_workers(dir: &std::path::Path) -> Vec<Worker> {
+fn detect_django_workers(dir: &std::path::Path) -> Vec<Worker> {
     if !dir.join("manage.py").is_file() {
         return Vec::new();
     }
@@ -1532,6 +1915,69 @@ mod tests {
         assert_eq!(v["workers"][0]["kind"], "qcluster");
         assert_eq!(v["workers"][0]["script_exists"], true);
         assert_eq!(v["workers"][1]["script_exists"], false);
+    }
+
+    #[test]
+    fn node_projects_get_commands_and_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(detect_commands(p).is_empty());
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"name":"portal-ui","scripts":{"build":"vite build","dev":"vite","lint":"eslint .","evil; rm -rf /":"x"}}"#,
+        )
+        .unwrap();
+        let ids: Vec<String> = detect_commands(p).iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, vec!["npm-install", "npm-run-build", "npm-run-lint"]);
+        std::fs::write(p.join("package-lock.json"), "{}").unwrap();
+        let cmds = detect_commands(p);
+        assert_eq!(cmds[1].id, "npm-ci");
+        assert_eq!(cmds[2].shown(), "npm run build");
+        assert!(cmds[2].changes && !cmds[3].changes);
+        assert_eq!(package_scripts(p), vec!["build", "dev", "lint"]);
+
+        let workers = detect_workers(p);
+        assert_eq!(workers.len(), 1);
+        assert_eq!((workers[0].kind, workers[0].command.as_str()), ("npm_dev", "npm run dev"));
+        let (script, created) = create_launcher(p, "npm_dev").unwrap();
+        assert!(created && script.starts_with("portalcontrol_npm_dev."));
+        assert!(std::fs::read_to_string(p.join(script)).unwrap().contains("npm run dev"));
+
+        // A Django project with a front end gets both sets.
+        std::fs::write(p.join("manage.py"), "").unwrap();
+        let ids: Vec<String> = detect_commands(p).iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&"migrate".to_string()) && ids.contains(&"npm-run-build".to_string()));
+    }
+
+    #[test]
+    fn public_paths_and_session_cookies() {
+        for open in ["/assets/styles.css", "/assets/js/app.js", "/api/auth/status", "/api/auth/login", "/api/webhooks/deploy/abc"] {
+            assert!(is_public_path(open), "{open}");
+        }
+        for closed in ["/", "/api/targets", "/ws", "/api/auth/password", "/api/auth/logout", "/api/system/shutdown", "/api/webhooks"] {
+            assert!(!is_public_path(closed), "{closed}");
+        }
+        let cookie = session_cookie("tok", 60);
+        assert!(cookie.contains("pc_session=tok") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+
+        let state = AppState::new(crate::db::Db::open_in_memory().unwrap(), "127.0.0.1:0".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        assert!(!is_authenticated(&state, &headers));
+        let token = state.auth.create_session();
+        headers.insert(COOKIE, format!("x=1; pc_session={token}").parse().unwrap());
+        assert!(is_authenticated(&state, &headers));
+        state.auth.end_session(&token);
+        assert!(!is_authenticated(&state, &headers));
+        headers.insert(auth::CONTROL_HEADER, state.auth.control_token.parse().unwrap());
+        assert!(is_authenticated(&state, &headers));
+
+        // Every asset the page shell references is embedded.
+        for html in [INDEX_HTML, LOGIN_HTML] {
+            for part in html.split("\"/assets/").skip(1) {
+                let name = part.split('"').next().unwrap();
+                assert!(ASSETS.iter().any(|(n, _, _)| *n == name), "{name} is not embedded");
+            }
+        }
     }
 
     #[test]

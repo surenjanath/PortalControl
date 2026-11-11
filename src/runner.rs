@@ -598,6 +598,7 @@ pub fn trigger_label(trigger: &str) -> &str {
         "WEBHOOK" => "webhook",
         "AUTO_RESTART" => "automatic restart after a crash",
         "COMMAND" => "quick command",
+        "ROLLBACK" => "rollback",
         "RESTART" => "restart",
         other => other,
     }

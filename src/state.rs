@@ -99,6 +99,9 @@ pub struct AppState {
     pub restart_log: Mutex<HashMap<i64, Vec<Instant>>>,
     /// Remote commit an auto-deploy last failed on, so it is not retried forever.
     pub auto_deploy_failed: Mutex<HashMap<i64, String>>,
+    pub auth: crate::auth::Auth,
+    /// Projects whose ordered start sequence is in progress.
+    pub starting_projects: Mutex<HashSet<String>>,
     pub started: Instant,
     pub ws_clients: AtomicUsize,
     pub bind: SocketAddr,
@@ -125,6 +128,8 @@ impl AppState {
             restart_queue: Mutex::new(Vec::new()),
             restart_log: Mutex::new(HashMap::new()),
             auto_deploy_failed: Mutex::new(HashMap::new()),
+            auth: crate::auth::Auth::default(),
+            starting_projects: Mutex::new(HashSet::new()),
             started: Instant::now(),
             ws_clients: AtomicUsize::new(0),
             bind,
