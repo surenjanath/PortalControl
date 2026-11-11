@@ -179,6 +179,24 @@
   .side-p:hover { color: var(--text); }
   h2 a.plink:hover { text-decoration: underline; }
 
+  /* ---- new target form ---- */
+  .step { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 14px; }
+  .stepn { width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 12.5px;
+    display: inline-flex; align-items: center; justify-content: center; flex: none; margin-top: 1px; }
+  .step b { font-size: 15px; }
+  .optlabel { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .6px; margin: 14px 0 6px; }
+  .optlabel:first-child { margin-top: 0; }
+  .choice { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; cursor: pointer; }
+  .choice:hover { background: var(--panel2); }
+  .choice.on { border-color: var(--accent); background: var(--accent-soft); }
+  .choice input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+  .choice b { font-weight: 600; } .choice small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .picklist { border: 1px solid var(--line); border-radius: 6px; height: 46vh; overflow: auto; margin-top: 8px; background: var(--bg); }
+  .pick { display: flex; align-items: center; gap: 10px; padding: 7px 12px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  .pick:hover, .pick:focus { background: var(--panel2); outline: none; }
+  .bars i.mixed { background: var(--warn); }
+  .btn.on { background: var(--panel3); border-color: var(--accent); }
+
   /* ---- charts ---- */
   .chart { position: relative; height: 150px; margin: 10px 0 20px 60px; }
   .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }

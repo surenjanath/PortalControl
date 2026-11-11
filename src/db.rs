@@ -54,6 +54,21 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- One row per target per minute: resource use and health, kept for 7 days
+CREATE TABLE IF NOT EXISTS metric_points (
+    target_id INTEGER NOT NULL,
+    t INTEGER NOT NULL,              -- unix seconds, start of the minute
+    cpu REAL,                        -- average % of the whole machine
+    mem INTEGER,                     -- average bytes
+    mem_max INTEGER,
+    procs INTEGER,
+    latency REAL,                    -- average health response time, ms
+    probes INTEGER NOT NULL DEFAULT 0,
+    probes_up INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_id, t),
+    FOREIGN KEY(target_id) REFERENCES portal_targets(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_history_target ON process_execution_history(target_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_scans_target ON security_scan_reports(target_id, id DESC);
 "#;
@@ -169,6 +184,20 @@ pub struct ScanReport {
     pub scanned_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_payload: Option<serde_json::Value>,
+}
+
+/// One minute of a target's metrics (or, after bucketing, one bucket).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MetricPoint {
+    pub target_id: i64,
+    pub t: i64,
+    pub cpu: Option<f64>,
+    pub mem: Option<i64>,
+    pub mem_max: Option<i64>,
+    pub procs: Option<i64>,
+    pub latency: Option<f64>,
+    pub probes: i64,
+    pub probes_up: i64,
 }
 
 #[derive(Clone)]
@@ -432,6 +461,58 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    /// Store minute points. A point for a target that no longer exists is skipped.
+    pub async fn insert_metric_points(&self, points: Vec<MetricPoint>) -> Result<usize, String> {
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "INSERT OR REPLACE INTO metric_points \
+                 (target_id, t, cpu, mem, mem_max, procs, latency, probes, probes_up) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )?;
+            let mut stored = 0;
+            for p in &points {
+                let row = params![
+                    p.target_id, p.t, p.cpu, p.mem, p.mem_max, p.procs, p.latency, p.probes, p.probes_up
+                ];
+                if st.execute(row).is_ok() {
+                    stored += 1;
+                }
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
+    /// Minute points of a target from `since` (unix seconds) on, oldest first.
+    pub async fn metric_points_since(&self, target_id: i64, since: i64) -> Result<Vec<MetricPoint>, String> {
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT target_id, t, cpu, mem, mem_max, procs, latency, probes, probes_up \
+                 FROM metric_points WHERE target_id=?1 AND t>=?2 ORDER BY t",
+            )?;
+            let rows = st.query_map(params![target_id, since], |r| {
+                Ok(MetricPoint {
+                    target_id: r.get(0)?,
+                    t: r.get(1)?,
+                    cpu: r.get(2)?,
+                    mem: r.get(3)?,
+                    mem_max: r.get(4)?,
+                    procs: r.get(5)?,
+                    latency: r.get(6)?,
+                    probes: r.get(7)?,
+                    probes_up: r.get(8)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn prune_metric_points(&self, before: i64) -> Result<usize, String> {
+        self.call(move |c| c.execute("DELETE FROM metric_points WHERE t < ?1", [before]))
+            .await
     }
 
     pub async fn get_setting(&self, key: &'static str) -> Result<Option<String>, String> {
@@ -781,6 +862,35 @@ mod tests {
         assert_eq!(t.name, "old");
         assert_eq!(t.project, "Default");
         assert!(!t.auto_restart);
+    }
+
+    #[tokio::test]
+    async fn metric_points_round_trip_and_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_target(input("a")).await.unwrap();
+        let point = |target_id, t| MetricPoint {
+            target_id,
+            t,
+            cpu: Some(1.5),
+            mem: Some(1_000),
+            mem_max: Some(2_000),
+            procs: Some(3),
+            latency: None,
+            probes: 4,
+            probes_up: 3,
+        };
+        // The point for a missing target is skipped without failing the others.
+        let stored = db
+            .insert_metric_points(vec![point(id, 60), point(999, 60), point(id, 120), point(id, 120)])
+            .await
+            .unwrap();
+        assert_eq!(stored, 3);
+        let rows = db.metric_points_since(id, 100).await.unwrap();
+        assert_eq!(rows, vec![point(id, 120)]);
+        assert_eq!(db.metric_points_since(id, 0).await.unwrap().len(), 2);
+        assert_eq!(db.prune_metric_points(100).await.unwrap(), 1);
+        db.delete_target(id).await.unwrap();
+        assert!(db.metric_points_since(id, 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

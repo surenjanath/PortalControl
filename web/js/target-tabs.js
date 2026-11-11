@@ -98,40 +98,6 @@ function logsBody(id) {
   return { el: h("div", {}, info, log.el), cleanup: () => sinks.delete(sink) };
 }
 
-// ---- metrics ----
-function metricsBody(id) {
-  const c = h("div");
-  let data = null;
-  const paint = () => {
-    const t = T(id);
-    if (!data || !t) return c.replaceChildren(h("p", { class: "muted" }, "Loading\u2026"));
-    const [m, hh, runs] = data;
-    const last = m.samples[m.samples.length - 1];
-    const lat = hh.samples.filter((x) => x.latency_ms !== null);
-    const recent = runs.slice(0, 40).reverse();
-    const maxDur = Math.max(1, ...recent.map((r) => r.duration_ms || 0));
-    c.replaceChildren(
-      !t.running && !m.samples.length ? h("div", { class: "note-box" }, "CPU and memory are sampled every 5 seconds while the target is running, across its whole process tree. Start it to see live figures.") : null,
-      h("div", { class: "grid g2" },
-        h("div", { class: "box" }, chartBlock("CPU", last && t.running ? last.cpu.toFixed(1) + " %" : "", m.samples.map((x) => ({ t: x.t, v: x.cpu })),
-          { minTop: 1, fmt: (v) => (v < 10 ? v.toFixed(1) : Math.round(v)) + "%", note: "of all " + m.cpus + " cores", empty: "Not running", label: "CPU usage of the process tree" })),
-        h("div", { class: "box" }, chartBlock("Memory", last && t.running ? fmtBytes(last.mem) : "", m.samples.map((x) => ({ t: x.t, v: x.mem })),
-          { fmt: fmtBytes, note: last ? last.procs + " process(es) in the tree" : "", empty: "Not running", label: "Memory of the process tree" })),
-        t.health_url ? h("div", { class: "box" }, chartBlock("Health response time", lat.length ? lat[lat.length - 1].latency_ms + " ms" : "", lat.map((x) => ({ t: x.t, v: x.latency_ms })),
-          { fmt: (v) => Math.round(v) + " ms", note: t.uptime_pct !== null ? t.uptime_pct + "% reachable" : "", empty: "No successful probes yet", label: "Health probe response time" })) : null,
-        h("div", { class: "box" }, h("div", { class: "chart-h" }, h("b", {}, "Run durations"), h("span", { class: "dim small" }, "last " + recent.length + " runs, oldest first")),
-          recent.length ? [h("div", { class: "bars" }, recent.map((r) => h("i", { class: r.status, style: "height:" + Math.max(4, ((r.duration_ms || 0) / maxDur) * 100) + "%",
-              title: "#" + r.id + " " + r.status.toLowerCase() + " \u00b7 " + fmtDur(r.duration_ms) + " \u00b7 " + fmtDT(parseUTC(r.executed_at)), onclick: () => go("target/" + id + "/deployments/" + r.id) }))),
-            h("div", { class: "legend" }, h("span", {}, h("i", { style: "background:var(--ok)" }), "Success"), h("span", {}, h("i", { style: "background:var(--err)" }), "Failed"), h("span", {}, h("i", { style: "background:var(--info)" }), "In progress"), h("span", { class: "right" }, "longest " + fmtDur(maxDur)))]
-            : h("div", { class: "muted small", style: "padding:20px 0" }, "No runs yet."))));
-  };
-  const load = () => Promise.all([api("GET", "/api/targets/" + id + "/metrics"), api("GET", "/api/targets/" + id + "/health/history"), api("GET", "/api/targets/" + id + "/history")])
-    .then((d) => { data = d; if (!c.querySelector(".chart:hover")) paint(); }, () => {});
-  load();
-  const timer = setInterval(load, 5000);
-  return { el: c, cleanup: () => clearInterval(timer) };
-}
-
 // ---- security ----
 function secBody(id) {
   const c = h("div");

@@ -4,6 +4,8 @@
 function lineChart(points, o) {
   o = o || {};
   const fmt = o.fmt || ((v) => String(Math.round(v)));
+  // How a point's time is written: clock time by default, date + time for long ranges.
+  const stamp = o.stamp || fmtClock;
   const wrap = h("div", { class: "chart", style: o.height ? "height:" + o.height + "px" : null });
   if (!points.length) { wrap.append(h("div", { class: "none" }, o.empty || "No samples yet")); return wrap; }
   const maxV = Math.max(...points.map((p) => p.v));
@@ -20,7 +22,7 @@ function lineChart(points, o) {
   wrap.append(s("svg", { viewBox: "0 0 100 100", preserveAspectRatio: "none", role: "img", "aria-label": o.label || "chart" },
     single ? null : s("path", { d: line + " L100 100 L0 100 Z", fill: "var(--series)", "fill-opacity": ".12", stroke: "none" }),
     single ? null : s("path", { d: line, fill: "none", stroke: "var(--series)", "stroke-width": "2", "vector-effect": "non-scaling-stroke", "stroke-linejoin": "round" })));
-  wrap.append(h("div", { class: "xl", style: "left:0" }, fmtClock(new Date(t0 * 1000))), h("div", { class: "xl", style: "right:0" }, fmtClock(new Date(t1 * 1000))));
+  wrap.append(h("div", { class: "xl", style: "left:0" }, stamp(new Date(t0 * 1000))), h("div", { class: "xl", style: "right:0" }, stamp(new Date(t1 * 1000))));
   const cross = h("div", { class: "cross" }), pt = h("div", { class: "pt" }), tip = h("div", { class: "tip" });
   wrap.append(cross, pt, tip);
   if (single) { pt.style.display = "block"; pt.style.left = "0%"; pt.style.top = Y(points[0]) + "%"; }
@@ -32,7 +34,7 @@ function lineChart(points, o) {
     const x = X(best);
     cross.style.left = pt.style.left = tip.style.left = x + "%";
     pt.style.top = Y(best) + "%";
-    tip.replaceChildren(h("b", {}, fmt(best.v)), "  " + fmtClock(new Date(best.t * 1000)));
+    tip.replaceChildren(h("b", {}, fmt(best.v)), "  " + stamp(new Date(best.t * 1000)));
     cross.style.display = pt.style.display = tip.style.display = "block";
   });
   wrap.addEventListener("mouseleave", () => { cross.style.display = tip.style.display = "none"; if (!single) pt.style.display = "none"; });

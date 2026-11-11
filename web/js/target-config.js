@@ -16,6 +16,41 @@ CFG.general = (ctx) => {
       mode: h("select", {}, h("option", { value: "TASK" }, "Task \u2014 runs to completion"), h("option", { value: "SERVICE" }, "Service \u2014 long-running")),
     };
     f.mode.value = t.run_mode;
+    // Script picker: the other scripts in the folder, and start scripts
+    // PortalControl can write for this project type. Picking one only fills
+    // in the form; nothing changes until Save.
+    const picker = h("div", { class: "hint", style: "margin:-6px 0 14px" }, "Looking for scripts in the folder…");
+    let pendingHealth = null;
+    const currentPort = (() => { try { return t.health_url ? new URL(t.health_url).port : ""; } catch (_) { return ""; } })();
+    const useScript = (name) => { f.script.value = name; paintPicker(); };
+    let found = null;
+    const paintPicker = () => {
+      if (!found || !found.exists) return picker.replaceChildren(found ? "The working directory could not be read." : "Looking for scripts in the folder…");
+      const chosen = f.script.value.trim().toLowerCase();
+      const known = found.scripts.some((x) => x.toLowerCase() === chosen);
+      picker.replaceChildren(
+        h("div", { class: "rowf" }, h("span", {}, found.project.label + " project. Scripts in the folder:"),
+          found.scripts.length ? found.scripts.map((name) => btn(name, () => useScript(name), "sm" + (name.toLowerCase() === chosen ? " on" : ""))) : h("span", {}, "none")),
+        !known && chosen ? h("div", { class: "errtxt", style: "margin-top:6px" }, "“" + f.script.value + "” is not in the folder.") : null,
+        found.starters.length ? h("div", { style: "margin-top:10px" }, h("div", { style: "margin-bottom:6px" }, "Or have PortalControl write a start script for this project:"),
+          found.starters.map((st) => {
+            const port = st.default_port ? h("input", { type: "number", min: "1", max: "65535", value: currentPort || st.default_port, style: "width:96px;padding:3px 8px", "aria-label": "Port for " + st.label }) : null;
+            const blocked = st.script_exists && !st.script_is_ours;
+            return h("div", { class: "rowf", style: "margin-bottom:6px" }, h("span", { style: "min-width:230px;color:var(--text)" }, st.label), port ? ["port", port] : h("span", { class: "dim" }, "no port needed"),
+              btn(st.script_exists && st.script_is_ours ? "Rewrite & use" : "Write & use", async () => {
+                try {
+                  const made = await api("POST", "/api/fs/starter", { dir: f.dir.value.trim(), starter: st.id, host: "127.0.0.1", port: port ? parseInt(port.value, 10) || null : null });
+                  f.script.value = made.script; f.mode.value = st.run_mode; pendingHealth = made.health_url;
+                  toast(made.script + " written. Press Save to switch to it" + (made.health_url ? " (the health URL is updated too)." : "."));
+                  load();
+                } catch (e) { toast(e.message, true); }
+              }, "sm", null, { disabled: blocked, title: blocked ? st.script + " exists and was not written by PortalControl; pick it from the list above instead" : st.description }));
+          })) : null);
+    };
+    const load = () => api("GET", "/api/fs/inspect?dir=" + encodeURIComponent(f.dir.value.trim())).then((r) => { found = r; paintPicker(); }, () => {});
+    load();
+    f.script.addEventListener("input", paintPicker);
+    f.dir.addEventListener("change", load);
     return [
       live((x) => h("div", { class: "box", style: "margin-bottom:22px" }, facts([
         ["Status", pill(tStatus(x))],
@@ -31,8 +66,10 @@ CFG.general = (ctx) => {
         field("Description", f.desc),
         field("Working directory", f.dir, "Absolute path on this machine. The folder is used in place."),
         h("div", { class: "cols" }, field("Script", f.script, "Run through " + (sys ? sys.shell : "the host shell") + " with the working directory as current directory."), field("Run mode", f.mode)),
+        picker,
         h("datalist", { id: "projlist2" }, [...new Set(targets.map((x) => x.project))].map((p) => h("option", { value: p }))),
-      ], () => ({ name: f.name.value, description: f.desc.value, project: f.project.value, working_directory: f.dir.value, script_name: f.script.value, run_mode: f.mode.value })),
+      ], () => Object.assign({ name: f.name.value, description: f.desc.value, project: f.project.value, working_directory: f.dir.value, script_name: f.script.value, run_mode: f.mode.value },
+        pendingHealth ? { health_url: pendingHealth } : {})),
       h("div", { style: "margin-top:18px" }, h("a", { class: "btn", href: "#/new/" + id }, icon("copy"), "Clone this target")),
     ];
 };

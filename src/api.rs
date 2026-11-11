@@ -38,6 +38,8 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("js/router.js", JS, include_str!("../web/js/router.js")),
     ("js/pages-home.js", JS, include_str!("../web/js/pages-home.js")),
     ("js/pages-project.js", JS, include_str!("../web/js/pages-project.js")),
+    ("js/pages-new.js", JS, include_str!("../web/js/pages-new.js")),
+    ("js/target-metrics.js", JS, include_str!("../web/js/target-metrics.js")),
     ("js/target.js", JS, include_str!("../web/js/target.js")),
     ("js/target-config.js", JS, include_str!("../web/js/target-config.js")),
     ("js/target-tabs.js", JS, include_str!("../web/js/target-tabs.js")),
@@ -121,6 +123,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/auth/password", post(auth_password))
         .route("/api/targets/{id}/rollback", post(rollback_target))
+        .route("/api/targets/{id}/metrics/history", get(metrics_history))
+        .route("/api/targets/{id}/processes", get(target_processes))
+        .route("/api/fs/list", get(fs_list))
+        .route("/api/fs/port", get(fs_port))
+        .route("/api/fs/starter", post(fs_starter))
         .route("/api/projects/{name}/start", post(project_start))
         .route("/api/projects/{name}/stop", post(project_stop))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -878,6 +885,67 @@ async fn target_metrics(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
     Ok(ok(body))
 }
 
+/// The processes in a running target's tree, plus the disk its folder is on.
+async fn target_processes(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let body = {
+        let m = state.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        json!({
+            "processes": m.processes.get(&id).cloned().unwrap_or_default(),
+            "disk": m.disk_for(&t.working_directory),
+        })
+    };
+    Ok(ok(body))
+}
+
+/// Minute history from the database for the 24-hour and 7-day views:
+/// bucketed series, availability, latency figures and the outage list.
+async fn metrics_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Params,
+) -> AppResult {
+    load_target(&state, id).await?;
+    let (span, bucket): (i64, i64) = match q.get("range").map(String::as_str) {
+        Some("7d") => (7 * 24 * 3600, 1800),
+        Some("1h") => (3600, 60),
+        _ => (24 * 3600, 300),
+    };
+    let now = crate::util::now_secs() as i64;
+    let rows = state.db.metric_points_since(id, now - span).await.map_err(internal)?;
+
+    let probes: i64 = rows.iter().map(|p| p.probes).sum();
+    let up: i64 = rows.iter().map(|p| p.probes_up).sum();
+    let mut latencies: Vec<f64> = rows.iter().filter_map(|p| p.latency).collect();
+    latencies.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| -> Option<f64> {
+        if latencies.is_empty() {
+            None
+        } else {
+            let i = ((latencies.len() as f64 - 1.0) * p).round() as usize;
+            Some(latencies[i.min(latencies.len() - 1)])
+        }
+    };
+    let cpu: Vec<f64> = rows.iter().filter_map(|p| p.cpu).collect();
+    let running_minutes = cpu.len();
+    Ok(ok(json!({
+        "range_secs": span,
+        "bucket_secs": bucket,
+        "points": crate::metrics::bucketed(&rows, bucket),
+        "minutes_recorded": rows.len(),
+        "running_minutes": running_minutes,
+        "availability_pct": if probes > 0 { Some((up as f64 * 10000.0 / probes as f64).round() / 100.0) } else { None },
+        "latency_avg": if latencies.is_empty() { None } else { Some(latencies.iter().sum::<f64>() / latencies.len() as f64) },
+        "latency_p50": pct(0.5),
+        "latency_p95": pct(0.95),
+        "latency_max": latencies.last(),
+        "cpu_avg": if cpu.is_empty() { None } else { Some(cpu.iter().sum::<f64>() / cpu.len() as f64) },
+        "cpu_peak": cpu.iter().cloned().fold(None, |m: Option<f64>, v| Some(m.map_or(v, |x| x.max(v)))),
+        "mem_peak": rows.iter().filter_map(|p| p.mem_max).max(),
+        "outages": crate::metrics::outages(&rows).into_iter().take(25).collect::<Vec<_>>(),
+    })))
+}
+
 // --------------------------------------------------------------- webhooks --
 
 async fn webhook_enable(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
@@ -1030,9 +1098,31 @@ fn inspect_dir(dir: &std::path::Path) -> Value {
     sqlite_files.sort();
     sqlite_files.truncate(10);
 
+    let project = detect_project(dir);
+    let starters: Vec<Value> = project
+        .starters
+        .iter()
+        .map(|s| {
+            let existing = std::fs::read_to_string(dir.join(s.script())).ok();
+            json!({
+                "id": s.id,
+                "label": s.label,
+                "description": s.description,
+                "commands": s.lines,
+                "default_port": s.default_port,
+                "run_mode": s.run_mode,
+                "script": s.script(),
+                "script_exists": existing.is_some(),
+                "script_is_ours": existing.map(|t| t.contains(GENERATED_MARKER)).unwrap_or(false),
+            })
+        })
+        .collect();
+
     let info = git::inspect(dir, "main");
     json!({
         "exists": true,
+        "project": {"kind": project.kind, "label": project.label},
+        "starters": starters,
         "sqlite_files": sqlite_files,
         "workers": workers,
         "suggested_name": dir.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -1385,6 +1475,403 @@ async fn import_config(
     Ok(ok(json!({"created": created, "skipped": skipped, "errors": errors})))
 }
 
+// ------------------------------------------------ project type / starters --
+
+/// Every generated script carries this, so PortalControl can tell its own
+/// launchers (safe to regenerate) from files the user wrote (never touched).
+const GENERATED_MARKER: &str = "Created by PortalControl";
+
+/// A way to run a project that has no script of its own. PortalControl can
+/// write the launcher script for it. `{host}` and `{port}` are filled in.
+#[derive(Debug, Clone)]
+struct Starter {
+    id: &'static str,
+    label: String,
+    description: String,
+    lines: Vec<String>,
+    default_port: Option<u16>,
+    run_mode: &'static str,
+    /// Pass the port as the `PORT` environment variable instead of an argument.
+    port_env: bool,
+}
+
+impl Starter {
+    fn script(&self) -> String {
+        let ext = if cfg!(windows) { "bat" } else { "sh" };
+        format!("portalcontrol_{}.{ext}", self.id.replace('-', "_"))
+    }
+
+    fn body(&self, host: &str, port: Option<u16>) -> String {
+        let port_text = port.map(|p| p.to_string()).unwrap_or_default();
+        let lines: Vec<String> = self
+            .lines
+            .iter()
+            .map(|l| l.replace("{host}", host).replace("{port}", &port_text))
+            .collect();
+        let many = lines.len() > 1;
+        let mut out = String::new();
+        if cfg!(windows) {
+            out.push_str(&format!(
+                "@echo off\r\nREM {GENERATED_MARKER}: {}. Change it from the dashboard rather than by hand.\r\ncd /d \"%~dp0\"\r\n",
+                self.label
+            ));
+            if self.port_env {
+                out.push_str(&format!("set PORT={port_text}\r\nset HOST={host}\r\n"));
+            }
+            for line in &lines {
+                // A multi-step script stops at the first step that fails.
+                out.push_str(&if many { format!("{line} || exit /b 1\r\n") } else { format!("{line}\r\n") });
+            }
+        } else {
+            out.push_str(&format!(
+                "#!/bin/sh\n# {GENERATED_MARKER}: {}. Change it from the dashboard rather than by hand.\ncd \"$(dirname \"$0\")\" || exit 1\nset -e\n",
+                self.label
+            ));
+            if self.port_env {
+                out.push_str(&format!("export PORT={port_text}\nexport HOST={host}\n"));
+            }
+            for (i, line) in lines.iter().enumerate() {
+                let last = i + 1 == lines.len();
+                out.push_str(&if last && !many { format!("exec {line}\n") } else { format!("{line}\n") });
+            }
+        }
+        out
+    }
+}
+
+struct ProjectInfo {
+    kind: &'static str,
+    label: &'static str,
+    starters: Vec<Starter>,
+}
+
+/// Lower-cased text of the Python dependency manifests at the top level.
+fn python_deps(dir: &std::path::Path) -> String {
+    let mut text = String::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten().take(2_000) {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if (name.starts_with("requirements") && name.ends_with(".txt")) || name == "pyproject.toml" || name == "pipfile" {
+                text.push_str(&read_small(&entry.path()));
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+/// First immediate sub-directory that contains `file`, e.g. the Django
+/// project package (the one holding `wsgi.py`).
+fn package_with(dir: &std::path::Path, file: &str) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .take(2_000)
+        .filter(|e| e.path().join(file).is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .collect();
+    names.sort();
+    names.into_iter().next()
+}
+
+/// Work out what kind of project a folder holds and how it could be started.
+fn detect_project(dir: &std::path::Path) -> ProjectInfo {
+    let python = project_python(dir);
+    let deps = python_deps(dir);
+    let has = |f: &str| dir.join(f).is_file();
+    let service = |id, label: &str, description: &str, line: String, port: u16| Starter {
+        id,
+        label: label.to_string(),
+        description: description.to_string(),
+        lines: vec![line],
+        default_port: Some(port),
+        run_mode: "SERVICE",
+        port_env: false,
+    };
+    let mut starters = Vec::new();
+    let (mut kind, mut label) = ("unknown", "Unrecognised project");
+
+    if has("manage.py") {
+        (kind, label) = ("django", "Django");
+        starters.push(service(
+            "runserver",
+            "Django development server",
+            "manage.py runserver. Simple and fine for internal tools; Django itself advises a WSGI server for production.",
+            format!("{python} manage.py runserver {{host}}:{{port}} --noreload"),
+            8000,
+        ));
+        if let Some(pkg) = package_with(dir, "wsgi.py") {
+            if deps.contains("waitress") {
+                starters.push(service(
+                    "waitress",
+                    "Waitress (production WSGI server)",
+                    "Serves the project with Waitress, which is in its requirements. Suitable for production on Windows.",
+                    format!("{python} -m waitress --listen={{host}}:{{port}} {pkg}.wsgi:application"),
+                    8000,
+                ));
+            }
+            if deps.contains("gunicorn") && !cfg!(windows) {
+                starters.push(service(
+                    "gunicorn",
+                    "Gunicorn (production WSGI server)",
+                    "Serves the project with Gunicorn, which is in its requirements.",
+                    format!("{python} -m gunicorn --bind {{host}}:{{port}} {pkg}.wsgi:application"),
+                    8000,
+                ));
+            }
+        }
+        let mut lines = Vec::new();
+        if has("requirements.txt") {
+            lines.push(format!("{python} -m pip install -r requirements.txt"));
+        }
+        lines.push(format!("{python} manage.py migrate --noinput"));
+        let collects = package_with(dir, "settings.py")
+            .map(|pkg| read_small(&dir.join(pkg).join("settings.py")).contains("static_root"))
+            .unwrap_or(false);
+        if collects {
+            lines.push(format!("{python} manage.py collectstatic --noinput"));
+        }
+        starters.push(Starter {
+            id: "deploy",
+            label: "Django deploy task".into(),
+            description: "Installs requirements, applies migrations and collects static files, stopping at the first step that fails. Runs to completion; pair it with a server target.".into(),
+            lines,
+            default_port: None,
+            run_mode: "TASK",
+            port_env: false,
+        });
+    } else if deps.contains("fastapi") && (has("main.py") || has("app.py") || dir.join("app").join("main.py").is_file()) {
+        (kind, label) = ("fastapi", "FastAPI");
+        let module = if has("main.py") { "main" } else if has("app.py") { "app" } else { "app.main" };
+        starters.push(service(
+            "uvicorn",
+            "Uvicorn server",
+            "Serves the FastAPI app with Uvicorn.",
+            format!("{python} -m uvicorn {module}:app --host {{host}} --port {{port}}"),
+            8000,
+        ));
+    } else if deps.contains("streamlit") && (has("app.py") || has("main.py") || has("streamlit_app.py")) {
+        (kind, label) = ("streamlit", "Streamlit");
+        let file = if has("streamlit_app.py") { "streamlit_app.py" } else if has("app.py") { "app.py" } else { "main.py" };
+        starters.push(service(
+            "streamlit",
+            "Streamlit app",
+            "Runs the Streamlit app without opening a browser.",
+            format!("{python} -m streamlit run {file} --server.port {{port}} --server.address {{host}} --server.headless true"),
+            8501,
+        ));
+    } else if deps.contains("flask") && (has("app.py") || has("wsgi.py") || has("application.py")) {
+        (kind, label) = ("flask", "Flask");
+        let module = if has("app.py") { "app" } else if has("wsgi.py") { "wsgi" } else { "application" };
+        starters.push(service(
+            "flask",
+            "Flask server",
+            "flask run. Fine for internal tools; use a WSGI server for production.",
+            format!("{python} -m flask --app {module} run --host {{host}} --port {{port}}"),
+            5000,
+        ));
+    }
+
+    let scripts = package_scripts(dir);
+    if has("package.json") {
+        if kind == "unknown" {
+            (kind, label) = ("node", "Node.js");
+        }
+        for (script, id, text) in [("start", "npm-start", "npm start"), ("dev", "npm-dev", "npm dev server")] {
+            if scripts.iter().any(|s| s == script) {
+                starters.push(Starter {
+                    id,
+                    label: text.to_string(),
+                    description: format!("Runs the \"{script}\" script from package.json. The port is passed as the PORT environment variable, which most Node servers honour; if this one does not, the port set here only affects the health check."),
+                    lines: vec![format!("npm run {script}")],
+                    default_port: Some(3000),
+                    run_mode: "SERVICE",
+                    port_env: true,
+                });
+            }
+        }
+    }
+    if kind == "unknown" && has("index.html") {
+        (kind, label) = ("static", "Static site");
+        starters.push(service(
+            "static",
+            "Static file server",
+            "Serves this folder with Python's built-in web server.",
+            "python -m http.server {port} --bind {host}".to_string(),
+            8080,
+        ));
+    }
+    if kind == "unknown" && !deps.is_empty() {
+        (kind, label) = ("python", "Python");
+    }
+    ProjectInfo { kind, label, starters }
+}
+
+/// Write (or regenerate) the launcher script of a starter. A file that was
+/// not generated by PortalControl is never overwritten.
+fn create_starter(
+    dir: &std::path::Path,
+    id: &str,
+    host: &str,
+    port: Option<u16>,
+) -> Result<(String, Option<String>), String> {
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err("directory does not exist".into());
+    }
+    if host != "127.0.0.1" && host != "0.0.0.0" {
+        return Err("host must be 127.0.0.1 or 0.0.0.0".into());
+    }
+    let starter = detect_project(dir)
+        .starters
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("'{id}' is not available for this project"))?;
+    let port = match (starter.default_port, port) {
+        (None, _) => None,
+        (Some(_), Some(p)) if p >= 1 => Some(p),
+        (Some(_), _) => return Err("a port between 1 and 65535 is required".into()),
+    };
+    let script = starter.script();
+    let path = dir.join(&script);
+    if path.exists() && !std::fs::read_to_string(&path).unwrap_or_default().contains(GENERATED_MARKER) {
+        return Err(format!(
+            "{script} already exists and was not created by PortalControl. Choose it as the script instead."
+        ));
+    }
+    std::fs::write(&path, starter.body(host, port))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok((script, port.map(|p| format!("http://127.0.0.1:{p}/"))))
+}
+
+#[derive(serde::Deserialize)]
+struct StarterRequest {
+    dir: String,
+    starter: String,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+async fn fs_starter(State(state): State<Arc<AppState>>, Json(req): Json<StarterRequest>) -> AppResult {
+    let dir = std::path::PathBuf::from(req.dir.trim().trim_matches('"'));
+    let shown = dir.display().to_string();
+    let (script, health_url) = tokio::task::spawn_blocking(move || {
+        create_starter(&dir, &req.starter, req.host.as_deref().unwrap_or("127.0.0.1"), req.port)
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    state.activity("info", "system", None, format!("Start script {script} written in {shown}"));
+    Ok(ok(json!({"script": script, "health_url": health_url})))
+}
+
+/// Is something already listening on this port on this machine?
+fn port_in_use(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).is_ok()
+        || std::net::TcpListener::bind(addr).is_err()
+}
+
+/// Check a port before it goes into a start script: whether something is
+/// listening on it now, whether another target already claims it, and the
+/// next port that is clear of both.
+async fn fs_port(State(state): State<Arc<AppState>>, Query(q): Params) -> AppResult {
+    let Some(port) = q.get("port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0) else {
+        return Err(fail(StatusCode::BAD_REQUEST, "port must be a number between 1 and 65535"));
+    };
+    let except: Option<i64> = q.get("except").and_then(|v| v.parse().ok());
+    let claimed: Vec<(u16, String)> = state
+        .db
+        .list_targets()
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|t| Some(t.id) != except)
+        .filter_map(|t| {
+            let url = t.health_url.as_deref()?;
+            health::parse_url(url).ok().map(|u| (u.port, t.name.clone()))
+        })
+        .collect();
+    let report = tokio::task::spawn_blocking(move || {
+        let used_by = claimed.iter().find(|(p, _)| *p == port).map(|(_, n)| n.clone());
+        let in_use = port_in_use(port);
+        let suggestion = if in_use || used_by.is_some() {
+            (port..=port.saturating_add(200))
+                .find(|p| !claimed.iter().any(|(c, _)| c == p) && !port_in_use(*p))
+        } else {
+            None
+        };
+        json!({"port": port, "in_use": in_use, "used_by": used_by, "suggestion": suggestion})
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?;
+    Ok(ok(report))
+}
+
+/// Sub-folders of a directory, for the folder picker on the New target page.
+async fn fs_list(State(state): State<Arc<AppState>>, Query(q): Params) -> AppResult {
+    let wanted = q.get("dir").map(|d| d.trim().trim_matches('"').to_string()).unwrap_or_default();
+    // The drives the metrics worker already knows about. Probing every drive
+    // letter here would stall for seconds on disconnected network drives.
+    let mut roots: Vec<String> = state
+        .metrics
+        .lock()
+        .map(|m| m.disks.iter().map(|d| d.mount.clone()).collect())
+        .unwrap_or_default();
+    if roots.is_empty() {
+        roots.push(if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() });
+    }
+    let report = tokio::task::spawn_blocking(move || list_dir(&wanted, roots))
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    Ok(ok(report))
+}
+
+fn list_dir(wanted: &str, roots: Vec<String>) -> Value {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    let dir = if wanted.is_empty() {
+        home.clone().unwrap_or_else(|| std::path::PathBuf::from(roots.first().cloned().unwrap_or_default()))
+    } else {
+        std::path::PathBuf::from(wanted)
+    };
+    if !dir.is_absolute() || !dir.is_dir() {
+        return json!({"error": "that folder does not exist", "roots": roots, "home": home});
+    }
+    let markers = [".git", "manage.py", "package.json", "requirements.txt", "pyproject.toml"];
+    let mut entries: Vec<(String, bool)> = std::fs::read_dir(&dir)
+        .map(|list| {
+            list.flatten()
+                .take(5_000)
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+                .filter(|(name, _)| !name.starts_with('.') && !name.starts_with('$'))
+                .map(|(name, path)| {
+                    let project = markers.iter().any(|m| path.join(m).exists());
+                    (name, project)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries.truncate(600);
+    json!({
+        "dir": dir.display().to_string(),
+        "parent": dir.parent().map(|p| p.display().to_string()),
+        "is_project": markers.iter().any(|m| dir.join(m).exists()),
+        "entries": entries.iter().map(|(name, project)| json!({
+            "name": name,
+            "path": dir.join(name).display().to_string(),
+            "project": project,
+        })).collect::<Vec<_>>(),
+        "roots": roots,
+        "home": home,
+    })
+}
+
 // ---------------------------------------------------- companion processes --
 
 /// A background process a project needs besides its main script, e.g. a
@@ -1616,6 +2103,7 @@ async fn system(State(state): State<Arc<AppState>>) -> AppResult {
             "os_version": m.os_version,
             "cpus": m.cpus,
             "mem_total": m.mem_total,
+            "disks": m.disks,
             "latest": m.host.back(),
         })
     };
@@ -1915,6 +2403,106 @@ mod tests {
         assert_eq!(v["workers"][0]["kind"], "qcluster");
         assert_eq!(v["workers"][0]["script_exists"], true);
         assert_eq!(v["workers"][1]["script_exists"], false);
+    }
+
+    #[test]
+    fn project_types_are_detected_with_start_options() {
+        let ids = |p: &std::path::Path| -> (String, Vec<&'static str>) {
+            let info = detect_project(p);
+            (info.kind.to_string(), info.starters.iter().map(|s| s.id).collect())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(ids(p), ("unknown".to_string(), vec![]));
+
+        std::fs::write(p.join("index.html"), "<h1>hi</h1>").unwrap();
+        assert_eq!(ids(p), ("static".to_string(), vec!["static"]));
+
+        std::fs::write(p.join("requirements.txt"), "fastapi\nuvicorn\n").unwrap();
+        std::fs::write(p.join("main.py"), "app = FastAPI()").unwrap();
+        assert_eq!(ids(p), ("fastapi".to_string(), vec!["uvicorn"]));
+        assert!(detect_project(p).starters[0].lines[0].contains("uvicorn main:app --host {host} --port {port}"));
+
+        // Django wins, and offers Waitress because it is in the requirements.
+        std::fs::write(p.join("manage.py"), "").unwrap();
+        std::fs::write(p.join("requirements.txt"), "Django\nwaitress\n").unwrap();
+        std::fs::create_dir(p.join("portal")).unwrap();
+        std::fs::write(p.join("portal").join("wsgi.py"), "").unwrap();
+        std::fs::write(p.join("portal").join("settings.py"), "STATIC_ROOT = BASE_DIR / 'static'\n").unwrap();
+        let (kind, starters) = ids(p);
+        assert_eq!(kind, "django");
+        assert_eq!(starters, vec!["runserver", "waitress", "deploy"]);
+        let info = detect_project(p);
+        assert!(info.starters[1].lines[0].contains("portal.wsgi:application"));
+        assert_eq!(info.starters[2].lines.len(), 3, "pip install, migrate, collectstatic");
+        assert_eq!((info.starters[2].run_mode, info.starters[2].default_port), ("TASK", None));
+
+        // A front end next to Django adds its npm start option.
+        std::fs::write(p.join("package.json"), r#"{"scripts":{"start":"node server.js"}}"#).unwrap();
+        assert_eq!(ids(p).1, vec!["runserver", "waitress", "deploy", "npm-start"]);
+    }
+
+    #[test]
+    fn start_scripts_are_generated_and_user_files_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("manage.py"), "").unwrap();
+
+        assert!(create_starter(p, "runserver", "127.0.0.1", None).unwrap_err().contains("port"));
+        assert!(create_starter(p, "runserver", "8.8.8.8", Some(8000)).is_err());
+        assert!(create_starter(p, "nope", "127.0.0.1", Some(8000)).is_err());
+
+        let (script, health) = create_starter(p, "runserver", "127.0.0.1", Some(8123)).unwrap();
+        assert_eq!(health.as_deref(), Some("http://127.0.0.1:8123/"));
+        assert!(runner::validate_target_paths(&p.to_string_lossy(), &script).is_ok());
+        let body = std::fs::read_to_string(p.join(&script)).unwrap();
+        assert!(body.contains("manage.py runserver 127.0.0.1:8123 --noreload") && body.contains(GENERATED_MARKER));
+        assert!(!body.contains("{port}") && !body.contains("{host}"));
+
+        // Changing the port regenerates our own script ...
+        create_starter(p, "runserver", "0.0.0.0", Some(9000)).unwrap();
+        assert!(std::fs::read_to_string(p.join(&script)).unwrap().contains("0.0.0.0:9000"));
+        // ... but a file the user wrote under that name is never overwritten.
+        std::fs::write(p.join(&script), "my own script").unwrap();
+        assert!(create_starter(p, "runserver", "127.0.0.1", Some(8000)).unwrap_err().contains("already exists"));
+        assert_eq!(std::fs::read_to_string(p.join(&script)).unwrap(), "my own script");
+
+        // The deploy task has no port and stops at the first failing step.
+        let (deploy, health) = create_starter(p, "deploy", "127.0.0.1", None).unwrap();
+        assert!(health.is_none());
+        let body = std::fs::read_to_string(p.join(deploy)).unwrap();
+        assert!(body.contains("migrate --noinput"));
+
+        let v = inspect_dir(p);
+        assert_eq!(v["project"]["kind"], "django");
+        assert_eq!(v["starters"][0]["script_exists"], true);
+        assert_eq!(v["starters"][0]["script_is_ours"], false);
+    }
+
+    #[test]
+    fn folders_are_listed_and_busy_ports_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::create_dir(p.join("beta_portal")).unwrap();
+        std::fs::create_dir(p.join("Alpha")).unwrap();
+        std::fs::create_dir(p.join(".hidden")).unwrap();
+        std::fs::write(p.join("beta_portal").join("manage.py"), "").unwrap();
+        std::fs::write(p.join("file.txt"), "").unwrap();
+        let roots = || vec!["/".to_string()];
+        let v = list_dir(&p.to_string_lossy(), roots());
+        let names: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Alpha", "beta_portal"]);
+        assert_eq!(v["entries"][1]["project"], true);
+        assert_eq!(v["entries"][0]["project"], false);
+        assert!(v["parent"].is_string() && !v["roots"].as_array().unwrap().is_empty());
+        assert!(list_dir("relative/path", roots())["error"].is_string());
+        assert!(list_dir("", roots())["dir"].is_string(), "defaults to the home folder");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_in_use(port));
+        drop(listener);
+        assert!(!port_in_use(port));
     }
 
     #[test]
