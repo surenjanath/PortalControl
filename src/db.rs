@@ -52,6 +52,26 @@ CREATE INDEX IF NOT EXISTS idx_history_target ON process_execution_history(targe
 CREATE INDEX IF NOT EXISTS idx_scans_target ON security_scan_reports(target_id, id DESC);
 "#;
 
+/// Columns added after the first release. Applied to both fresh and existing
+/// databases, so an upgrade never loses registered targets or history.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("portal_targets", "description", "TEXT NOT NULL DEFAULT ''"),
+    ("portal_targets", "project", "TEXT NOT NULL DEFAULT 'Default'"),
+    ("portal_targets", "env_vars", "TEXT NOT NULL DEFAULT ''"),
+    ("portal_targets", "schedule", "TEXT"),
+    ("portal_targets", "auto_deploy", "INTEGER NOT NULL DEFAULT 0"),
+    ("portal_targets", "auto_restart", "INTEGER NOT NULL DEFAULT 0"),
+    ("portal_targets", "webhook_token", "TEXT"),
+    ("process_execution_history", "commit_sha", "TEXT"),
+    ("process_execution_history", "commit_message", "TEXT"),
+    ("process_execution_history", "label", "TEXT"),
+    ("portal_targets", "db_file", "TEXT"),
+    ("portal_targets", "backup_on_deploy", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Execution-history rows kept per target; older ones are pruned.
+const RUNS_KEPT_PER_TARGET: i64 = 200;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Target {
     pub id: i64,
@@ -65,9 +85,19 @@ pub struct Target {
     pub run_mode: String,
     pub autostart: bool,
     pub timeout_secs: u64,
+    pub description: String,
+    pub project: String,
+    pub env_vars: String,
+    pub schedule: Option<String>,
+    pub auto_deploy: bool,
+    pub auto_restart: bool,
+    pub webhook_token: Option<String>,
+    /// SQLite database inside the working directory that is backed up.
+    pub db_file: Option<String>,
+    pub backup_on_deploy: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TargetInput {
     pub name: String,
     pub working_directory: String,
@@ -82,6 +112,22 @@ pub struct TargetInput {
     pub autostart: Option<bool>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub env_vars: Option<String>,
+    #[serde(default)]
+    pub schedule: Option<String>,
+    #[serde(default)]
+    pub auto_deploy: Option<bool>,
+    #[serde(default)]
+    pub auto_restart: Option<bool>,
+    #[serde(default)]
+    pub db_file: Option<String>,
+    #[serde(default)]
+    pub backup_on_deploy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +139,12 @@ pub struct RunRecord {
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub executed_at: String,
+    pub commit_sha: Option<String>,
+    pub commit_message: Option<String>,
+    /// Set for one-off commands (e.g. "Apply migrations"); empty for script runs.
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured_logs: Option<String>,
 }
@@ -114,7 +166,11 @@ pub struct Db {
 }
 
 const TARGET_COLS: &str = "id, name, working_directory, script_name, git_branch, \
-     current_git_status, created_at, health_url, run_mode, autostart, timeout_secs";
+     current_git_status, created_at, health_url, run_mode, autostart, timeout_secs, \
+     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy";
+
+const RUN_COLS: &str = "h.id, h.target_id, h.triggered_by, h.status, h.exit_code, h.duration_ms, \
+     h.executed_at, h.commit_sha, h.commit_message, h.label";
 
 fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
     Ok(Target {
@@ -131,7 +187,75 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         run_mode: r.get(8)?,
         autostart: r.get::<_, i64>(9)? != 0,
         timeout_secs: r.get::<_, i64>(10)?.max(0) as u64,
+        description: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+        project: r
+            .get::<_, Option<String>>(12)?
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "Default".into()),
+        env_vars: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        schedule: r.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty()),
+        auto_deploy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
+        auto_restart: r.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
+        webhook_token: r.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
+        db_file: r.get::<_, Option<String>>(18)?.filter(|s| !s.is_empty()),
+        backup_on_deploy: r.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
     })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RunExtra {
+    None,
+    Logs,
+    TargetName,
+}
+
+/// Maps the `RUN_COLS` projection; `extra` says what column 9 holds, if any.
+fn row_to_run(r: &Row, extra: RunExtra) -> rusqlite::Result<RunRecord> {
+    let tail: Option<String> = match extra {
+        RunExtra::None => None,
+        _ => r.get::<_, Option<String>>(10)?,
+    };
+    Ok(RunRecord {
+        id: r.get(0)?,
+        target_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        triggered_by: r.get(2)?,
+        status: r.get(3)?,
+        exit_code: r.get(4)?,
+        duration_ms: r.get(5)?,
+        executed_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        commit_sha: r.get(7)?,
+        commit_message: r.get(8)?,
+        label: r.get(9)?,
+        target_name: if extra == RunExtra::TargetName { tail.clone() } else { None },
+        captured_logs: if extra == RunExtra::Logs {
+            Some(tail.unwrap_or_default())
+        } else {
+            None
+        },
+    })
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let exists = {
+        let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = st.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for name in names {
+            if name? == column {
+                found = true;
+            }
+        }
+        found
+    };
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
+    Ok(())
 }
 
 impl Db {
@@ -148,6 +272,13 @@ impl Db {
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(SCHEMA)?;
+        for (table, column, decl) in MIGRATIONS {
+            add_column_if_missing(&conn, table, column, decl)?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_webhook \
+             ON portal_targets(webhook_token) WHERE webhook_token IS NOT NULL;",
+        )?;
         // Anything still RUNNING belongs to a previous manager process.
         conn.execute(
             "UPDATE process_execution_history SET status='FAILED', \
@@ -198,11 +329,25 @@ impl Db {
         .await
     }
 
+    pub async fn target_by_webhook(&self, token: String) -> Result<Option<Target>, String> {
+        self.call(move |c| {
+            c.query_row(
+                &format!("SELECT {TARGET_COLS} FROM portal_targets WHERE webhook_token=?1"),
+                [token],
+                row_to_target,
+            )
+            .optional()
+        })
+        .await
+    }
+
     pub async fn insert_target(&self, t: TargetInput) -> Result<i64, String> {
         self.call(move |c| {
             c.execute(
                 "INSERT INTO portal_targets (name, working_directory, script_name, git_branch, \
-                 health_url, run_mode, autostart, timeout_secs) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                 health_url, run_mode, autostart, timeout_secs, description, project, env_vars, \
+                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     t.name,
                     t.working_directory,
@@ -212,6 +357,14 @@ impl Db {
                     t.run_mode.unwrap_or_else(|| "TASK".into()),
                     t.autostart.unwrap_or(false) as i64,
                     t.timeout_secs.unwrap_or(300) as i64,
+                    t.description.unwrap_or_default(),
+                    t.project.unwrap_or_else(|| "Default".into()),
+                    t.env_vars.unwrap_or_default(),
+                    t.schedule,
+                    t.auto_deploy.unwrap_or(false) as i64,
+                    t.auto_restart.unwrap_or(false) as i64,
+                    t.db_file,
+                    t.backup_on_deploy.unwrap_or(false) as i64,
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -223,7 +376,9 @@ impl Db {
         self.call(move |c| {
             let n = c.execute(
                 "UPDATE portal_targets SET name=?1, working_directory=?2, script_name=?3, \
-                 git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8 WHERE id=?9",
+                 git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8, \
+                 description=?9, project=?10, env_vars=?11, schedule=?12, auto_deploy=?13, \
+                 auto_restart=?14, db_file=?15, backup_on_deploy=?16 WHERE id=?17",
                 params![
                     t.name,
                     t.working_directory,
@@ -233,6 +388,14 @@ impl Db {
                     t.run_mode.unwrap_or_else(|| "TASK".into()),
                     t.autostart.unwrap_or(false) as i64,
                     t.timeout_secs.unwrap_or(300) as i64,
+                    t.description.unwrap_or_default(),
+                    t.project.unwrap_or_else(|| "Default".into()),
+                    t.env_vars.unwrap_or_default(),
+                    t.schedule,
+                    t.auto_deploy.unwrap_or(false) as i64,
+                    t.auto_restart.unwrap_or(false) as i64,
+                    t.db_file,
+                    t.backup_on_deploy.unwrap_or(false) as i64,
                     id
                 ],
             )?;
@@ -257,12 +420,43 @@ impl Db {
         .await
     }
 
-    pub async fn start_run(&self, target_id: i64, triggered_by: String) -> Result<i64, String> {
+    pub async fn set_webhook_token(&self, id: i64, token: Option<String>) -> Result<(), String> {
         self.call(move |c| {
             c.execute(
-                "INSERT INTO process_execution_history (target_id, triggered_by, status) \
-                 VALUES (?1, ?2, 'RUNNING')",
-                params![target_id, triggered_by],
+                "UPDATE portal_targets SET webhook_token=?1 WHERE id=?2",
+                params![token, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn start_run(
+        &self,
+        target_id: i64,
+        triggered_by: String,
+        commit_sha: Option<String>,
+        commit_message: Option<String>,
+    ) -> Result<i64, String> {
+        self.start_run_labeled(target_id, triggered_by, commit_sha, commit_message, None)
+            .await
+    }
+
+    pub async fn start_run_labeled(
+        &self,
+        target_id: i64,
+        triggered_by: String,
+        commit_sha: Option<String>,
+        commit_message: Option<String>,
+        label: Option<String>,
+    ) -> Result<i64, String> {
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO process_execution_history \
+                 (target_id, triggered_by, status, commit_sha, commit_message, label) \
+                 VALUES (?1, ?2, 'RUNNING', ?3, ?4, ?5)",
+                params![target_id, triggered_by, commit_sha, commit_message, label],
             )?;
             Ok(c.last_insert_rowid())
         })
@@ -288,24 +482,50 @@ impl Db {
         .await
     }
 
+    /// Drop the oldest history rows of a target beyond the retention limit.
+    pub async fn prune_runs(&self, target_id: i64) -> Result<usize, String> {
+        self.call(move |c| {
+            c.execute(
+                "DELETE FROM process_execution_history WHERE target_id=?1 AND id NOT IN \
+                 (SELECT id FROM process_execution_history WHERE target_id=?1 \
+                  ORDER BY id DESC LIMIT ?2)",
+                params![target_id, RUNS_KEPT_PER_TARGET],
+            )
+        })
+        .await
+    }
+
+    /// Delete the finished runs of a target. A run in progress is kept.
+    pub async fn clear_runs(&self, target_id: i64) -> Result<usize, String> {
+        self.call(move |c| {
+            c.execute(
+                "DELETE FROM process_execution_history WHERE target_id=?1 AND status!='RUNNING'",
+                [target_id],
+            )
+        })
+        .await
+    }
+
     pub async fn list_runs(&self, target_id: i64, limit: i64) -> Result<Vec<RunRecord>, String> {
         self.call(move |c| {
-            let mut st = c.prepare(
-                "SELECT id, target_id, triggered_by, status, exit_code, duration_ms, executed_at \
-                 FROM process_execution_history WHERE target_id=?1 ORDER BY id DESC LIMIT ?2",
-            )?;
-            let rows = st.query_map(params![target_id, limit], |r| {
-                Ok(RunRecord {
-                    id: r.get(0)?,
-                    target_id: r.get(1)?,
-                    triggered_by: r.get(2)?,
-                    status: r.get(3)?,
-                    exit_code: r.get(4)?,
-                    duration_ms: r.get(5)?,
-                    executed_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    captured_logs: None,
-                })
-            })?;
+            let mut st = c.prepare(&format!(
+                "SELECT {RUN_COLS} FROM process_execution_history h \
+                 WHERE h.target_id=?1 ORDER BY h.id DESC LIMIT ?2"
+            ))?;
+            let rows = st.query_map(params![target_id, limit], |r| row_to_run(r, RunExtra::None))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Most recent runs across every target, with the target's name.
+    pub async fn list_recent_runs(&self, limit: i64) -> Result<Vec<RunRecord>, String> {
+        self.call(move |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {RUN_COLS}, t.name FROM process_execution_history h \
+                 JOIN portal_targets t ON t.id = h.target_id ORDER BY h.id DESC LIMIT ?1"
+            ))?;
+            let rows = st.query_map([limit], |r| row_to_run(r, RunExtra::TargetName))?;
             rows.collect()
         })
         .await
@@ -314,21 +534,12 @@ impl Db {
     pub async fn get_run(&self, run_id: i64) -> Result<Option<RunRecord>, String> {
         self.call(move |c| {
             c.query_row(
-                "SELECT id, target_id, triggered_by, status, exit_code, duration_ms, executed_at, \
-                 captured_logs FROM process_execution_history WHERE id=?1",
+                &format!(
+                    "SELECT {RUN_COLS}, h.captured_logs FROM process_execution_history h \
+                     WHERE h.id=?1"
+                ),
                 [run_id],
-                |r| {
-                    Ok(RunRecord {
-                        id: r.get(0)?,
-                        target_id: r.get(1)?,
-                        triggered_by: r.get(2)?,
-                        status: r.get(3)?,
-                        exit_code: r.get(4)?,
-                        duration_ms: r.get(5)?,
-                        executed_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                        captured_logs: Some(r.get::<_, Option<String>>(7)?.unwrap_or_default()),
-                    })
-                },
+                |r| row_to_run(r, RunExtra::Logs),
             )
             .optional()
         })
@@ -384,6 +595,29 @@ impl Db {
         })
         .await
     }
+
+    /// Scan summaries (no payload), newest first, for the trend view.
+    pub async fn list_scans(&self, target_id: i64, limit: i64) -> Result<Vec<ScanReport>, String> {
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT id, target_id, critical_issues_found, vulnerable_packages_found, \
+                 scanned_at FROM security_scan_reports WHERE target_id=?1 \
+                 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = st.query_map(params![target_id, limit], |r| {
+                Ok(ScanReport {
+                    id: r.get(0)?,
+                    target_id: r.get(1)?,
+                    critical_issues_found: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    vulnerable_packages_found: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    scanned_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    raw_payload: None,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -395,11 +629,7 @@ mod tests {
             name: name.into(),
             working_directory: "/tmp/x".into(),
             script_name: "deploy.sh".into(),
-            git_branch: None,
-            health_url: None,
-            run_mode: None,
-            autostart: None,
-            timeout_secs: None,
+            ..Default::default()
         }
     }
 
@@ -412,20 +642,48 @@ mod tests {
         assert_eq!(t.current_git_status, "UP_TO_DATE");
         assert_eq!(t.run_mode, "TASK");
         assert_eq!(t.timeout_secs, 300);
-        assert!(!t.autostart);
+        assert_eq!(t.project, "Default");
+        assert!(!t.autostart && !t.auto_deploy && !t.auto_restart);
+        assert!(t.schedule.is_none() && t.webhook_token.is_none() && t.env_vars.is_empty());
 
         db.set_git_status(id, "DIRTY").await.unwrap();
         assert_eq!(db.list_targets().await.unwrap()[0].current_git_status, "DIRTY");
+
+        let mut edit = input("claims");
+        edit.project = Some("Insurance".into());
+        edit.env_vars = Some("DEBUG=1".into());
+        edit.schedule = Some("0 2 * * *".into());
+        edit.auto_deploy = Some(true);
+        assert!(db.update_target(id, edit).await.unwrap());
+        let t = db.get_target(id).await.unwrap().unwrap();
+        assert_eq!(t.project, "Insurance");
+        assert_eq!(t.env_vars, "DEBUG=1");
+        assert_eq!(t.schedule.as_deref(), Some("0 2 * * *"));
+        assert!(t.auto_deploy);
 
         assert!(db.delete_target(id).await.unwrap());
         assert!(db.get_target(id).await.unwrap().is_none());
     }
 
     #[tokio::test]
+    async fn webhook_token_lookup() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_target(input("a")).await.unwrap();
+        assert!(db.target_by_webhook("abc".into()).await.unwrap().is_none());
+        db.set_webhook_token(id, Some("abc".into())).await.unwrap();
+        assert_eq!(db.target_by_webhook("abc".into()).await.unwrap().unwrap().id, id);
+        db.set_webhook_token(id, None).await.unwrap();
+        assert!(db.target_by_webhook("abc".into()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn history_cascades_on_target_delete() {
         let db = Db::open_in_memory().unwrap();
         let id = db.insert_target(input("a")).await.unwrap();
-        let run = db.start_run(id, "MANUAL".into()).await.unwrap();
+        let run = db
+            .start_run(id, "MANUAL".into(), Some("abc123".into()), Some("fix".into()))
+            .await
+            .unwrap();
         db.finish_run(run, "SUCCESS", Some(0), 12, "hello".into())
             .await
             .unwrap();
@@ -433,11 +691,47 @@ mod tests {
         let r = db.get_run(run).await.unwrap().unwrap();
         assert_eq!(r.status, "SUCCESS");
         assert_eq!(r.captured_logs.as_deref(), Some("hello"));
+        assert_eq!(r.commit_sha.as_deref(), Some("abc123"));
         assert_eq!(db.list_runs(id, 10).await.unwrap().len(), 1);
+        let recent = db.list_recent_runs(10).await.unwrap();
+        assert_eq!(recent[0].target_name.as_deref(), Some("a"));
+        assert_eq!(db.list_scans(id, 10).await.unwrap().len(), 1);
 
         db.delete_target(id).await.unwrap();
         assert!(db.get_run(run).await.unwrap().is_none());
         assert!(db.latest_scan(id, false).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_is_pruned_and_cleared() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_target(input("a")).await.unwrap();
+        for _ in 0..(RUNS_KEPT_PER_TARGET + 5) {
+            let run = db.start_run(id, "MANUAL".into(), None, None).await.unwrap();
+            db.finish_run(run, "SUCCESS", Some(0), 1, String::new()).await.unwrap();
+        }
+        assert_eq!(db.prune_runs(id).await.unwrap(), 5);
+        let live = db.start_run(id, "MANUAL".into(), None, None).await.unwrap();
+        assert_eq!(db.clear_runs(id).await.unwrap(), RUNS_KEPT_PER_TARGET as usize);
+        let left = db.list_runs(id, 10).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, live);
+    }
+
+    #[tokio::test]
+    async fn old_databases_are_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO portal_targets (name, working_directory, script_name) VALUES ('old','/x','d.sh')",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let t = &db.list_targets().await.unwrap()[0];
+        assert_eq!(t.name, "old");
+        assert_eq!(t.project, "Default");
+        assert!(!t.auto_restart);
     }
 
     #[tokio::test]

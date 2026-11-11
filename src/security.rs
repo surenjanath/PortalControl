@@ -295,6 +295,12 @@ pub fn start_scan(state: &Arc<AppState>, target: Target) -> Result<(), String> {
             "vulnerable_packages_found": vulnerable,
             "ok": bandit.is_ok() && audit.is_ok() && stored.is_ok(),
         }));
+        state.activity(
+            if high + vulnerable > 0 { "warn" } else { "ok" },
+            "scan",
+            Some(id),
+            format!("Security scan finished: {high} critical issue(s), {vulnerable} vulnerable package(s)"),
+        );
         log(&format!(
             "security scan finished for target {id}: {high} critical, {vulnerable} vulnerable packages"
         ));

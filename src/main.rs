@@ -6,10 +6,13 @@
 //! scans. See `prd.md` and `README.md`.
 
 mod api;
+mod automation;
 mod autostart;
+mod backup;
 mod db;
 mod git;
 mod health;
+mod metrics;
 mod net;
 mod runner;
 mod security;
@@ -311,10 +314,14 @@ fn serve(opts: Opts) -> Result<(), String> {
         let db = db::Db::open(&db_path)
             .map_err(|e| format!("cannot open database {}: {e}", db_path.display()))?;
         let state = AppState::new(db, addr);
+        let _ = state.data_dir.set(data_dir.clone());
+        let _ = state.serve_args.set(opts.passthrough_args());
 
         git::init();
         git::spawn_worker(state.clone());
         health::spawn_worker(state.clone());
+        metrics::spawn_worker(state.clone());
+        automation::spawn_worker(state.clone());
 
         log(&format!(
             "PortalControl-Core {} listening on http://{addr}  (data: {})",

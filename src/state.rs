@@ -3,12 +3,15 @@
 use crate::db::Db;
 use crate::git::GitInfo;
 use crate::health::HealthInfo;
+use crate::metrics::MetricsStore;
 use crate::util::now_ms;
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Notify};
 
@@ -16,6 +19,11 @@ use tokio::sync::{broadcast, Notify};
 pub const MAX_LINE_BYTES: usize = 8 * 1024;
 const TAIL_MAX_LINES: usize = 2_000;
 const TAIL_MAX_BYTES: usize = 512 * 1024;
+
+/// Health probes remembered per target (one hour at the 15 s probe interval).
+pub const HEALTH_HISTORY: usize = 240;
+/// Entries kept in the activity feed.
+const ACTIVITY_MAX: usize = 300;
 
 /// Bounded ring of the most recent output lines of one run.
 #[derive(Default)]
@@ -60,8 +68,18 @@ pub struct RunHandle {
     pub run_id: i64,
     pub pid: Option<u32>,
     pub started: Instant,
+    pub started_ms: u64,
+    pub triggered_by: String,
     pub cancel: Arc<Notify>,
     pub tail: Arc<Mutex<LogTail>>,
+}
+
+/// One health probe result, kept for the latency chart and uptime figure.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthSample {
+    pub t: u64,
+    pub status: &'static str,
+    pub latency_ms: Option<u64>,
 }
 
 pub struct AppState {
@@ -69,12 +87,25 @@ pub struct AppState {
     pub events: broadcast::Sender<String>,
     pub running: tokio::sync::Mutex<HashMap<i64, RunHandle>>,
     pub health: Mutex<HashMap<i64, HealthInfo>>,
+    pub health_history: Mutex<HashMap<i64, VecDeque<HealthSample>>>,
     pub git: Mutex<HashMap<i64, GitInfo>>,
     pub scans_running: Mutex<HashSet<i64>>,
+    pub metrics: Mutex<MetricsStore>,
+    pub activity: Mutex<VecDeque<Value>>,
+    activity_seq: AtomicU64,
+    /// Services waiting to be restarted after an unexpected exit: (target, due).
+    pub restart_queue: Mutex<Vec<(i64, Instant)>>,
+    /// Recent automatic restarts per target, for crash-loop detection.
+    pub restart_log: Mutex<HashMap<i64, Vec<Instant>>>,
+    /// Remote commit an auto-deploy last failed on, so it is not retried forever.
+    pub auto_deploy_failed: Mutex<HashMap<i64, String>>,
     pub started: Instant,
     pub ws_clients: AtomicUsize,
     pub bind: SocketAddr,
     pub shutdown: Notify,
+    pub data_dir: OnceLock<PathBuf>,
+    /// The `serve` options this manager was started with (for login autostart).
+    pub serve_args: OnceLock<Vec<String>>,
 }
 
 impl AppState {
@@ -85,18 +116,54 @@ impl AppState {
             events,
             running: tokio::sync::Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
+            health_history: Mutex::new(HashMap::new()),
             git: Mutex::new(HashMap::new()),
             scans_running: Mutex::new(HashSet::new()),
+            metrics: Mutex::new(MetricsStore::default()),
+            activity: Mutex::new(VecDeque::new()),
+            activity_seq: AtomicU64::new(1),
+            restart_queue: Mutex::new(Vec::new()),
+            restart_log: Mutex::new(HashMap::new()),
+            auto_deploy_failed: Mutex::new(HashMap::new()),
             started: Instant::now(),
             ws_clients: AtomicUsize::new(0),
             bind,
             shutdown: Notify::new(),
+            data_dir: OnceLock::new(),
+            serve_args: OnceLock::new(),
         })
     }
 
     /// Broadcast an event to every connected dashboard. Having no listeners is fine.
-    pub fn emit(&self, event: serde_json::Value) {
+    pub fn emit(&self, event: Value) {
         let _ = self.events.send(event.to_string());
+    }
+
+    /// Record a notable event in the activity feed and push it to dashboards.
+    /// `level` is one of `info`, `ok`, `warn`, `error`.
+    pub fn activity(
+        &self,
+        level: &str,
+        kind: &str,
+        target_id: Option<i64>,
+        message: impl Into<String>,
+    ) {
+        let event = json!({
+            "type": "activity",
+            "id": self.activity_seq.fetch_add(1, Ordering::Relaxed),
+            "ts": now_ms(),
+            "level": level,
+            "kind": kind,
+            "target_id": target_id,
+            "message": message.into(),
+        });
+        if let Ok(mut ring) = self.activity.lock() {
+            ring.push_back(event.clone());
+            while ring.len() > ACTIVITY_MAX {
+                ring.pop_front();
+            }
+        }
+        self.emit(event);
     }
 
     /// Record one output line: append to the bounded tail and stream it out.
@@ -142,5 +209,20 @@ mod tests {
         }
         assert!(t.bytes <= TAIL_MAX_BYTES);
         assert!(t.joined().starts_with("[portalcontrol] ..."));
+    }
+
+    #[test]
+    fn activity_feed_is_bounded_and_ordered() {
+        let state = AppState::new(
+            crate::db::Db::open_in_memory().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        for i in 0..(ACTIVITY_MAX + 10) {
+            state.activity("info", "test", Some(1), format!("event {i}"));
+        }
+        let ring = state.activity.lock().unwrap();
+        assert_eq!(ring.len(), ACTIVITY_MAX);
+        assert_eq!(ring.back().unwrap()["message"], format!("event {}", ACTIVITY_MAX + 9));
+        assert!(ring.front().unwrap()["id"].as_u64() < ring.back().unwrap()["id"].as_u64());
     }
 }

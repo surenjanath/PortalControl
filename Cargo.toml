@@ -1,6 +1,6 @@
 [package]
 name = "portalcontrol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PortalControl-Core: native cross-platform automation supervisor"
 license = "MIT"
@@ -15,6 +15,10 @@ axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Local wall-clock time for cron schedules.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# CPU / memory of the host and of each supervised process tree.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # libgit2 is compiled in, so no system Git install is needed.
 [target.'cfg(windows)'.dependencies]

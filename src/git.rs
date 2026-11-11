@@ -3,9 +3,13 @@
 
 use crate::state::AppState;
 use crate::util::{log, now_secs};
-use git2::{Cred, CredentialType, FetchOptions, RemoteCallbacks, Repository, StatusOptions};
+use git2::{
+    build::CheckoutBuilder, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository,
+    Status, StatusOptions,
+};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +37,55 @@ pub struct GitInfo {
     pub last_fetch: Option<String>,
     pub fetch_error: Option<String>,
     pub error: Option<String>,
+    /// First line of the checked-out commit's message.
+    pub head_summary: Option<String>,
+    pub head_author: Option<String>,
+    /// Commit time of HEAD, unix seconds.
+    pub head_time: Option<i64>,
+    pub remote_summary: Option<String>,
+    /// URL of `origin`, with any embedded credentials removed.
+    pub remote_url: Option<String>,
+}
+
+/// One commit in the history view.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub summary: String,
+    pub author: String,
+    pub time: i64,
+    /// `incoming` (on origin, not pulled yet), `local` (not on origin) or `synced`.
+    pub state: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PullOutcome {
+    pub updated: bool,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub commits: usize,
+}
+
+/// Remove `user:password@` from an http(s) remote URL before showing it.
+pub fn strip_credentials(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.starts_with("http") {
+            let (authority, tail) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            if let Some((_, host)) = authority.rsplit_once('@') {
+                return format!("{scheme}://{host}{tail}");
+            }
+        }
+    }
+    url.to_string()
 }
 
 impl GitInfo {
@@ -50,8 +103,26 @@ impl GitInfo {
             last_fetch: None,
             fetch_error: None,
             error,
+            head_summary: None,
+            head_author: None,
+            head_time: None,
+            remote_summary: None,
+            remote_url: None,
         }
     }
+}
+
+fn commit_info(repo: &Repository, oid: Oid, state: &'static str) -> Option<CommitInfo> {
+    let c = repo.find_commit(oid).ok()?;
+    let author = c.author().name().unwrap_or("").to_string();
+    let info = CommitInfo {
+        sha: oid.to_string(),
+        summary: c.summary().unwrap_or("").to_string(),
+        author,
+        time: c.time().seconds(),
+        state,
+    };
+    Some(info)
 }
 
 /// One-time libgit2 configuration.
@@ -112,6 +183,18 @@ pub fn inspect(dir: &Path, branch: &str) -> GitInfo {
         .ok();
     info.head = head.map(|o| o.to_string());
     info.remote_head = remote.map(|o| o.to_string());
+    if let Some(c) = head.and_then(|h| commit_info(&repo, h, "synced")) {
+        info.head_summary = Some(c.summary);
+        info.head_author = Some(c.author);
+        info.head_time = Some(c.time);
+    }
+    info.remote_summary = remote
+        .and_then(|r| commit_info(&repo, r, "synced"))
+        .map(|c| c.summary);
+    info.remote_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().map(strip_credentials));
 
     if let (Some(h), Some(r)) = (head, remote) {
         if h != r {
@@ -166,6 +249,155 @@ pub fn fetch(dir: &Path) -> Result<(), String> {
     remote
         .fetch(&[] as &[&str], Some(&mut options), None)
         .map_err(|e| e.message().to_string())
+}
+
+/// Recent history: commits waiting on `origin/<branch>` first, then the
+/// commits of HEAD, each marked incoming / local / synced.
+pub fn recent_commits(dir: &Path, branch: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let err = |e: git2::Error| e.message().to_string();
+    let head = repo.head().ok().and_then(|h| h.target());
+    let remote = repo
+        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
+        .ok();
+    let mut out = Vec::new();
+
+    if let (Some(h), Some(r)) = (head, remote) {
+        if h != r {
+            let mut walk = repo.revwalk().map_err(err)?;
+            walk.push(r).map_err(err)?;
+            walk.hide(h).map_err(err)?;
+            for oid in walk.flatten().take(limit) {
+                out.extend(commit_info(&repo, oid, "incoming"));
+            }
+        }
+    }
+
+    let Some(h) = head else { return Ok(out) };
+    let mut unpushed: HashSet<Oid> = HashSet::new();
+    if let Some(r) = remote {
+        if h != r {
+            let mut walk = repo.revwalk().map_err(err)?;
+            walk.push(h).map_err(err)?;
+            walk.hide(r).map_err(err)?;
+            unpushed.extend(walk.flatten().take(500));
+        }
+    }
+    let mut walk = repo.revwalk().map_err(err)?;
+    walk.push(h).map_err(err)?;
+    for oid in walk.flatten().take(limit) {
+        let state = if unpushed.contains(&oid) {
+            "local"
+        } else if remote.is_some() {
+            "synced"
+        } else {
+            "local"
+        };
+        out.extend(commit_info(&repo, oid, state));
+    }
+    Ok(out)
+}
+
+fn status_label(s: Status) -> &'static str {
+    if s.contains(Status::CONFLICTED) {
+        "conflicted"
+    } else if s.contains(Status::WT_NEW) {
+        "untracked"
+    } else if s.contains(Status::INDEX_NEW) {
+        "added"
+    } else if s.intersects(Status::WT_DELETED | Status::INDEX_DELETED) {
+        "deleted"
+    } else if s.intersects(Status::WT_RENAMED | Status::INDEX_RENAMED) {
+        "renamed"
+    } else {
+        "modified"
+    }
+}
+
+/// The files that make the working tree DIRTY.
+pub fn changed_files(dir: &Path, limit: usize) -> Result<Vec<ChangedFile>, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| e.message().to_string())?;
+    Ok(statuses
+        .iter()
+        .take(limit)
+        .map(|e| ChangedFile {
+            path: e.path().unwrap_or("?").to_string(),
+            status: status_label(e.status()),
+        })
+        .collect())
+}
+
+/// Fetch `origin` and fast-forward the checked-out branch to
+/// `origin/<branch>`. This is the only operation that changes the working
+/// tree, and it refuses to do so unless the update is a clean fast-forward:
+/// the tracked branch must be checked out, tracked files must be unmodified
+/// and there must be no local commits missing from origin.
+pub fn pull_ff(dir: &Path, branch: &str) -> Result<PullOutcome, String> {
+    fetch(dir)?;
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let err = |e: git2::Error| e.message().to_string();
+
+    let head = repo.head().map_err(err)?;
+    if !head.is_branch() || head.shorthand() != Some(branch) {
+        return Err(format!(
+            "the checked-out branch is '{}', not the tracked branch '{branch}'",
+            head.shorthand().unwrap_or("detached HEAD")
+        ));
+    }
+    let head_oid = head.target().ok_or("HEAD does not point at a commit")?;
+    let remote_oid = repo
+        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
+        .map_err(|_| format!("origin has no branch '{branch}'"))?;
+    if head_oid == remote_oid {
+        return Ok(PullOutcome {
+            updated: false,
+            from: Some(head_oid.to_string()),
+            to: Some(head_oid.to_string()),
+            commits: 0,
+        });
+    }
+    let (ahead, behind) = repo.graph_ahead_behind(head_oid, remote_oid).map_err(err)?;
+    if ahead > 0 {
+        return Err(format!(
+            "the local branch has {ahead} commit(s) that are not on origin; a fast-forward is not possible"
+        ));
+    }
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let modified = repo.statuses(Some(&mut opts)).map_err(err)?.len();
+    if modified > 0 {
+        return Err(format!(
+            "{modified} tracked file(s) have local changes; commit or discard them before pulling"
+        ));
+    }
+
+    let object = repo.find_object(remote_oid, None).map_err(err)?;
+    let mut checkout = CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&object, Some(&mut checkout))
+        .map_err(|e| format!("checkout failed: {}", e.message()))?;
+    let refname = format!("refs/heads/{branch}");
+    repo.find_reference(&refname)
+        .and_then(|mut r| r.set_target(remote_oid, "portalcontrol: fast-forward"))
+        .map_err(err)?;
+    repo.set_head(&refname).map_err(err)?;
+    Ok(PullOutcome {
+        updated: true,
+        from: Some(head_oid.to_string()),
+        to: Some(remote_oid.to_string()),
+        commits: behind,
+    })
 }
 
 /// Inspect (optionally fetching first) one target and publish the result.
@@ -234,6 +466,35 @@ pub async fn refresh_target(
     if info.is_repo {
         let _ = state.db.set_git_status(target_id, info.status).await;
     }
+    if let Some(prev) = previous.as_ref().filter(|p| p.is_repo && info.is_repo) {
+        if info.behind > prev.behind {
+            state.activity(
+                "info",
+                "git",
+                Some(target_id),
+                format!(
+                    "{} new commit(s) available on origin/{}{}",
+                    info.behind,
+                    info.tracked_branch,
+                    info.remote_summary
+                        .as_deref()
+                        .map(|s| format!(": {s}"))
+                        .unwrap_or_default()
+                ),
+            );
+        } else if prev.status != info.status {
+            state.activity(
+                "info",
+                "git",
+                Some(target_id),
+                format!(
+                    "Git state changed from {} to {}",
+                    prev.status.replace('_', " "),
+                    info.status.replace('_', " ")
+                ),
+            );
+        }
+    }
     if let Ok(mut g) = state.git.lock() {
         g.insert(target_id, info.clone());
     }
@@ -257,8 +518,17 @@ pub fn spawn_worker(state: Arc<AppState>) {
                 for t in targets {
                     let st = state.clone();
                     tokio::spawn(async move {
-                        refresh_target(&st, t.id, t.working_directory, t.git_branch, do_fetch)
-                            .await;
+                        let info = refresh_target(
+                            &st,
+                            t.id,
+                            t.working_directory.clone(),
+                            t.git_branch.clone(),
+                            do_fetch,
+                        )
+                        .await;
+                        if do_fetch && t.auto_deploy {
+                            crate::automation::auto_deploy(&st, &t, &info).await;
+                        }
                     });
                 }
                 if let Ok(mut g) = state.git.lock() {
@@ -368,6 +638,94 @@ mod tests {
         let info = inspect(dir.path(), "main");
         assert_eq!(info.dirty_files, 0);
         assert_eq!(info.status, UP_TO_DATE);
+    }
+
+    #[test]
+    fn commit_details_history_and_changed_files() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = init_repo(origin_dir.path());
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::clone(origin_dir.path().to_str().unwrap(), clone_dir.path()).unwrap();
+
+        let info = inspect(clone_dir.path(), "main");
+        assert_eq!(info.head_summary.as_deref(), Some("initial"));
+        assert_eq!(info.head_author.as_deref(), Some("Tester"));
+        assert!(info.head_time.unwrap() > 1_600_000_000);
+        assert!(info.remote_url.is_some());
+
+        std::fs::write(origin_dir.path().join("app.py"), "print('v2')\n").unwrap();
+        commit_all(&origin, "remote change");
+        fetch(clone_dir.path()).unwrap();
+        std::fs::write(clone_dir.path().join("local.txt"), "x").unwrap();
+        commit_all(&clone, "local change");
+        std::fs::write(clone_dir.path().join("notes.txt"), "wip").unwrap();
+        std::fs::write(clone_dir.path().join("app.py"), "print('edited')\n").unwrap();
+
+        let log = recent_commits(clone_dir.path(), "main", 10).unwrap();
+        let states: Vec<(&str, &str)> = log.iter().map(|c| (c.summary.as_str(), c.state)).collect();
+        assert_eq!(
+            states,
+            vec![("remote change", "incoming"), ("local change", "local"), ("initial", "synced")]
+        );
+        assert_eq!(inspect(clone_dir.path(), "main").remote_summary.as_deref(), Some("remote change"));
+
+        let mut files = changed_files(clone_dir.path(), 50).unwrap();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let files: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        assert_eq!(files, vec![("app.py", "modified"), ("notes.txt", "untracked")]);
+    }
+
+    #[test]
+    fn pull_fast_forwards_only_when_it_is_safe() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = init_repo(origin_dir.path());
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = Repository::clone(origin_dir.path().to_str().unwrap(), clone_dir.path()).unwrap();
+
+        // Nothing to do.
+        assert!(!pull_ff(clone_dir.path(), "main").unwrap().updated);
+
+        // Remote moves ahead by two commits; an untracked file does not block the pull.
+        std::fs::write(origin_dir.path().join("app.py"), "print('v2')\n").unwrap();
+        commit_all(&origin, "second");
+        std::fs::write(origin_dir.path().join("new.py"), "print('new')\n").unwrap();
+        let tip = commit_all(&origin, "third");
+        std::fs::write(clone_dir.path().join("db.sqlite3"), "local data").unwrap();
+        let out = pull_ff(clone_dir.path(), "main").unwrap();
+        assert!(out.updated);
+        assert_eq!(out.commits, 2);
+        assert_eq!(out.to, Some(tip.to_string()));
+        // (`contains`: a global core.autocrlf setting may change line endings.)
+        assert!(std::fs::read_to_string(clone_dir.path().join("app.py")).unwrap().contains("v2"));
+        assert!(clone_dir.path().join("new.py").exists());
+        assert_eq!(std::fs::read_to_string(clone_dir.path().join("db.sqlite3")).unwrap(), "local data");
+        let info = inspect(clone_dir.path(), "main");
+        assert_eq!((info.ahead, info.behind), (0, 0));
+        assert_eq!(info.head, Some(tip.to_string()));
+
+        // A modified tracked file blocks the pull and is left untouched.
+        std::fs::write(origin_dir.path().join("app.py"), "print('v3')\n").unwrap();
+        commit_all(&origin, "fourth");
+        std::fs::write(clone_dir.path().join("app.py"), "print('mine')\n").unwrap();
+        assert!(pull_ff(clone_dir.path(), "main").unwrap_err().contains("local changes"));
+        assert_eq!(std::fs::read_to_string(clone_dir.path().join("app.py")).unwrap(), "print('mine')\n");
+
+        // A local commit (diverged history) blocks it too.
+        commit_all(&clone, "local work");
+        assert!(pull_ff(clone_dir.path(), "main").unwrap_err().contains("fast-forward"));
+
+        // So does tracking a branch that is not the one checked out.
+        assert!(pull_ff(clone_dir.path(), "release").unwrap_err().contains("tracked branch"));
+    }
+
+    #[test]
+    fn credentials_are_stripped_from_remote_urls() {
+        assert_eq!(
+            strip_credentials("https://user:secret@example.com/org/repo.git"),
+            "https://example.com/org/repo.git"
+        );
+        assert_eq!(strip_credentials("https://example.com/r.git"), "https://example.com/r.git");
+        assert_eq!(strip_credentials("git@example.com:org/repo.git"), "git@example.com:org/repo.git");
     }
 
     #[test]

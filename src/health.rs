@@ -2,7 +2,7 @@
 //! target to LIVE | SLOW | DOWN. Uses a tiny built-in HTTP/1.1 client so no
 //! TLS stack or HTTP library has to be linked in.
 
-use crate::state::AppState;
+use crate::state::{AppState, HealthSample, HEALTH_HISTORY};
 use crate::util::{fmt_utc, now_secs};
 use serde::Serialize;
 use serde_json::json;
@@ -169,20 +169,43 @@ pub async fn probe(url: &str) -> HealthInfo {
 /// Probe one target now, cache the result and notify dashboards on change.
 pub async fn probe_target(state: &Arc<AppState>, target_id: i64, url: &str) -> HealthInfo {
     let info = probe(url).await;
-    let changed = {
+    let previous = {
         let mut map = match state.health.lock() {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
-        let changed = map
-            .get(&target_id)
-            .map(|old| old.status != info.status)
-            .unwrap_or(true);
-        map.insert(target_id, info.clone());
-        changed
+        map.insert(target_id, info.clone()).map(|old| old.status)
     };
-    if changed {
+    if let Ok(mut history) = state.health_history.lock() {
+        let ring = history.entry(target_id).or_default();
+        ring.push_back(HealthSample {
+            t: now_secs(),
+            status: info.status,
+            latency_ms: info.latency_ms,
+        });
+        while ring.len() > HEALTH_HISTORY {
+            ring.pop_front();
+        }
+    }
+    if previous != Some(info.status) {
         state.emit(json!({"type": "health", "target_id": target_id, "health": info}));
+        if let Some(old) = previous {
+            let level = match info.status {
+                "LIVE" => "ok",
+                "SLOW" => "warn",
+                _ => "error",
+            };
+            state.activity(
+                level,
+                "health",
+                Some(target_id),
+                format!(
+                    "Health changed from {old} to {}{}",
+                    info.status,
+                    info.detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()
+                ),
+            );
+        }
     }
     info
 }
@@ -203,6 +226,9 @@ pub fn spawn_worker(state: Arc<AppState>) {
                     });
                 }
                 if let Ok(mut map) = state.health.lock() {
+                    map.retain(|id, _| probed.contains(id));
+                }
+                if let Ok(mut map) = state.health_history.lock() {
                     map.retain(|id, _| probed.contains(id));
                 }
             }
