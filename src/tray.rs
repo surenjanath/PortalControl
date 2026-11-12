@@ -26,7 +26,8 @@ const ABOUT: &str = "about";
 
 /// What the tray needs to know about this manager.
 pub struct Config {
-    /// Dashboard address, ending in `/`.
+    /// Dashboard address on this computer, ending in `/`. The manager
+    /// replaces it once it knows which port it listens on.
     pub url: String,
     /// The `serve` options in use, remembered when "Start at login" is ticked.
     pub serve_args: Vec<String>,
@@ -47,9 +48,9 @@ impl Link {
         }
     }
 
-    /// The manager is listening: show the icon.
-    pub fn ready(&self) {
-        self.send(Signal::Ready)
+    /// The manager is listening at `url`: show the icon.
+    pub fn ready(&self, url: String) {
+        self.send(Signal::Ready(url))
     }
 
     /// New status: `tip` is shown when hovering over the icon, `line` is the
@@ -60,7 +61,7 @@ impl Link {
 }
 
 enum Signal {
-    Ready,
+    Ready(String),
     Status { tip: String, line: String },
     Menu(MenuEvent),
     Tray(TrayIconEvent),
@@ -76,7 +77,7 @@ struct Ui {
 
 /// Run `server` on its own thread and the tray on this (the main) thread.
 /// Never returns: the process exits when `server` has finished.
-pub fn run(config: Config, server: impl FnOnce(Link) -> Result<(), String> + Send + 'static) -> ! {
+pub fn run(mut config: Config, server: impl FnOnce(Link) -> Result<(), String> + Send + 'static) -> ! {
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<Signal>::with_user_event().build();
     #[cfg(target_os = "macos")]
@@ -111,7 +112,8 @@ pub fn run(config: Config, server: impl FnOnce(Link) -> Result<(), String> + Sen
         *flow = ControlFlow::Wait;
         let Event::UserEvent(signal) = event else { return };
         match signal {
-            Signal::Ready => {
+            Signal::Ready(url) => {
+                config.url = url;
                 let scale = target.primary_monitor().map(|m| m.scale_factor()).unwrap_or(1.0);
                 match build(scale) {
                     Ok(built) => {

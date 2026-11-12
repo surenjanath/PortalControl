@@ -6,7 +6,7 @@
 use crate::automation::{self, Cron};
 use crate::db::{Target, TargetInput};
 use crate::state::AppState;
-use crate::{auth, autostart, backup, git, health, net, pyenv, runner, security};
+use crate::{auth, autostart, backup, git, health, net, netcfg, pyenv, runner, security};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
@@ -34,20 +34,26 @@ const JS: &str = "text/javascript; charset=utf-8";
 const ASSETS: &[(&str, &str, &str)] = &[
     ("styles.css", CSS, include_str!("../web/styles.css")),
     ("icon.svg", "image/svg+xml", include_str!("../web/icon.svg")),
-    ("js/core.js", JS, include_str!("../web/js/core.js")),
-    ("js/components.js", JS, include_str!("../web/js/components.js")),
-    ("js/router.js", JS, include_str!("../web/js/router.js")),
-    ("js/pages-home.js", JS, include_str!("../web/js/pages-home.js")),
-    ("js/pages-project.js", JS, include_str!("../web/js/pages-project.js")),
-    ("js/pages-new.js", JS, include_str!("../web/js/pages-new.js")),
-    ("js/target-metrics.js", JS, include_str!("../web/js/target-metrics.js")),
-    ("js/target.js", JS, include_str!("../web/js/target.js")),
-    ("js/target-config.js", JS, include_str!("../web/js/target-config.js")),
-    ("js/target-python.js", JS, include_str!("../web/js/target-python.js")),
-    ("js/target-tabs.js", JS, include_str!("../web/js/target-tabs.js")),
-    ("js/pages-global.js", JS, include_str!("../web/js/pages-global.js")),
-    ("js/pages-about.js", JS, include_str!("../web/js/pages-about.js")),
-    ("js/app.js", JS, include_str!("../web/js/app.js")),
+    ("js/core/core.js", JS, include_str!("../web/js/core/core.js")),
+    ("js/core/components.js", JS, include_str!("../web/js/core/components.js")),
+    ("js/core/router.js", JS, include_str!("../web/js/core/router.js")),
+    ("js/pages/home.js", JS, include_str!("../web/js/pages/home.js")),
+    ("js/pages/project.js", JS, include_str!("../web/js/pages/project.js")),
+    ("js/pages/new.js", JS, include_str!("../web/js/pages/new.js")),
+    ("js/target/target.js", JS, include_str!("../web/js/target/target.js")),
+    ("js/target/config.js", JS, include_str!("../web/js/target/config.js")),
+    ("js/target/python.js", JS, include_str!("../web/js/target/python.js")),
+    ("js/target/network.js", JS, include_str!("../web/js/target/network.js")),
+    ("js/target/tabs.js", JS, include_str!("../web/js/target/tabs.js")),
+    ("js/target/metrics.js", JS, include_str!("../web/js/target/metrics.js")),
+    ("js/settings/settings.js", JS, include_str!("../web/js/settings/settings.js")),
+    ("js/settings/access.js", JS, include_str!("../web/js/settings/access.js")),
+    ("js/settings/network.js", JS, include_str!("../web/js/settings/network.js")),
+    ("js/settings/general.js", JS, include_str!("../web/js/settings/general.js")),
+    ("js/settings/system.js", JS, include_str!("../web/js/settings/system.js")),
+    ("js/pages/lists.js", JS, include_str!("../web/js/pages/lists.js")),
+    ("js/pages/about.js", JS, include_str!("../web/js/pages/about.js")),
+    ("js/core/app.js", JS, include_str!("../web/js/core/app.js")),
     ("js/login.js", JS, include_str!("../web/js/login.js")),
 ];
 /// No inline scripts are allowed; inline `style` attributes are.
@@ -119,6 +125,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(autostart_install).delete(autostart_remove),
         )
         .route("/api/system/shutdown", post(shutdown))
+        .route("/api/system/restart", post(restart))
+        .route("/api/system/network", get(network_get).put(network_put))
         .route("/ws", get(ws_upgrade))
         .route("/assets/{*path}", get(asset))
         .route("/api/auth/status", get(auth_status))
@@ -128,6 +136,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/targets/{id}/rollback", post(rollback_target))
         .route("/api/targets/{id}/metrics/history", get(metrics_history))
         .route("/api/targets/{id}/processes", get(target_processes))
+        .route("/api/targets/{id}/network", get(target_network))
         .route("/api/fs/list", get(fs_list))
         .route("/api/fs/port", get(fs_port))
         .route("/api/fs/pyenv", get(fs_pyenv))
@@ -186,10 +195,18 @@ fn is_public_path(path: &str) -> bool {
         || path.starts_with("/api/webhooks/deploy/")
 }
 
-fn session_cookie(token: &str, max_age_secs: u64) -> String {
+/// Marks requests that arrived through the HTTPS listener.
+#[derive(Clone, Copy)]
+pub struct ViaTls;
+type Tls = Option<axum::Extension<ViaTls>>;
+
+/// `secure`: the request came over HTTPS, so the browser must only ever send
+/// the cookie back over HTTPS.
+fn session_cookie(token: &str, max_age_secs: u64, secure: bool) -> String {
     format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}",
-        auth::SESSION_COOKIE
+        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}{}",
+        auth::SESSION_COOKIE,
+        if secure { "; Secure" } else { "" }
     )
 }
 
@@ -223,6 +240,7 @@ async fn verify(state: &Arc<AppState>, password: String) -> bool {
 
 async fn auth_login(
     State(state): State<Arc<AppState>>,
+    tls: Tls,
     Json(req): Json<LoginRequest>,
 ) -> AppResult {
     if !state.auth.password_set() {
@@ -243,15 +261,15 @@ async fn auth_login(
     let token = state.auth.create_session();
     Ok(with_cookie(
         ok(json!({"authenticated": true})),
-        session_cookie(&token, auth::SESSION_TTL.as_secs()),
+        session_cookie(&token, auth::SESSION_TTL.as_secs(), tls.is_some()),
     ))
 }
 
-async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AppResult {
+async fn auth_logout(State(state): State<Arc<AppState>>, tls: Tls, headers: HeaderMap) -> AppResult {
     if let Some(token) = session_token(&headers) {
         state.auth.end_session(&token);
     }
-    Ok(with_cookie(ok(json!({"authenticated": false})), session_cookie("", 0)))
+    Ok(with_cookie(ok(json!({"authenticated": false})), session_cookie("", 0, tls.is_some())))
 }
 
 #[derive(serde::Deserialize)]
@@ -265,6 +283,7 @@ struct PasswordRequest {
 /// Set, change or (with an empty new password) remove the dashboard password.
 async fn auth_password(
     State(state): State<Arc<AppState>>,
+    tls: Tls,
     Json(req): Json<PasswordRequest>,
 ) -> AppResult {
     if state.auth.password_set() {
@@ -281,10 +300,16 @@ async fn auth_password(
         state.auth.clear_failures();
     }
     if req.new.is_empty() {
+        if !netcfg::NetSettings::load(&state.db).await.address.is_empty() {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "other computers can reach this dashboard, so it needs a password. Switch network access off under Settings > Network first",
+            ));
+        }
         state.db.set_setting(auth::PASSWORD_KEY, None).await.map_err(internal)?;
         state.auth.set_hash(None);
         state.activity("warn", "auth", None, "Dashboard password removed");
-        return Ok(with_cookie(ok(json!({"password_set": false})), session_cookie("", 0)));
+        return Ok(with_cookie(ok(json!({"password_set": false})), session_cookie("", 0, tls.is_some())));
     }
     auth::validate_new_password(&req.new).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     let new = req.new;
@@ -302,7 +327,7 @@ async fn auth_password(
     state.activity("info", "auth", None, "Dashboard password set");
     Ok(with_cookie(
         ok(json!({"password_set": true})),
-        session_cookie(&token, auth::SESSION_TTL.as_secs()),
+        session_cookie(&token, auth::SESSION_TTL.as_secs(), tls.is_some()),
     ))
 }
 
@@ -320,7 +345,8 @@ async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !net::host_header_allowed(&host) {
+    let named = state.net.get().is_some_and(|n| n.host_allowed(&host));
+    if !net::host_header_allowed(&host) && !named {
         return fail(StatusCode::FORBIDDEN, "forbidden host");
     }
     if let Some(origin) = req.headers().get(ORIGIN) {
@@ -904,6 +930,48 @@ async fn target_metrics(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
 }
 
 /// The processes in a running target's tree, plus the disk its folder is on.
+/// Who can reach a target's own port: what its start script was written
+/// for, and what really answers right now on each address of this machine.
+async fn target_network(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let port = t.health_url.as_deref().and_then(|u| health::parse_url(u).ok()).map(|u| u.port);
+    let view = tokio::task::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from(&t.working_directory);
+        let script = std::fs::read_to_string(dir.join(&t.script_name)).unwrap_or_default();
+        let ours = script.contains(GENERATED_MARKER);
+        // Only a script PortalControl wrote can be rewritten from the dashboard.
+        let starter = ours
+            .then(|| detect_project(&dir).starters.into_iter().find(|s| s.script().eq_ignore_ascii_case(&t.script_name)))
+            .flatten();
+        let answers = |ip: &str| {
+            port.and_then(|p| format!("{ip}:{p}").parse::<std::net::SocketAddr>().ok())
+                .is_some_and(|addr| std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok())
+        };
+        let network: Vec<Value> = netcfg::local_addresses()
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "ip": a.ip, "interface": a.interface, "kind": a.kind,
+                    "url": port.map(|p| format!("http://{}:{p}/", a.ip)),
+                    "open": answers(&a.ip),
+                })
+            })
+            .collect();
+        json!({
+            "port": port,
+            "script": t.script_name,
+            "script_is_ours": ours,
+            "starter": starter.as_ref().map(|s| json!({"id": s.id, "label": s.label})),
+            "written_for_network": ours && script.contains("0.0.0.0"),
+            "local": {"url": port.map(|p| format!("http://127.0.0.1:{p}/")), "open": answers("127.0.0.1")},
+            "network": network,
+        })
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?;
+    Ok(ok(view))
+}
+
 async fn target_processes(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     let body = {
@@ -2245,6 +2313,94 @@ async fn shutdown(State(state): State<Arc<AppState>>) -> AppResult {
     Ok(ok(json!({"shutting_down": true})))
 }
 
+/// Stop, then start again with the same options. This is how changed
+/// network settings are applied.
+async fn restart(State(state): State<Arc<AppState>>) -> AppResult {
+    state.restart.store(true, Ordering::SeqCst);
+    state.activity("warn", "system", None, "PortalControl is restarting");
+    state.shutdown.notify_one();
+    Ok(ok(json!({"restarting": true})))
+}
+
+// ---------------------------------------------------------------- network --
+
+/// Everything the Network settings show: what is stored, what is running,
+/// whether the two differ, and what this machine could offer.
+async fn network_view(state: &Arc<AppState>) -> Value {
+    let saved = netcfg::NetSettings::load(&state.db).await;
+    let active = state
+        .net
+        .get()
+        .cloned()
+        .unwrap_or_else(|| netcfg::Active::local_only(state.bind.port()));
+    let (cli_bind, cli_port) = state.cli_net.get().copied().unwrap_or((None, None));
+    let next = netcfg::effective(&saved, cli_bind, cli_port, crate::DEFAULT_PORT);
+    let addresses = tokio::task::spawn_blocking(netcfg::local_addresses).await.unwrap_or_default();
+    let computer_name = state.metrics.lock().ok().and_then(|m| m.host_name.clone());
+    let password_set = state.auth.password_set();
+
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(e) = &active.error {
+        warnings.push(format!("Other computers cannot connect right now, because the network address could not be opened: {e}"));
+    }
+    if !saved.address.is_empty() && !addresses.iter().any(|a| a.ip == saved.address) {
+        warnings.push(format!(
+            "This computer does not have the address {} at the moment (is the network or Tailscale connected?). Network access stays off until it does and PortalControl is restarted.",
+            saved.address
+        ));
+    }
+    if saved.https && saved.address.is_empty() {
+        warnings.push("HTTPS is set up but has nothing to protect until an address for other computers is chosen.".into());
+    }
+    if next.network.is_some() && !next.https {
+        warnings.push("Other computers connect without encryption: the password and everything on screen cross the network in clear text. That is fine on Tailscale or a network you trust; otherwise turn on HTTPS.".into());
+    }
+    if next.network.is_some() && !password_set {
+        warnings.push("No dashboard password is set. Anyone who can reach the address can run the registered scripts.".into());
+    }
+
+    json!({
+        "saved": saved,
+        "active": {
+            "port": active.effective.port,
+            "local_url": active.local_url(),
+            "network_url": active.network_url(),
+            "https": active.effective.https && active.network.is_some(),
+            "hosts": active.effective.hosts,
+            "error": active.error,
+        },
+        "bind_from_cli": next.bind_from_cli,
+        "port_from_cli": next.port_from_cli,
+        "restart_needed": next != active.effective,
+        "addresses": addresses,
+        "computer_name": computer_name,
+        "password_set": password_set,
+        "default_port": crate::DEFAULT_PORT,
+        "warnings": warnings,
+    })
+}
+
+async fn network_get(State(state): State<Arc<AppState>>) -> AppResult {
+    Ok(ok(network_view(&state).await))
+}
+
+async fn network_put(State(state): State<Arc<AppState>>, Json(input): Json<netcfg::NetSettings>) -> AppResult {
+    // Validation reads the certificate files.
+    let settings = tokio::task::spawn_blocking(move || input.validate())
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    if !settings.address.is_empty() && !state.auth.password_set() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "set a dashboard password first (Settings > Access). PortalControl runs scripts, so it is not opened to other computers without one",
+        ));
+    }
+    settings.save(&state.db).await.map_err(internal)?;
+    state.activity("info", "system", None, "Network settings changed");
+    Ok(ok(network_view(&state).await))
+}
+
 // -------------------------------------------------------------- websocket --
 
 async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
@@ -2578,14 +2734,17 @@ mod tests {
 
     #[test]
     fn public_paths_and_session_cookies() {
-        for open in ["/assets/styles.css", "/assets/js/app.js", "/api/auth/status", "/api/auth/login", "/api/webhooks/deploy/abc"] {
+        for open in ["/assets/styles.css", "/assets/js/core/app.js", "/api/auth/status", "/api/auth/login", "/api/webhooks/deploy/abc"] {
             assert!(is_public_path(open), "{open}");
         }
         for closed in ["/", "/api/targets", "/ws", "/api/auth/password", "/api/auth/logout", "/api/system/shutdown", "/api/webhooks"] {
             assert!(!is_public_path(closed), "{closed}");
         }
-        let cookie = session_cookie("tok", 60);
+        let cookie = session_cookie("tok", 60, false);
         assert!(cookie.contains("pc_session=tok") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        assert!(!cookie.contains("Secure"));
+        // Signed in over HTTPS: the cookie never travels over plain HTTP.
+        assert!(session_cookie("tok", 60, true).ends_with("; Secure"));
 
         let state = AppState::new(crate::db::Db::open_in_memory().unwrap(), "127.0.0.1:0".parse().unwrap());
         let mut headers = HeaderMap::new();

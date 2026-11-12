@@ -109,6 +109,12 @@ pub struct AppState {
     pub data_dir: OnceLock<PathBuf>,
     /// The `serve` options this manager was started with (for login autostart).
     pub serve_args: OnceLock<Vec<String>>,
+    /// What this manager is listening on (see `netcfg.rs`).
+    pub net: OnceLock<crate::netcfg::Active>,
+    /// `--bind` and `--port` as given on the command line.
+    pub cli_net: OnceLock<(Option<std::net::IpAddr>, Option<u16>)>,
+    /// Set when the manager should start again after it has stopped.
+    pub restart: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -136,6 +142,9 @@ impl AppState {
             shutdown: Notify::new(),
             data_dir: OnceLock::new(),
             serve_args: OnceLock::new(),
+            net: OnceLock::new(),
+            cli_net: OnceLock::new(),
+            restart: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -31,7 +31,7 @@ function resolve(r) {
   if (a === "deployments") return deploymentsView();
   if (a === "security") return securityView();
   if (a === "activity") return activityView();
-  if (a === "settings") return settingsView();
+  if (a === "settings") return settingsView(b);
   if (a === "about") return aboutView();
   if (a === "target" && b) return targetView(Number(b), c || "configuration", d);
   return simple("404", () => empty("Page not found", "This address does not match a page.", h("a", { class: "btn", href: "#/" }, "Back to dashboard")));

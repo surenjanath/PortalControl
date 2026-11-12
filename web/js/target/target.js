@@ -1,7 +1,7 @@
 "use strict";
 // ------------------------------------------------------------------ target --
 const TABS = [["configuration", "Configuration"], ["deployments", "Deployments"], ["commands", "Commands"], ["logs", "Logs"], ["metrics", "Metrics"], ["security", "Security"]];
-const SUBS = [["general", "General"], ["processes", "Related Processes"], ["environment", "Environment Variables"], ["python", "Python Environment"], ["git", "Git Source"], ["health", "Health Check"], ["schedule", "Scheduled Task"],
+const SUBS = [["general", "General"], ["processes", "Related Processes"], ["environment", "Environment Variables"], ["python", "Python Environment"], ["network", "Network"], ["git", "Git Source"], ["health", "Health Check"], ["schedule", "Scheduled Task"],
   ["webhooks", "Webhooks"], ["backups", "Database Backups"], ["advanced", "Advanced"], ["danger", "Danger Zone"]];
 
 async function saveTarget(t, patch, msg) {

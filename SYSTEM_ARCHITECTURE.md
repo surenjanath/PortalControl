@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.1.0 |
-| Application version | 0.6.0 (`Cargo.toml`) |
+| Document version | 1.2.0 |
+| Application version | 0.7.0 (`Cargo.toml`) |
 | Last updated | 2026-11-12 |
 
 ## 1. System Overview
@@ -25,7 +25,7 @@ Node, workers such as qcluster or Celery) on a workstation or a small server and
 one place to start, stop, deploy and watch them, without Docker, a CI server or a
 process manager per project.
 
-**Form.** One executable (`portalcontrol`, about 4.4 MB on Windows). The dashboard,
+**Form.** One executable (`portalcontrol`, about 5.6 MB on Windows). The dashboard,
 SQLite and libgit2 are compiled in. It needs no installer, no runtime and no other
 files; it creates its data folder on first start.
 
@@ -92,7 +92,8 @@ files; it creates its data folder on first start.
 | Frontend | Plain HTML, CSS and JavaScript | No framework, no build step; files in `web/` are embedded with `include_str!` |
 | Database | SQLite through rusqlite (`bundled`) | One file, `portalcontrol.db`, in the data folder |
 | Git | libgit2 through git2 (`vendored-libgit2`) | No `git` program is run at runtime. HTTPS uses WinHTTP on Windows and vendored OpenSSL elsewhere |
-| Metrics | sysinfo | Host and per-process-tree CPU and memory |
+| Metrics | sysinfo | Host and per-process-tree CPU and memory; also lists this machine's network addresses |
+| HTTPS | rustls (ring provider) with axum-server | Serves the dashboard's network address over TLS, HTTP/1.1 only. Not used on the local address |
 | Scheduling | Built-in cron parser, chrono for local time | `automation.rs` |
 | Password hashing | pbkdf2, sha2, getrandom | Salted PBKDF2-HMAC-SHA256 |
 | Tray icon | tray-icon and tao | Windows and macOS only; Linux builds have none |
@@ -118,6 +119,7 @@ health probes that the user configured.
 | `src/` | The program (see 3.2) |
 | `web/` | The dashboard (see 3.3) |
 | `assets/` | `icon.ico`, `icon.icns`, `tray.rgba`, `tray-mac.rgba`; all drawn by `scripts/make-icon.py` |
+| `.github/workflows/release.yml` | Builds Windows (x64) and macOS (universal app) on GitHub and publishes release `v<version>` when the version in `Cargo.toml` has no release yet |
 | `scripts/` | `install-autostart.ps1` / `.sh` (build, install, register autostart), `make-icon.py`, `make-macos-app.sh` |
 | `README.md` | User guide |
 | `prd.md` | Original product requirements |
@@ -141,6 +143,7 @@ health probes that the user configured.
 | `backup.rs` | Consistent SQLite snapshots of a target's database (`VACUUM INTO`), restore, pruning |
 | `auth.rs` | Optional dashboard password, sessions, sign-in lockout, the control token |
 | `net.rs` | Which addresses may be bound and which `Host` values are answered |
+| `netcfg.rs` | Network settings of the manager: stored values, what a start will open, loading the certificate, this machine's addresses (see 3.7) |
 | `autostart.rs` | Register and remove start at login on the three systems |
 | `tray.rs` | Tray or menu-bar icon: status tooltip, menu, runs the user-interface loop on the main thread. Holds the native About window for Windows (`about_window`); macOS uses the system About panel |
 | `util.rs` | Time formatting and the manager's own log file |
@@ -153,19 +156,26 @@ global functions. Routing is by URL hash (`#/target/3/logs`).
 | File | Holds |
 | --- | --- |
 | `index.html`, `login.html`, `styles.css`, `icon.svg` | Page shell, sign-in page, all styling (dark and light tokens), the icon |
-| `js/core.js` | DOM helper `h`, icons, the API client, formatters, shared state, target status and actions |
-| `js/components.js` | Charts, log viewer, tables, tiles, form fields |
-| `js/router.js` | Hash routing, view lifecycle, sidebar |
-| `js/pages-home.js` | Dashboard and Projects |
-| `js/pages-project.js` | Project page with grouped terminals |
-| `js/pages-new.js` | New Target page with project detection |
-| `js/target.js` | Target page frame, tabs, saving |
-| `js/target-config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
-| `js/target-python.js` | Configuration section "Python Environment" (`CFG.python`) |
-| `js/target-tabs.js`, `js/target-metrics.js` | Deployments, Commands, Logs, Security and Metrics tabs |
-| `js/pages-global.js` | Deployments, Security, Activity and Settings pages |
-| `js/pages-about.js` | About page |
-| `js/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
+| `js/core/core.js` | DOM helper `h`, icons, the API client, formatters, shared state, target status and actions |
+| `js/core/components.js` | Charts, the log viewer, and small pieces (tables, tiles, form fields) |
+| `js/core/router.js` | Hash routing, the view lifecycle and the sidebar |
+| `js/core/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
+| `js/pages/home.js` | Dashboard and Projects |
+| `js/pages/project.js` | Project page (grouped terminals) |
+| `js/pages/new.js` | New Target page with project detection |
+| `js/pages/lists.js` | Deployments, Security and Activity pages |
+| `js/pages/about.js` | About page |
+| `js/target/target.js` | The target page frame: header, tabs, saving |
+| `js/target/config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
+| `js/target/python.js` | Configuration section "Python Environment" (`CFG.python`) |
+| `js/target/network.js` | Configuration section "Network" (`CFG.network`) |
+| `js/target/tabs.js` | Deployments, Commands, Logs and Security tabs |
+| `js/target/metrics.js` | Metrics tab |
+| `js/settings/settings.js` | Settings page frame: side menu, one section at a time (`SET.<name>`) |
+| `js/settings/access.js` | Settings section Access: the dashboard password |
+| `js/settings/network.js` | Settings section Network |
+| `js/settings/general.js` | Settings sections Start at Login, Notifications, Export and Import |
+| `js/settings/system.js` | Settings sections Manager, Resources, Manager Log, Danger Zone |
 | `js/login.js` | Sign-in form |
 
 A new script must be added in two places: a `<script>` tag in `index.html` and the
@@ -221,6 +231,37 @@ and can override this. A named folder with no Python in it stops the run with an
 instead of silently using another Python. Quick commands use the same environment; with
 the setting empty they still prefer an environment found in the folder, as before.
 
+### 3.7 Network access
+
+**The manager.** It always listens on `127.0.0.1:<port>` in plain HTTP (the local
+door). The tray icon, `portalcontrol stop` and `reset-password` use only that, so they
+work whatever else is configured. Optionally it opens a second listener on one private
+address of the machine (the network door), in plain HTTP or, with a certificate, HTTPS.
+
+- Settings are one JSON value under the key `network` in the `settings` table
+  (`NetSettings`: `address`, `port`, `hosts`, `https`, `cert_file`, `key_file`).
+- At start `main.rs` opens the database, reads the settings, combines them with `--bind`
+  and `--port` (the command line wins; `netcfg::effective`) and opens the doors. What
+  was opened is kept in `AppState::net` (`netcfg::Active`).
+- If the network door cannot be opened, the manager still starts and records the
+  reason, which the Settings page shows. With `--bind` the failure is fatal, as before.
+- Settings are read only at start. Saving stores them; `GET /api/system/network`
+  reports `restart_needed` when a start would open something different from what is
+  running. `POST /api/system/restart` stops the manager and, after everything is
+  closed, starts the same executable with the same arguments (minus `--detach` and
+  `--open`); the new process retries the port for up to 10 seconds.
+- Requests through the HTTPS listener carry a marker (`api::ViaTls`), so sign-in
+  cookies set there get the `Secure` attribute.
+- Host names listed in the settings are accepted by the request guard in addition to
+  `localhost` and private IP literals.
+
+**A target.** `GET /api/targets/{id}/network` reports the port (from the health URL),
+whether the start script was written by PortalControl and for which host, and whether a
+TCP connection to the port succeeds on `127.0.0.1` and on each private address of the
+machine. The dashboard rewrites a generated start script through the existing
+`POST /api/fs/starter` with host `127.0.0.1` or `0.0.0.0`. Scripts PortalControl did
+not write are never edited. No listener of the manager sits in front of a project.
+
 ## 4. Data Models & State Management
 
 ### 4.1 Database
@@ -272,7 +313,8 @@ target are kept.
 **`security_scan_reports`**: `id`, `target_id` (FK, cascade), `critical_issues_found`,
 `vulnerable_packages_found`, `raw_payload_json`, `scanned_at`.
 
-**`settings`**: `key`, `value`. Holds the dashboard password hash.
+**`settings`**: `key`, `value`. Holds the dashboard password hash and, under the key
+`network`, the network settings as JSON (see 3.7).
 
 **`metric_points`**: one row per target per minute, kept 7 days. Primary key
 (`target_id`, `t`); `t` is unix seconds at the start of the minute. Columns `cpu`,
@@ -302,7 +344,8 @@ Lost on restart and rebuilt by the workers:
 | `scans_running`, `starting_projects` | What is in progress |
 | `auth` | Password hash, sessions, failed sign-ins, control token |
 | `events` | Broadcast channel feeding every WebSocket client |
-| `shutdown` | Notified to stop the manager |
+| `shutdown`, `restart` | Notified to stop the manager; flag to start it again afterwards |
+| `net`, `cli_net` | What this manager listens on, and the `--bind` / `--port` it was started with |
 
 ### 4.3 Browser state
 
@@ -323,10 +366,20 @@ the result. On manager shutdown every tree is killed; nothing is left orphaned.
 PortalControl runs shell scripts, so the design keeps it off the internet and limits
 what a request can make it run.
 
-- **Bind addresses.** Only loopback, private-LAN and Tailscale (`100.64.0.0/10`)
-  addresses are accepted. `0.0.0.0` and public addresses are refused (`net.rs`).
-- **Host and Origin checks.** Requests whose `Host` is not `localhost` or a private
-  address are rejected (DNS rebinding). Requests with a foreign `Origin` are rejected,
+- **Listening addresses.** Only loopback, private-LAN and Tailscale (`100.64.0.0/10`)
+  addresses are accepted, from the command line and from Settings → Network alike.
+  `0.0.0.0` and public addresses are refused (`net.rs`, `netcfg.rs`). The default is
+  loopback only.
+- **Opening to the network needs a password.** `PUT /api/system/network` refuses a
+  network address while no dashboard password is set, and the password cannot be
+  removed while a network address is saved. `--bind` does not enforce this.
+- **HTTPS.** Optional, for the network address only, with a certificate and key the
+  user provides as PEM files. Only the file paths are stored. TLS 1.2 and 1.3 through
+  rustls. Sign-in cookies issued over HTTPS are marked `Secure`. The local address is
+  plain HTTP and never leaves the machine. Without HTTPS, traffic from other computers,
+  including the password, is unencrypted; the Settings page says so.
+- **Host and Origin checks.** Requests whose `Host` is not `localhost`, a private
+  address or a host name the user listed are rejected (DNS rebinding). Requests with a foreign `Origin` are rejected,
   so another web page cannot drive the API.
 - **Password, optional.** Stored only as a salted PBKDF2-HMAC-SHA256 hash in
   `settings`. Signing in gives a random 256-bit session token in an HttpOnly cookie;
@@ -356,15 +409,18 @@ what a request can make it run.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (76 at the time of writing).** Target registration and
+**Working and covered by tests (81 at the time of writing).** Target registration and
 validation, running and stopping scripts, services with auto-restart, timeouts, quick
 commands, live logs, history, Git state, pull, rollback, deploy, auto-deploy, cron
 schedules, webhooks, health probes and history, metrics and 7-day history, security
 scan parsing, SQLite backups and restore, projects with start order, project detection
 with generated start scripts and worker launchers (qcluster, Celery, Node), password
-protection, export and import, login autostart, Python environment selection.
+protection, export and import, login autostart, Python environment selection, validation of network settings.
 
-**Working, checked by hand only.** The dashboard pages, the Windows tray icon and its
+**Working, checked by hand only.** Network access end to end on Windows (HTTPS on a
+LAN address with a self-signed certificate, host names, restart from the dashboard,
+password rules) and the per-target Network page with a generated start script. The
+dashboard pages, the Windows tray icon and its
 status text, the About page, the native About window on Windows, starting with no
 terminal window. The tray menu entries were not clicked during development on Windows
 except through the `about` command, and printing into an interactive `cmd` or
@@ -383,8 +439,14 @@ quick-command timeout 900 s, default port 7878.
 
 - One machine only. There is no agent for remote hosts and no shared database.
 - One user. A password protects the dashboard, but there are no accounts or roles.
-- No TLS. Health checks of `https://` URLs only test that the port answers. The
-  dashboard itself is plain HTTP, which is acceptable on loopback and a tailnet only.
+- Health checks of `https://` URLs only test that the port answers.
+- HTTPS is for the dashboard's network address only. PortalControl does not serve
+  HTTPS for the projects it runs, and has no reverse proxy in front of them.
+- Network settings, including a renewed certificate, are picked up only at a restart.
+  The certificate's names and expiry date are not shown or checked.
+- One network address at a time; no listening on every interface.
+- The per-target Network page only tests connections from this machine, so it cannot
+  see a firewall that blocks other computers.
 - Environment variables are stored unencrypted.
 - Security scans cover Python only and do not use the target's Python environment
   setting yet; `pip-audit` reads `requirements.txt`, else an environment inside the
@@ -443,6 +505,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.2.0 | 0.7.0 | 2026-11-12 | Network settings for the manager (`netcfg.rs`, Settings section, `GET`/`PUT /api/system/network`): address for other computers, port, host names, HTTPS with a user-supplied certificate; stored as JSON in `settings`. The manager now always listens on 127.0.0.1 and optionally on one network address; `--bind` adds the network address instead of replacing loopback, and `stop` always uses the local address. Restart from the dashboard (`POST /api/system/restart`). Password required for network access. Per-target Network page (`GET /api/targets/{id}/network`). New dependencies rustls and axum-server; sysinfo `network` feature. Dashboard scripts grouped into folders (`js/core`, `js/pages`, `js/target`, `js/settings`); the Settings page now has a side menu with one section per address (`#/settings/<section>`), each a `SET.<name>` function. Release workflow on GitHub Actions. |
 | 1.1.0 | 0.6.0 | 2026-11-12 | Windows build is a windowed program: no terminal window, attaches to the parent terminal for command output, opens the dashboard when started twice (3.5). Native About window from the tray menu and the new `about` command; macOS uses the system About panel. Author, homepage and tagline in `Cargo.toml`, `/api/system` (`author`, `homepage`, `tagline`) and the About page. New dependency windows-sys; the manifest now requests common controls 6 and is required at build time. |
 | 1.0.0 | 0.5.0 | 2026-11-12 | First version of this file. In this release: application icon embedded in the Windows executable and used as the browser-tab icon; tray icon on Windows and menu-bar icon on macOS with status tooltip and menu (`tray.rs`, `--no-tray`); macOS app bundle script; C runtime linked statically on Windows; per-target Python environment (`pyenv.rs`, new column `portal_targets.python_env`, `GET /api/fs/pyenv`); About page with version, commit and build time (`/api/system` gained `commit`, `built_at`, `sqlite`, `libgit2`, `started_at`). |
 

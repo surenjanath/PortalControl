@@ -1,6 +1,6 @@
 [package]
 name = "portalcontrol"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Surenjanath Singh"]
 homepage = "https://github.com/surenjanath"
@@ -20,11 +20,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Local wall-clock time for cron schedules.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # CPU / memory of the host and of each supervised process tree.
-sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 # Password hashing and random tokens for the optional dashboard login.
 pbkdf2 = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"
+axum-server = { version = "0.9.2", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 
 # libgit2 is compiled in, so no system Git install is needed.
 [target.'cfg(windows)'.dependencies]

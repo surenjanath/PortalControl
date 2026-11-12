@@ -20,6 +20,7 @@ mod git;
 mod health;
 mod metrics;
 mod net;
+mod netcfg;
 mod pyenv;
 mod runner;
 mod security;
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use util::log;
 
-const DEFAULT_PORT: u16 = 7878;
+pub const DEFAULT_PORT: u16 = 7878;
 
 /// Shown on the About page and in the tray's About window.
 pub const TAGLINE: &str = "Start, deploy and watch your projects from one place.";
@@ -71,7 +72,7 @@ USAGE:
 
 COMMANDS:
     serve                 Run the manager and web dashboard (default)
-    stop                  Stop a running manager (same --bind/--port)
+    stop                  Stop a running manager (same --port and --data-dir)
     install-autostart     Start PortalControl automatically at login
     uninstall-autostart   Remove the login autostart entry
     autostart-status      Show whether autostart is installed
@@ -79,10 +80,13 @@ COMMANDS:
     about                 Show the version and who made it
 
 OPTIONS:
-    --bind <IP>           Address to listen on (default 127.0.0.1).
-                          Only loopback, private-LAN and Tailscale (100.x.y.z)
-                          addresses are accepted.
+    --bind <IP>           Also listen on this address of the machine, so other
+                          computers can connect. Only private-LAN and Tailscale
+                          (100.x.y.z) addresses are accepted. The dashboard
+                          always answers on 127.0.0.1 as well.
     --port <PORT>         Port to listen on (default 7878)
+                          Both can also be set in the dashboard under
+                          Settings > Network; these options win over that.
     --data-dir <DIR>      Where the SQLite database and log file live
     --detach              Run in the background without a console window
     --open                Open the dashboard in the default browser
@@ -286,9 +290,23 @@ fn check_bind(opts: &Opts) -> Result<(), String> {
 
 /// Relaunch this executable as a background process and return immediately.
 fn detach(args: &[String]) -> Result<(), String> {
+    let pid = spawn_background(args, false)?;
+    println!("PortalControl started in the background (pid {pid}).");
+    Ok(())
+}
+
+/// Set for a manager that was started by its predecessor's "Restart", which
+/// may still be letting go of the port.
+const RESTARTED_ENV: &str = "PORTALCONTROL_RESTARTED";
+
+/// Start this executable again as a background process with `args`.
+fn spawn_background(args: &[String], restarted: bool) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(args.iter().filter(|a| a.as_str() != "--detach"))
+    if restarted {
+        cmd.env(RESTARTED_ENV, "1");
+    }
+    cmd.args(args.iter().filter(|a| !matches!(a.as_str(), "--detach" | "--open")))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -305,8 +323,24 @@ fn detach(args: &[String]) -> Result<(), String> {
         cmd.process_group(0);
     }
     let child = cmd.spawn().map_err(|e| format!("cannot start background process: {e}"))?;
-    println!("PortalControl started in the background (pid {}).", child.id());
-    Ok(())
+    Ok(child.id())
+}
+
+/// The port stored under Settings > Network, read straight from the database.
+fn saved_port(data_dir: &std::path::Path) -> Option<u16> {
+    let db_path = data_dir.join("portalcontrol.db");
+    if !db_path.is_file() {
+        return None;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let db = db::Db::open(&db_path).ok()?;
+    rt.block_on(netcfg::NetSettings::load(&db)).port
+}
+
+/// Where a running manager can always be reached from this computer.
+fn control_addr(opts: &Opts) -> SocketAddr {
+    let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
+    netcfg::local_addr(opts.port.or_else(|| saved_port(&data_dir)).unwrap_or(DEFAULT_PORT))
 }
 
 /// File in the data directory holding the running manager's control token.
@@ -323,10 +357,10 @@ fn reset_password(opts: &Opts) -> Result<(), String> {
     if !db_path.is_file() {
         return Err(format!("no database found at {}", db_path.display()));
     }
-    if std::net::TcpStream::connect_timeout(&opts.addr(), Duration::from_millis(500)).is_ok() {
+    let addr = control_addr(opts);
+    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
         return Err(format!(
-            "PortalControl is running at {}. Stop it first (portalcontrol stop), then run reset-password again.",
-            opts.addr()
+            "PortalControl is running at {addr}. Stop it first (portalcontrol stop), then run reset-password again."
         ));
     }
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -348,7 +382,8 @@ fn reset_password(opts: &Opts) -> Result<(), String> {
 }
 
 fn stop_remote(opts: &Opts) -> Result<(), String> {
-    let url = format!("http://{}/api/system/shutdown", opts.addr());
+    let addr = control_addr(opts);
+    let url = format!("http://{addr}/api/system/shutdown");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -364,11 +399,11 @@ fn stop_remote(opts: &Opts) -> Result<(), String> {
     };
     match rt.block_on(health::http_request_with("POST", &url, Duration::from_secs(5), &headers)) {
         Ok(Some(200)) => {
-            println!("PortalControl at {} is shutting down.", opts.addr());
+            println!("PortalControl at {addr} is shutting down.");
             Ok(())
         }
-        Ok(code) => Err(format!("unexpected response from {}: {code:?}", opts.addr())),
-        Err(e) => Err(format!("no manager reachable at {}: {e}", opts.addr())),
+        Ok(code) => Err(format!("unexpected response from {addr}: {code:?}")),
+        Err(e) => Err(format!("no manager reachable at {addr}: {e}")),
     }
 }
 
@@ -406,7 +441,7 @@ fn serve(opts: Opts) -> Result<(), String> {
     #[cfg(any(windows, target_os = "macos"))]
     if !opts.no_tray {
         let config = tray::Config {
-            url: format!("http://{}/", opts.addr()),
+            url: format!("http://{}/", netcfg::local_addr(opts.port.unwrap_or(DEFAULT_PORT))),
             serve_args: opts.passthrough_args(),
             data_dir: opts.data_dir.clone().unwrap_or_else(default_data_dir),
         };
@@ -417,7 +452,7 @@ fn serve(opts: Opts) -> Result<(), String> {
                 opts,
                 Hooks {
                     quit: link.quit.clone(),
-                    on_ready: Box::new(move || ready.ready()),
+                    on_ready: Box::new(move |url| ready.ready(url)),
                     on_status: Some(Box::new(move |tip, line| status.status(tip, line))),
                 },
             )
@@ -425,7 +460,7 @@ fn serve(opts: Opts) -> Result<(), String> {
     }
     run_manager(
         opts,
-        Hooks { quit: Arc::new(tokio::sync::Notify::new()), on_ready: Box::new(|| {}), on_status: None },
+        Hooks { quit: Arc::new(tokio::sync::Notify::new()), on_ready: Box::new(|_| {}), on_status: None },
     )
 }
 
@@ -433,8 +468,9 @@ fn serve(opts: Opts) -> Result<(), String> {
 struct Hooks {
     /// Stops the manager from outside (the tray menu).
     quit: Arc<tokio::sync::Notify>,
-    /// Called once the manager is listening.
-    on_ready: Box<dyn FnOnce() + Send>,
+    /// Called once the manager is listening, with the dashboard address on
+    /// this computer.
+    on_ready: Box<dyn FnOnce(String) + Send>,
     /// Receives the hover text and the menu's status line when they change.
     on_status: Option<Box<dyn Fn(String, String) + Send + Sync>>,
 }
@@ -489,7 +525,7 @@ async fn tray_status(state: &AppState) -> (String, String) {
 /// The manager itself.
 fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
     let Hooks { quit, on_ready, on_status } = hooks;
-    let addr = opts.addr();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data directory {}: {e}", data_dir.display()))?;
@@ -503,9 +539,27 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start async runtime: {e}"))?;
 
-    rt.block_on(async move {
-        // Bind first: if another instance owns the port, fail before touching the DB.
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+    let restart = rt.block_on(async move {
+        // The port and the network address may be stored in the database.
+        let db_path = data_dir.join("portalcontrol.db");
+        let db = db::Db::open(&db_path)
+            .map_err(|e| format!("cannot open database {}: {e}", db_path.display()))?;
+        let saved = netcfg::NetSettings::load(&db).await;
+        let plan = netcfg::effective(&saved, opts.bind, opts.port, DEFAULT_PORT);
+
+        // The local door. A manager started by "Restart" waits a moment for
+        // its predecessor to let go of the port.
+        let addr = netcfg::local_addr(plan.port);
+        let attempts = if std::env::var_os(RESTARTED_ENV).is_some() { 40 } else { 1 };
+        let mut bound = tokio::net::TcpListener::bind(addr).await;
+        for _ in 1..attempts {
+            if bound.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            bound = tokio::net::TcpListener::bind(addr).await;
+        }
+        let listener = bound.map_err(|e| {
             // Started by a double click while it is already running: there is
             // no terminal to show the error in, so show the dashboard instead.
             if !std::io::IsTerminal::is_terminal(&std::io::stderr())
@@ -516,10 +570,34 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
             format!("cannot listen on {addr}: {e} (is PortalControl already running?)")
         })?;
 
-        let db_path = data_dir.join("portalcontrol.db");
-        let db = db::Db::open(&db_path)
-            .map_err(|e| format!("cannot open database {}: {e}", db_path.display()))?;
+        // The door for other computers, if one is configured. When it cannot
+        // be opened the manager still runs, reachable locally, and says why.
+        let mut active = netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None };
+        let mut network_listener = None;
+        let mut tls = None;
+        if let Some(ip) = plan.network {
+            let net_addr = SocketAddr::new(ip, plan.port);
+            let opened = (|| {
+                let tls = if plan.https { Some(netcfg::load_tls(&plan.cert_file, &plan.key_file)?) } else { None };
+                let listener = std::net::TcpListener::bind(net_addr).map_err(|e| format!("cannot listen on {net_addr}: {e}"))?;
+                listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok::<_, String>((listener, tls))
+            })();
+            match opened {
+                Ok((listener, config)) => {
+                    active.network = Some(net_addr);
+                    network_listener = Some(listener);
+                    tls = config;
+                }
+                // Asked for on the command line: failing loudly is expected.
+                Err(e) if plan.bind_from_cli => return Err(e),
+                Err(e) => active.error = Some(e),
+            }
+        }
+
         let state = AppState::new(db, addr);
+        let _ = state.net.set(active.clone());
+        let _ = state.cli_net.set((opts.bind, opts.port));
         let _ = state.data_dir.set(data_dir.clone());
         let _ = state.serve_args.set(opts.passthrough_args());
         if let Some(hash) = state.db.get_setting(auth::PASSWORD_KEY).await? {
@@ -540,6 +618,11 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
             env!("CARGO_PKG_VERSION"),
             data_dir.display()
         ));
+        match (active.network_url(), &active.error) {
+            (Some(url), _) => log(&format!("open to other computers at {url}")),
+            (None, Some(e)) => log(&format!("network access is off: {e}")),
+            (None, None) => {}
+        }
 
         // Supervisor behaviour: bring up every target flagged for autostart.
         for target in state.db.list_targets().await.unwrap_or_default() {
@@ -551,9 +634,9 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         }
 
         if opts.open {
-            open_browser(&format!("http://{addr}/"));
+            open_browser(&active.local_url());
         }
-        on_ready();
+        on_ready(active.local_url());
         if let Some(push) = on_status {
             let st = state.clone();
             tokio::spawn(async move {
@@ -570,8 +653,30 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         }
 
         let app = api::router(state.clone());
+        let network_app = app.clone();
+        let network_server = async move {
+            let Some(listener) = network_listener else {
+                return std::future::pending::<Result<(), String>>().await;
+            };
+            match tls {
+                Some(config) => {
+                    // Marked so sign-in cookies are sent back over HTTPS only.
+                    let service = network_app.layer(axum::Extension(api::ViaTls)).into_make_service();
+                    axum_server::from_tcp_rustls(listener, axum_server::tls_rustls::RustlsConfig::from_config(config))
+                        .map_err(|e| format!("network server error: {e}"))?
+                        .serve(service)
+                        .await
+                        .map_err(|e| format!("network server error: {e}"))
+                }
+                None => {
+                    let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| format!("network server error: {e}"))?;
+                    axum::serve(listener, network_app).await.map_err(|e| format!("network server error: {e}"))
+                }
+            }
+        };
         let outcome = tokio::select! {
             r = axum::serve(listener, app) => r.map_err(|e| format!("server error: {e}")),
+            r = network_server => r,
             _ = tokio::signal::ctrl_c() => {
                 log("interrupt received, shutting down");
                 Ok(())
@@ -591,8 +696,16 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         // Never leave orphaned deployment processes behind.
         runner::stop_all(&state).await;
         log("stopped");
-        outcome
-    })
+        outcome.map(|()| state.restart.load(std::sync::atomic::Ordering::SeqCst))
+    })?;
+
+    // "Restart" in the dashboard: everything above is closed, start afresh
+    // with the same options.
+    if restart {
+        let pid = spawn_background(&args, true)?;
+        log(&format!("restarting as pid {pid}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

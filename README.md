@@ -174,6 +174,21 @@ deleted.
 - **Activity feed.** Deployments, health changes, new commits, scans and automation
   events (the last 300, kept in memory).
 
+## Download
+
+Ready-made builds are on the repository's **Releases** page:
+
+- **Windows:** `PortalControl-<version>-windows-x64.zip`. Unzip and run `portalcontrol.exe`.
+- **macOS:** `PortalControl-<version>-macos-universal.zip` (Apple Silicon and Intel). Unzip,
+  move `PortalControl.app` to Applications, and the first time right-click it and choose
+  **Open**, because the app is not notarised.
+
+They are built by GitHub Actions (`.github/workflows/release.yml`). To publish a new
+release, raise `version` in `Cargo.toml` and push to `main`: the workflow builds both
+systems and creates the release `v<version>` with the files and their checksums. A push
+that leaves the version alone builds nothing. **Run workflow** on the Actions page
+rebuilds and replaces the files of the current version.
+
 ## Quick start
 
 Requires [Rust](https://rustup.rs) to build. Nothing else is needed at runtime: SQLite
@@ -211,6 +226,47 @@ Commands typed in a terminal (`portalcontrol stop`, `--help`, `about`) still pri
 One side effect: `cmd` and PowerShell do not wait for a windowed program, so the prompt
 comes back first and the text appears after it. Use `start /wait portalcontrol stop` in a
 batch file that must wait.
+
+## Network access
+
+By default only this computer can open the dashboard, at `http://127.0.0.1:7878/`. That
+local address is always on; the tray icon and `portalcontrol stop` use it.
+
+**Settings → Network** opens the dashboard to other computers. The section is always
+shown, with what is running now on top and the settings below it:
+
+| Setting | What it does |
+| --- | --- |
+| Who can open the dashboard | Only this computer, or other computers too through one address of this computer. The addresses it has (local network, Tailscale) are listed; public addresses and `0.0.0.0` are refused |
+| Port | Default 7878 |
+| Host names (domain) | Names people may type instead of the IP address, such as `portal.mycompany.lan` or the computer's name. Your DNS, router or hosts file must already point the name at this computer; this setting only allows PortalControl to answer to it |
+| HTTPS | Encrypts connections from other computers. Needs the full paths of a PEM certificate file and its PEM private key file. The files are checked when you save |
+
+Things to know:
+
+- **Changes apply at the next start.** They are saved at once, the page says "Saved, but
+  not in use yet", and **Restart now** restarts PortalControl for you. A restart stops
+  every running target; those set to start with PortalControl come back by themselves.
+- **A password is required** before other computers are let in, and it cannot be removed
+  while they are.
+- **HTTPS covers the network address only.** This computer keeps using plain
+  `http://127.0.0.1`, which never leaves it. With a self-made certificate browsers show
+  a warning until it is trusted on each computer; a certificate from your company's CA
+  or from Tailscale avoids that.
+- If the network address cannot be opened (cable unplugged, Tailscale off, certificate
+  file gone), PortalControl still starts, stays reachable on this computer and shows the
+  reason in this section.
+- `--bind` and `--port` on the command line still work and win over these settings.
+
+### Network settings of a project
+
+Each target has **Configuration → Network**: whether other computers can open that
+project. The page tries to connect to the project's port on every address of this
+computer and shows which ones answer. When the target uses a start script written by
+PortalControl, the page can switch it between "only this computer" (`127.0.0.1`) and
+"other computers too" (`0.0.0.0`) and change the port; the target has to be restarted
+for it. A script of your own is never edited; the page shows what to put in it.
+PortalControl does not put HTTPS in front of projects.
 
 ## About page
 
@@ -297,7 +353,7 @@ autostart-status      Show whether autostart is installed
 reset-password        Remove the dashboard password (stop the manager first)
 about                 Show the version and who made it
 
---bind <IP>           Address to listen on (default 127.0.0.1)
+--bind <IP>           Also listen on this address, for other computers (see Network access)
 --port <PORT>         Port to listen on (default 7878)
 --data-dir <DIR>      Where the SQLite database and log file live
 --detach              Run in the background without a console window
@@ -373,10 +429,11 @@ If one is missing the report says so instead of failing silently.
 PortalControl executes shell scripts, so it is deliberately not reachable from the
 internet:
 
-- It refuses to bind to anything but loopback, private-LAN or Tailscale
-  (`100.64.0.0/10`) addresses. `--bind 0.0.0.0` is rejected.
-- Requests whose `Host` header is not `localhost` or a private IP are rejected, which
-  blocks DNS-rebinding attacks. Requests carrying a foreign `Origin` are rejected, so a
+- It refuses to listen on anything but loopback, private-LAN or Tailscale
+  (`100.64.0.0/10`) addresses. `0.0.0.0` and public addresses are rejected, on the
+  command line and in Settings → Network.
+- Requests whose `Host` header is not `localhost`, a private IP or a host name you
+  listed under Settings → Network are rejected, which blocks DNS-rebinding attacks. Requests carrying a foreign `Origin` are rejected, so a
   web page you visit cannot drive the API.
 - Only a script file that exists inside the registered directory can be run; script
   names with path traversal or shell metacharacters are rejected.
@@ -384,9 +441,10 @@ internet:
 - Output is streamed line by line; lines are capped at 8 KB and only the last 2,000
   lines (512 KB) of a run are kept for the history.
 
-Without a password, anyone who can reach the bound address can run the registered
-scripts. Keep it on `127.0.0.1`, or set a password (see *Password protection*) before
-binding it to a network such as your tailnet.
+Without a password, anyone who can reach the address can run the registered scripts.
+Settings → Network refuses to open the dashboard to other computers until a password is
+set. `--bind` on the command line does not check this, so set one first (see *Password
+protection*).
 
 ## HTTP API
 
@@ -417,6 +475,9 @@ binding it to a network such as your tailnet.
 | GET | `/api/targets/{id}/commands` | Quick commands available for the target |
 | GET | `/api/fs/pyenv?dir=…&env=…` | Which Python environment a setting leads to |
 | GET | `/api/system` | Version, build, host and runtime details (the About page) |
+| GET / PUT | `/api/system/network` | Network settings: what is saved, what is running, this computer's addresses |
+| POST | `/api/system/restart` | Stop and start again with the same options |
+| GET | `/api/targets/{id}/network` | Which addresses a project's port answers on |
 | POST | `/api/targets/{id}/commands/{command}`, `/commands/stop` | Run a quick command / stop the running one |
 | GET / POST | `/api/targets/{id}/backups` | List database snapshots / take one now |
 | POST / DELETE | `/api/targets/{id}/backups/{file}/restore`, `/backups/{file}` | Restore / delete a snapshot |
@@ -440,7 +501,7 @@ cargo run -- --port 7979 --data-dir ./dev-data
 
 The source is in `src/` (`runner.rs`, `git.rs`, `health.rs`, `security.rs`,
 `automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api.rs`, `db.rs`,
-`autostart.rs`, `net.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
+`autostart.rs`, `net.rs`, `netcfg.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
 Windows executable and records the build commit and time.
 
 How the parts fit together, the database schema and the rules for keeping the
@@ -453,20 +514,29 @@ JavaScript with no build step and no dependencies:
 | File | What it holds |
 | --- | --- |
 | `index.html` | The page shell: sidebar and main containers, and the script tags |
-| `login.html`, `js/login.js` | The sign-in page |
+| `login.html` | The sign-in page |
+| `js/core/core.js` | DOM helper `h`, icons, the API client, formatters, shared state, target status and actions |
+| `js/core/components.js` | Charts, the log viewer, and small pieces (tables, tiles, form fields) |
+| `js/core/router.js` | Hash routing, the view lifecycle and the sidebar |
+| `js/core/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
+| `js/pages/home.js` | Dashboard and Projects |
+| `js/pages/project.js` | Project page (grouped terminals) |
+| `js/pages/new.js` | New Target page with project detection |
+| `js/pages/lists.js` | Deployments, Security and Activity pages |
+| `js/pages/about.js` | About page |
+| `js/target/target.js` | The target page frame: header, tabs, saving |
+| `js/target/config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
+| `js/target/python.js` | Configuration section "Python Environment" (`CFG.python`) |
+| `js/target/network.js` | Configuration section "Network" (`CFG.network`) |
+| `js/target/tabs.js` | Deployments, Commands, Logs and Security tabs |
+| `js/target/metrics.js` | Metrics tab |
+| `js/settings/settings.js` | Settings page frame: side menu, one section at a time (`SET.<name>`) |
+| `js/settings/access.js` | Settings section Access: the dashboard password |
+| `js/settings/network.js` | Settings section Network |
+| `js/settings/general.js` | Settings sections Start at Login, Notifications, Export and Import |
+| `js/settings/system.js` | Settings sections Manager, Resources, Manager Log, Danger Zone |
+| `js/login.js` | Sign-in form |
 | `styles.css` | All styling, with the dark and light colour tokens at the top |
-| `js/core.js` | DOM helpers, icons, the API client, formatters, shared state, target status and actions |
-| `js/components.js` | Charts, the log viewer, and small pieces (tables, tiles, deployment rows) |
-| `js/router.js` | Hash routing, the view lifecycle and the sidebar |
-| `js/pages-home.js` | Dashboard and Projects |
-| `js/pages-project.js` | Project page (grouped terminals) and New target |
-| `js/target.js` | The target page frame: header, tabs, saving |
-| `js/target-config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, …) |
-| `js/target-python.js` | The Python Environment section of the Configuration tab |
-| `js/target-tabs.js` | Deployments, Commands, Logs, Metrics and Security tabs |
-| `js/pages-global.js` | Deployments, Security, Activity and Settings pages |
-| `js/pages-about.js` | About page |
-| `js/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
 
 The scripts are ordinary (non-module) scripts loaded in that order and share one global
 scope. To add a script or stylesheet, put it in `web/`, reference it from the HTML and
