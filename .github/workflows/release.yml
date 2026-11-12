@@ -1,0 +1,130 @@
+# Builds PortalControl for Windows and macOS and publishes them as a GitHub
+# release named after the version in Cargo.toml.
+#
+# How to make a release: raise `version` in Cargo.toml and push to main.
+# A push that does not change the version builds nothing, because the release
+# for that version already exists. "Run workflow" on the Actions page builds
+# again and replaces the files of the existing release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Read version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      build: ${{ steps.read.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$version already exists; nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building v$version."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    name: Windows
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          rustup update stable
+          cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          Compress-Archive -Path target\release\portalcontrol.exe -DestinationPath "PortalControl-$v-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: PortalControl-*-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for Apple Silicon and Intel
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          # One program that runs on both kinds of Mac.
+          lipo -create -output portalcontrol \
+            target/aarch64-apple-darwin/release/portalcontrol \
+            target/x86_64-apple-darwin/release/portalcontrol
+          PORTALCONTROL_BINARY="$PWD/portalcontrol" sh scripts/make-macos-app.sh dist
+          ditto -c -k --keepParent dist/PortalControl.app "PortalControl-$v-macos-universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: PortalControl-*-macos-universal.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, windows, macos]
+    # Publish what was built even if one of the two systems failed.
+    if: always() && needs.version.outputs.build == 'true' && (needs.windows.result == 'success' || needs.macos.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cd dist
+          sha256sum PortalControl-* > "PortalControl-$VERSION-checksums.txt"
+          cat > ../notes.md <<EOF
+          ## Install
+
+          **Windows:** unzip \`PortalControl-$VERSION-windows-x64.zip\` and run \`portalcontrol.exe\`. It starts in the tray, next to the clock, with no terminal window. Windows SmartScreen may ask for confirmation because the program is not code-signed.
+
+          **macOS:** unzip \`PortalControl-$VERSION-macos-universal.zip\` and move \`PortalControl.app\` to Applications. It runs on Apple Silicon and Intel Macs and lives in the menu bar. The app is not notarised, so the first time right-click it and choose **Open**, or run \`xattr -dr com.apple.quarantine /Applications/PortalControl.app\`.
+
+          Replacing an older version keeps your targets, history and settings: they live in the data folder, not in the program.
+          EOF
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" * --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "v$VERSION" * --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "PortalControl $VERSION" --notes-file ../notes.md --generate-notes
+          fi

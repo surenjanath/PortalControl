@@ -9,14 +9,21 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-cargo build --release
 
+# PORTALCONTROL_BINARY names a program that is already built (the release
+# workflow passes its universal build); otherwise build one here.
 BUILD="${CARGO_TARGET_DIR:-target}/release"
+BINARY="${PORTALCONTROL_BINARY:-}"
+if [ -z "$BINARY" ]; then
+    cargo build --release
+    BINARY="$BUILD/portalcontrol"
+fi
 APP="${1:-$BUILD}/PortalControl.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BUILD/portalcontrol" "$APP/Contents/MacOS/portalcontrol"
+cp "$BINARY" "$APP/Contents/MacOS/portalcontrol"
+chmod +x "$APP/Contents/MacOS/portalcontrol"
 cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,7 +38,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>10.13</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
