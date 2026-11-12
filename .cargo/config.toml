@@ -1,0 +1,4 @@
+# Link the C runtime into the Windows binary so portalcontrol.exe runs on a
+# clean machine without the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
