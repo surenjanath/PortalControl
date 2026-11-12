@@ -153,6 +153,7 @@ pub fn tree_rows(root: u32, table: &[ProcRow]) -> Vec<&ProcRow> {
 }
 
 /// CPU, memory and process count summed over the tree of `root`.
+#[cfg(test)]
 pub fn tree_usage(root: u32, table: &[ProcRow]) -> (f32, u64, u32) {
     let rows = tree_rows(root, table);
     (

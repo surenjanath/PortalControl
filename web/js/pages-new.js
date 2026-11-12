@@ -136,13 +136,12 @@ function newView(cloneId) {
         info.starters.length ? [h("div", { class: "optlabel" }, userScripts.length ? "Or let PortalControl write a start script" : "This project has no script yet. PortalControl can write one"),
           info.starters.map((s) => option({ type: "starter", id: s.id }, choice && choice.type === "starter" && choice.id === s.id, s.label,
             [h("span", { class: "tag" }, s.run_mode === "SERVICE" ? "Service" : "Task"), s.script_exists && s.script_is_ours ? h("span", { class: "tag acc" }, "already generated") : null,
-              s.script_exists && !s.script_is_ours ? h("span", { class: "tag warn" }, s.script + " exists") : null], s.description))] : null,
+              s.script_exists && !s.script_is_ours ? h("span", { class: "tag warn" }, s.script + " exists") : null], s.description)), portBox] : null,
         helperScripts.length ? [h("div", { class: "optlabel" }, "Launchers written earlier"),
           helperScripts.map((s) => option({ type: "script", script: s }, choice && choice.type === "script" && choice.script === s, s, null, null))] : null,
         h("div", { class: "optlabel" }, "Something else"),
         option({ type: "custom" }, choice && choice.type === "custom", "Another script", null, "Type the name of a " + (win ? ".bat or .cmd" : ".sh") + " file inside the folder."),
-        choice && choice.type === "custom" ? h("div", { style: "margin:4px 0 12px 30px;max-width:360px" }, f.custom) : null,
-        portBox);
+        choice && choice.type === "custom" ? h("div", { style: "margin:4px 0 12px 30px;max-width:360px" }, f.custom) : null);
       paintPort();
     }
     function paintOptions() {
@@ -172,7 +171,7 @@ function newView(cloneId) {
       const taken = registered.map((o) => o.script_name.toLowerCase());
       workers = (r.workers || []).filter((w) => !taken.includes(w.script.toLowerCase())).map((w) => ({ w, box: h("input", { type: "checkbox", checked: !src }) }));
       found.replaceChildren(h("div", { class: "note-box ok" },
-        h("div", { class: "rowf" }, h("b", { style: "color:var(--text);font-size:14px" }, r.project.label), r.detected.map((d) => h("span", { class: "tag acc" }, d)),
+        h("div", { class: "rowf" }, h("b", { style: "color:var(--text);font-size:14px" }, r.project.label), r.detected.filter((d) => d !== r.project.label).map((d) => h("span", { class: "tag acc" }, d)),
           r.is_repo ? h("span", { class: "tag ok" }, icon("git"), r.branch || "detached HEAD") : h("span", { class: "tag" }, "not a Git repository")),
         r.remote_url ? h("div", { class: "mono", style: "margin-top:6px" }, r.remote_url) : null,
         r.head_summary ? h("div", { style: "margin-top:2px" }, "Latest commit: " + r.head_summary) : null,
