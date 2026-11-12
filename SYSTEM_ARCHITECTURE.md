@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.2.0 |
-| Application version | 0.7.0 (`Cargo.toml`) |
+| Document version | 1.3.0 |
+| Application version | 0.8.0 (`Cargo.toml`) |
 | Last updated | 2026-11-12 |
 
 ## 1. System Overview
@@ -132,7 +132,7 @@ health probes that the user configured.
 | `main.rs` | Command line (`serve`, `stop`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, shutdown, tray status text, author and build details |
 | `api.rs` | Every HTTP route, request guards, input validation, the embedded assets, project detection and generated start scripts, quick commands, export and import |
 | `state.rs` | `AppState`: everything kept in memory and shared between modules |
-| `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool |
+| `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool. That pool must not be capped low: on Windows every output pipe of a running process (two per service) holds one of its threads while waiting for output, so the limit is tokio's default of 512 (`MAX_BLOCKING_THREADS` in `main.rs`) |
 | `runner.rs` | Starts scripts and one-off commands, pumps their output, enforces timeouts, kills process trees, queues crashed services for restart |
 | `pyenv.rs` | Works out and activates a target's Python environment (see 3.6) |
 | `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files |
@@ -254,6 +254,16 @@ address of the machine (the network door), in plain HTTP or, with a certificate,
   cookies set there get the `Secure` attribute.
 - Host names listed in the settings are accepted by the request guard in addition to
   `localhost` and private IP literals.
+- **Network guard.** Every request through the network door first passes
+  `api::network_guard` (a layer only on that listener; it needs the peer address, so
+  the listener is served with connect info). It refuses, with HTTP 403 and a plain
+  sentence, when no password is set, when the time limit has passed, or when the peer
+  is outside the network of the bound address (prefix length taken from the interface,
+  /24 if unknown) and other networks are not allowed. The two limits live in
+  `AppState::net_limits` and are replaced on every save, so they apply without a
+  restart; they are not part of `Effective`. The guard records each peer in
+  `AppState::clients` (at most 200) and writes an Activity entry when a peer first
+  connects or its allowed/refused state changes. The local door is never guarded.
 
 **A target.** `GET /api/targets/{id}/network` reports the port (from the health URL),
 whether the start script was written by PortalControl and for which host, and whether a
@@ -369,10 +379,23 @@ what a request can make it run.
 - **Listening addresses.** Only loopback, private-LAN and Tailscale (`100.64.0.0/10`)
   addresses are accepted, from the command line and from Settings → Network alike.
   `0.0.0.0` and public addresses are refused (`net.rs`, `netcfg.rs`). The default is
-  loopback only.
+  loopback only. One exception, in Settings only: an address outside those ranges is
+  accepted when it is assigned to this machine at the time of saving and the user ticks
+  that the network is internal (`NetSettings::internal_confirmed`), because some
+  networks use public address space internally. The request guard then also answers
+  to that one address. `--bind` stays strict.
 - **Opening to the network needs a password.** `PUT /api/system/network` refuses a
   network address while no dashboard password is set, and the password cannot be
-  removed while a network address is saved. `--bind` does not enforce this.
+  removed while a network address is saved. Independently of how the address was
+  configured, including `--bind`, the network guard refuses every request from another
+  computer while no password is set.
+- **Same network only, optional time limit.** By default the network guard answers only
+  peers on the bound address's own network, and access can be given an end time after
+  which every peer is refused (see 3.7).
+- **Sign-ins are attributed.** Successful and failed sign-ins are written to Activity
+  with the peer address, or "on this computer".
+- **Response headers.** `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+  `Referrer-Policy: no-referrer` on every response.
 - **HTTPS.** Optional, for the network address only, with a certificate and key the
   user provides as PEM files. Only the file paths are stored. TLS 1.2 and 1.3 through
   rustls. Sign-in cookies issued over HTTPS are marked `Secure`. The local address is
@@ -505,6 +528,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.3.0 | 0.8.0 | 2026-11-12 | Stricter network access: a guard on the network listener refuses every peer while no password is set, peers outside the bound address's network (default), and everyone after an optional time limit; both limits apply without a restart. Peers are listed in Settings and logged to Activity, sign-ins carry the peer address, two more response headers. New sign-in page. Fix: networks that use address space outside the private ranges internally could not be configured; such an address is now accepted in Settings when the machine has it and the user confirms the network is internal. Fix: on Windows the dashboard stopped answering ("Loading...", empty lists) once eight services were running, because their output pipes used all 16 threads of the blocking pool and database calls had none left; the cap is now 512. The target list also loads scans and last runs in one query each instead of one per target. |
 | 1.2.0 | 0.7.0 | 2026-11-12 | Network settings for the manager (`netcfg.rs`, Settings section, `GET`/`PUT /api/system/network`): address for other computers, port, host names, HTTPS with a user-supplied certificate; stored as JSON in `settings`. The manager now always listens on 127.0.0.1 and optionally on one network address; `--bind` adds the network address instead of replacing loopback, and `stop` always uses the local address. Restart from the dashboard (`POST /api/system/restart`). Password required for network access. Per-target Network page (`GET /api/targets/{id}/network`). New dependencies rustls and axum-server; sysinfo `network` feature. Dashboard scripts grouped into folders (`js/core`, `js/pages`, `js/target`, `js/settings`); the Settings page now has a side menu with one section per address (`#/settings/<section>`), each a `SET.<name>` function. Release workflow on GitHub Actions. |
 | 1.1.0 | 0.6.0 | 2026-11-12 | Windows build is a windowed program: no terminal window, attaches to the parent terminal for command output, opens the dashboard when started twice (3.5). Native About window from the tray menu and the new `about` command; macOS uses the system About panel. Author, homepage and tagline in `Cargo.toml`, `/api/system` (`author`, `homepage`, `tagline`) and the About page. New dependency windows-sys; the manifest now requests common controls 6 and is required at build time. |
 | 1.0.0 | 0.5.0 | 2026-11-12 | First version of this file. In this release: application icon embedded in the Windows executable and used as the browser-tab icon; tray icon on Windows and menu-bar icon on macOS with status tooltip and menu (`tray.rs`, `--no-tray`); macOS app bundle script; C runtime linked statically on Windows; per-target Python environment (`pyenv.rs`, new column `portal_targets.python_env`, `GET /api/fs/pyenv`); About page with version, commit and build time (`/api/system` gained `commit`, `built_at`, `sqlite`, `libgit2`, `started_at`). |

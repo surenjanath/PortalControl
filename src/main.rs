@@ -217,6 +217,9 @@ pub fn worker_threads() -> usize {
         .clamp(2, 4)
 }
 
+/// Upper limit of the blocking thread pool (tokio's own default).
+const MAX_BLOCKING_THREADS: usize = 512;
+
 fn main() -> ExitCode {
     #[cfg(windows)]
     attach_parent_console();
@@ -533,7 +536,12 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
-        .max_blocking_threads(16)
+        // No small cap on the blocking pool. On Windows every output pipe of
+        // a running process (two per service) holds one of its threads while
+        // it waits for output, and database calls use the same pool: with a
+        // cap of 16, eight running services left none and the API hung.
+        // Threads are only created when needed and idle ones are released.
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .thread_name("portalcontrol")
         .enable_all()
         .build()
@@ -572,7 +580,7 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
 
         // The door for other computers, if one is configured. When it cannot
         // be opened the manager still runs, reachable locally, and says why.
-        let mut active = netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None };
+        let mut active = netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None, subnet: None };
         let mut network_listener = None;
         let mut tls = None;
         if let Some(ip) = plan.network {
@@ -586,6 +594,10 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
             match opened {
                 Ok((listener, config)) => {
                     active.network = Some(net_addr);
+                    if let IpAddr::V4(v4) = ip {
+                        let prefix = netcfg::local_addresses().iter().find(|a| a.ip == v4.to_string()).map(|a| a.prefix);
+                        active.subnet = Some((v4, prefix.unwrap_or(24)));
+                    }
                     network_listener = Some(listener);
                     tls = config;
                 }
@@ -597,6 +609,7 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
 
         let state = AppState::new(db, addr);
         let _ = state.net.set(active.clone());
+        *state.net_limits.lock().unwrap_or_else(|p| p.into_inner()) = netcfg::Limits::from(&saved);
         let _ = state.cli_net.set((opts.bind, opts.port));
         let _ = state.data_dir.set(data_dir.clone());
         let _ = state.serve_args.set(opts.passthrough_args());
@@ -653,7 +666,8 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         }
 
         let app = api::router(state.clone());
-        let network_app = app.clone();
+        // Everything from other computers passes the network guard first.
+        let network_app = app.clone().layer(axum::middleware::from_fn_with_state(state.clone(), api::network_guard));
         let network_server = async move {
             let Some(listener) = network_listener else {
                 return std::future::pending::<Result<(), String>>().await;
@@ -661,7 +675,7 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
             match tls {
                 Some(config) => {
                     // Marked so sign-in cookies are sent back over HTTPS only.
-                    let service = network_app.layer(axum::Extension(api::ViaTls)).into_make_service();
+                    let service = network_app.layer(axum::Extension(api::ViaTls)).into_make_service_with_connect_info::<SocketAddr>();
                     axum_server::from_tcp_rustls(listener, axum_server::tls_rustls::RustlsConfig::from_config(config))
                         .map_err(|e| format!("network server error: {e}"))?
                         .serve(service)
@@ -670,7 +684,7 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
                 }
                 None => {
                     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| format!("network server error: {e}"))?;
-                    axum::serve(listener, network_app).await.map_err(|e| format!("network server error: {e}"))
+                    axum::serve(listener, network_app.into_make_service_with_connect_info::<SocketAddr>()).await.map_err(|e| format!("network server error: {e}"))
                 }
             }
         };

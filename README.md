@@ -237,7 +237,7 @@ shown, with what is running now on top and the settings below it:
 
 | Setting | What it does |
 | --- | --- |
-| Who can open the dashboard | Only this computer, or other computers too through one address of this computer. The addresses it has (local network, Tailscale) are listed; public addresses and `0.0.0.0` are refused |
+| Who can open the dashboard | Only this computer, or other computers too through one address of this computer. The addresses it has are listed. `0.0.0.0` is refused. An address outside the private ranges (some networks use such ranges internally) is accepted only if this computer really has it and you tick that the network is internal |
 | Port | Default 7878 |
 | Host names (domain) | Names people may type instead of the IP address, such as `portal.mycompany.lan` or the computer's name. Your DNS, router or hosts file must already point the name at this computer; this setting only allows PortalControl to answer to it |
 | HTTPS | Encrypts connections from other computers. Needs the full paths of a PEM certificate file and its PEM private key file. The files are checked when you save |
@@ -248,7 +248,19 @@ Things to know:
   not in use yet", and **Restart now** restarts PortalControl for you. A restart stops
   every running target; those set to start with PortalControl come back by themselves.
 - **A password is required** before other computers are let in, and it cannot be removed
-  while they are.
+  while they are. Without a password every request from another computer is refused,
+  also when the address was given with `--bind`.
+- **Same network only.** By default only computers on the same network as the chosen
+  address are answered; anything routed in from elsewhere is refused. Untick this if
+  people on another of your networks must reach it.
+- **Time limit.** "Keep it open" can be 15 minutes, 1 hour or 8 hours instead of
+  forever. When the time runs out other computers are refused until you open it again.
+  Useful for a quick setup from another computer. This and the same-network rule apply
+  at once, without a restart.
+- **Who has connected.** The section lists every computer that used the network address
+  since the start, with the time of its last request and whether it was allowed or
+  refused. Sign-ins, failed sign-ins and refusals also appear under Activity, with the
+  address they came from.
 - **HTTPS covers the network address only.** This computer keeps using plain
   `http://127.0.0.1`, which never leaves it. With a self-made certificate browsers show
   a warning until it is trusted on each computer; a certificate from your company's CA

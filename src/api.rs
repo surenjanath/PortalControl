@@ -241,11 +241,16 @@ async fn verify(state: &Arc<AppState>, password: String) -> bool {
 async fn auth_login(
     State(state): State<Arc<AppState>>,
     tls: Tls,
+    client: Option<axum::Extension<ClientIp>>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult {
     if !state.auth.password_set() {
         return Ok(ok(json!({"authenticated": true})));
     }
+    let from = match client {
+        Some(axum::Extension(ClientIp(ip))) => format!("from {ip}"),
+        None => "on this computer".to_string(),
+    };
     if let Some(secs) = state.auth.locked_for() {
         return Err(fail(
             StatusCode::TOO_MANY_REQUESTS,
@@ -254,10 +259,11 @@ async fn auth_login(
     }
     if !verify(&state, req.password).await {
         state.auth.note_failure();
-        state.activity("warn", "auth", None, "Failed sign-in attempt");
+        state.activity("warn", "auth", None, format!("Failed sign-in attempt {from}"));
         return Err(fail(StatusCode::UNAUTHORIZED, "wrong password"));
     }
     state.auth.clear_failures();
+    state.activity("info", "auth", None, format!("Signed in {from}"));
     let token = state.auth.create_session();
     Ok(with_cookie(
         ok(json!({"authenticated": true})),
@@ -338,7 +344,17 @@ async fn auth_password(
 ///
 /// When a dashboard password is set, everything except the public paths
 /// also needs a signed-in session (or the local CLI's control token).
-async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+async fn guard(state: State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    // Every answer, refusals and the sign-in page included, carries these.
+    let mut res = checked(state, req, next).await;
+    let headers = res.headers_mut();
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(axum::http::header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(axum::http::header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    res
+}
+
+async fn checked(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let host = req
         .headers()
         .get(HOST)
@@ -363,10 +379,56 @@ async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> 
             fail(StatusCode::UNAUTHORIZED, "sign in required")
         };
     }
-    let mut res = next.run(req).await;
-    res.headers_mut()
-        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    res
+    next.run(req).await
+}
+
+/// The address of the other computer a request came from.
+#[derive(Clone, Copy)]
+pub struct ClientIp(pub std::net::IpAddr);
+
+/// First check for everything that arrives through the network address:
+/// is this computer allowed to talk to PortalControl at all right now?
+/// Requests on 127.0.0.1 never pass through here.
+pub async fn network_guard(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let ip = remote.ip();
+    let now = chrono::Utc::now().timestamp();
+    let limits = *state.net_limits.lock().unwrap_or_else(|p| p.into_inner());
+    let refused = state
+        .net
+        .get()
+        .and_then(|n| n.refuse(limits, ip, now, state.auth.password_set()));
+
+    // Remember who came by, and note it when that is news.
+    let news = {
+        let mut seen = state.clients.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() >= 200 && !seen.contains_key(&ip) {
+            if let Some(oldest) = seen.iter().min_by_key(|(_, c)| c.last_seen).map(|(k, _)| *k) {
+                seen.remove(&oldest);
+            }
+        }
+        let entry = seen.entry(ip).or_default();
+        let news = entry.requests == 0 || entry.refused != refused;
+        entry.last_seen = now;
+        entry.requests += 1;
+        entry.refused = refused;
+        news
+    };
+    if news {
+        match refused {
+            Some(why) => state.activity("warn", "network", None, format!("Refused {ip}: {why}")),
+            None => state.activity("info", "network", None, format!("{ip} connected")),
+        }
+    }
+    if let Some(why) = refused {
+        return (StatusCode::FORBIDDEN, why).into_response();
+    }
+    req.extensions_mut().insert(ClientIp(ip));
+    next.run(req).await
 }
 
 async fn index() -> Response {
@@ -507,7 +569,7 @@ fn refresh_in_background(state: &Arc<AppState>, t: &Target) {
     }
 }
 
-async fn target_view(state: &Arc<AppState>, t: Target) -> Value {
+async fn target_view(state: &Arc<AppState>, t: Target, extras: &mut Extras) -> Value {
     let (running, command_running) = {
         let r = state.running.lock().await;
         let view = |h: &crate::state::RunHandle| {
@@ -558,13 +620,8 @@ async fn target_view(state: &Arc<AppState>, t: Target) -> Value {
         .lock()
         .map(|q| q.iter().any(|(id, _)| *id == t.id))
         .unwrap_or(false);
-    let scan = state.db.latest_scan(t.id, false).await.ok().flatten();
-    let last_run = state
-        .db
-        .list_runs(t.id, 1)
-        .await
-        .ok()
-        .and_then(|v| v.into_iter().next());
+    let scan = extras.scans.remove(&t.id);
+    let last_run = extras.last_runs.remove(&t.id);
 
     let mut v = serde_json::to_value(&t).unwrap_or_else(|_| json!({}));
     v["running"] = json!(running);
@@ -580,24 +637,59 @@ async fn target_view(state: &Arc<AppState>, t: Target) -> Value {
     v["restart_pending"] = json!(restart_pending);
     v["next_run"] = json!(automation::next_run(t.schedule.as_deref()));
     v["env_count"] = json!(runner::parse_env(&t.env_vars).map(|e| e.len()).unwrap_or(0));
-    v["python"] = pyenv::describe(std::path::Path::new(&t.working_directory), t.python_env.as_deref());
+    v["python"] = extras.python.remove(&t.id).unwrap_or(Value::Null);
     v
+}
+
+/// What target views need from the database and the disk. It is loaded for
+/// every target in one go: the dashboard asks for the whole list on each
+/// refresh, and one query per target made that slow with many targets.
+#[derive(Default)]
+struct Extras {
+    scans: HashMap<i64, crate::db::ScanReport>,
+    last_runs: HashMap<i64, crate::db::RunRecord>,
+    python: HashMap<i64, Value>,
+}
+
+async fn load_extras(state: &Arc<AppState>, targets: &[Target]) -> Extras {
+    let (scans, last_runs) = tokio::join!(state.db.latest_scan_summaries(), state.db.last_runs());
+    // Looking for Python environments touches the disk: off the async threads.
+    let wanted: Vec<(i64, String, Option<String>)> = targets
+        .iter()
+        .map(|t| (t.id, t.working_directory.clone(), t.python_env.clone()))
+        .collect();
+    let python = tokio::task::spawn_blocking(move || {
+        wanted
+            .into_iter()
+            .map(|(id, dir, env)| (id, pyenv::describe(std::path::Path::new(&dir), env.as_deref())))
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    Extras { scans: scans.unwrap_or_default(), last_runs: last_runs.unwrap_or_default(), python }
+}
+
+/// The view of one target, for the routes that return a single one.
+async fn one_target_view(state: &Arc<AppState>, t: Target) -> Value {
+    let mut extras = load_extras(state, std::slice::from_ref(&t)).await;
+    target_view(state, t, &mut extras).await
 }
 
 // ---------------------------------------------------------------- targets --
 
 async fn list_targets(State(state): State<Arc<AppState>>) -> AppResult {
     let targets = state.db.list_targets().await.map_err(internal)?;
+    let mut extras = load_extras(&state, &targets).await;
     let mut out = Vec::with_capacity(targets.len());
     for t in targets {
-        out.push(target_view(&state, t).await);
+        out.push(target_view(&state, t, &mut extras).await);
     }
     Ok(ok(json!(out)))
 }
 
 async fn get_target(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
-    Ok(ok(target_view(&state, t).await))
+    Ok(ok(one_target_view(&state, t).await))
 }
 
 async fn create_target(
@@ -610,7 +702,7 @@ async fn create_target(
     refresh_in_background(&state, &t);
     state.activity("info", "target", Some(id), format!("Target '{}' registered", t.name));
     state.emit(json!({"type": "targets_changed"}));
-    Ok((StatusCode::CREATED, Json(target_view(&state, t).await)).into_response())
+    Ok((StatusCode::CREATED, Json(one_target_view(&state, t).await)).into_response())
 }
 
 async fn update_target(
@@ -628,7 +720,7 @@ async fn update_target(
     }
     state.activity("info", "target", Some(id), "Configuration saved");
     state.emit(json!({"type": "targets_changed"}));
-    Ok(ok(target_view(&state, t).await))
+    Ok(ok(one_target_view(&state, t).await))
 }
 
 async fn delete_target(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
@@ -2339,6 +2431,17 @@ async fn network_view(state: &Arc<AppState>) -> Value {
     let computer_name = state.metrics.lock().ok().and_then(|m| m.host_name.clone());
     let password_set = state.auth.password_set();
 
+    let mut clients: Vec<Value> = state
+        .clients
+        .lock()
+        .map(|seen| {
+            seen.iter()
+                .map(|(ip, c)| json!({"ip": ip.to_string(), "last_seen": c.last_seen, "requests": c.requests, "refused": c.refused}))
+                .collect()
+        })
+        .unwrap_or_default();
+    clients.sort_by_key(|c| std::cmp::Reverse(c["last_seen"].as_i64().unwrap_or(0)));
+
     let mut warnings: Vec<String> = Vec::new();
     if let Some(e) = &active.error {
         warnings.push(format!("Other computers cannot connect right now, because the network address could not be opened: {e}"));
@@ -2354,6 +2457,11 @@ async fn network_view(state: &Arc<AppState>) -> Value {
     }
     if next.network.is_some() && !next.https {
         warnings.push("Other computers connect without encryption: the password and everything on screen cross the network in clear text. That is fine on Tailscale or a network you trust; otherwise turn on HTTPS.".into());
+    }
+    if let Some(ip) = next.network.filter(|ip| !net::is_private_ip(ip)) {
+        warnings.push(format!(
+            "{ip} is outside the address ranges reserved for private networks. You confirmed your network uses it internally; make sure a firewall keeps this computer unreachable from the internet."
+        ));
     }
     if next.network.is_some() && !password_set {
         warnings.push("No dashboard password is set. Anyone who can reach the address can run the registered scripts.".into());
@@ -2376,6 +2484,13 @@ async fn network_view(state: &Arc<AppState>) -> Value {
         "computer_name": computer_name,
         "password_set": password_set,
         "default_port": crate::DEFAULT_PORT,
+        "limits": {
+            "allow_other_networks": saved.allow_other_networks,
+            "expires_at": saved.expires_at,
+            "expired": saved.expires_at.is_some_and(|end| chrono::Utc::now().timestamp() >= end),
+        },
+        "subnet": active.subnet_text(),
+        "clients": clients,
         "warnings": warnings,
     })
 }
@@ -2397,6 +2512,8 @@ async fn network_put(State(state): State<Arc<AppState>>, Json(input): Json<netcf
         ));
     }
     settings.save(&state.db).await.map_err(internal)?;
+    // The limits on other computers apply at once.
+    *state.net_limits.lock().unwrap_or_else(|p| p.into_inner()) = netcfg::Limits::from(&settings);
     state.activity("info", "system", None, "Network settings changed");
     Ok(ok(network_view(&state).await))
 }

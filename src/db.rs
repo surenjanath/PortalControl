@@ -710,10 +710,11 @@ impl Db {
     ) -> Result<Option<ScanReport>, String> {
         self.call(move |c| {
             c.query_row(
+                // The report can be megabytes: read it only when it is wanted.
                 "SELECT id, target_id, critical_issues_found, vulnerable_packages_found, \
-                 scanned_at, raw_payload_json FROM security_scan_reports \
+                 scanned_at, CASE WHEN ?2 THEN raw_payload_json END FROM security_scan_reports \
                  WHERE target_id=?1 ORDER BY id DESC LIMIT 1",
-                [target_id],
+                params![target_id, with_payload],
                 |r| {
                     let raw: Option<String> = r.get(5)?;
                     Ok(ScanReport {
@@ -731,6 +732,43 @@ impl Db {
                 },
             )
             .optional()
+        })
+        .await
+    }
+
+    /// The newest scan of every target, without the report itself. One query
+    /// for the whole target list instead of one per target.
+    pub async fn latest_scan_summaries(&self) -> Result<std::collections::HashMap<i64, ScanReport>, String> {
+        self.call(|c| {
+            let mut st = c.prepare(
+                "SELECT id, target_id, critical_issues_found, vulnerable_packages_found, scanned_at \
+                 FROM security_scan_reports \
+                 WHERE id IN (SELECT MAX(id) FROM security_scan_reports GROUP BY target_id)",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(ScanReport {
+                    id: r.get(0)?,
+                    target_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    critical_issues_found: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    vulnerable_packages_found: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    scanned_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    raw_payload: None,
+                })
+            })?;
+            rows.map(|r| r.map(|s| (s.target_id, s))).collect()
+        })
+        .await
+    }
+
+    /// The newest run of every target (no captured output).
+    pub async fn last_runs(&self) -> Result<std::collections::HashMap<i64, RunRecord>, String> {
+        self.call(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {RUN_COLS} FROM process_execution_history h \
+                 WHERE h.id IN (SELECT MAX(id) FROM process_execution_history GROUP BY target_id)"
+            ))?;
+            let rows = st.query_map([], |r| row_to_run(r, RunExtra::None))?;
+            rows.map(|r| r.map(|run| (run.target_id, run))).collect()
         })
         .await
     }

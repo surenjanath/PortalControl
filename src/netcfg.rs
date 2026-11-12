@@ -26,6 +26,21 @@ pub struct NetSettings {
     /// computer only.
     #[serde(default)]
     pub address: String,
+    /// The user confirmed that `address`, although outside the private
+    /// ranges, is on their internal network. Some networks use public
+    /// address space internally.
+    #[serde(default)]
+    pub internal_confirmed: bool,
+    /// Let computers from other networks in too. Off by default: only
+    /// computers on the same network as `address` are answered.
+    #[serde(default)]
+    pub allow_other_networks: bool,
+    /// Unix time after which other computers are refused. `None`: no limit.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// Input only: open for this many minutes from now (sets `expires_at`).
+    #[serde(default, skip_serializing)]
+    pub open_for_minutes: Option<u32>,
     /// Port of the dashboard. `None`: the default.
     #[serde(default)]
     pub port: Option<u16>,
@@ -68,12 +83,35 @@ impl NetSettings {
             if ip.is_loopback() || ip.is_unspecified() {
                 return Err("choose an address of this computer on your network; 127.0.0.1 is always on, and 0.0.0.0 (every network) is not allowed".into());
             }
-            if !crate::net::is_private_ip(&ip) {
-                return Err(format!(
-                    "{ip} is a public address. PortalControl runs scripts, so it only listens on private LAN (10.x, 172.16-31.x, 192.168.x) and Tailscale (100.64-127.x) addresses"
-                ));
+            if crate::net::is_private_ip(&ip) {
+                self.internal_confirmed = false;
+            } else {
+                // Outside the private ranges. Allowed only for an address this
+                // computer really has, and only when the user says the network
+                // is internal: PortalControl must never face the internet.
+                if !local_addresses().iter().any(|a| a.ip == ip.to_string()) {
+                    return Err(format!(
+                        "{ip} is not in a private range (10.x, 172.16-31.x, 192.168.x, Tailscale 100.64-127.x) and is not an address of this computer right now, so it cannot be used"
+                    ));
+                }
+                if !self.internal_confirmed {
+                    return Err(format!(
+                        "{ip} is outside the private ranges, so it could be reachable from the internet. If your network uses this range internally, tick the box that says so and save again"
+                    ));
+                }
             }
             self.address = ip.to_string();
+        } else {
+            self.internal_confirmed = false;
+        }
+        if let Some(minutes) = self.open_for_minutes.take() {
+            if minutes == 0 || minutes > 7 * 24 * 60 {
+                return Err("the time limit must be between 1 minute and 7 days".into());
+            }
+            self.expires_at = Some(chrono::Utc::now().timestamp() + i64::from(minutes) * 60);
+        }
+        if self.address.is_empty() {
+            self.expires_at = None;
         }
         if self.port == Some(0) {
             return Err("the port must be between 1 and 65535".into());
@@ -143,6 +181,40 @@ pub fn effective(saved: &NetSettings, cli_bind: Option<IpAddr>, cli_port: Option
     }
 }
 
+/// The limits on other computers that apply at once, without a restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Limits {
+    pub allow_other_networks: bool,
+    pub expires_at: Option<i64>,
+}
+
+impl From<&NetSettings> for Limits {
+    fn from(s: &NetSettings) -> Self {
+        Self { allow_other_networks: s.allow_other_networks, expires_at: s.expires_at }
+    }
+}
+
+pub const REFUSED_NO_PASSWORD: &str =
+    "This PortalControl is not open to other computers: no dashboard password is set. Set one on the computer it runs on.";
+pub const REFUSED_EXPIRED: &str =
+    "Network access to this PortalControl has ended. Open it again on the computer it runs on (Settings, Network).";
+pub const REFUSED_OTHER_NETWORK: &str = "Only computers on the same network as this PortalControl may connect.";
+
+/// One computer that used the network address since the manager started.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClientSeen {
+    pub last_seen: i64,
+    pub requests: u64,
+    /// Why it was turned away, if it was.
+    pub refused: Option<&'static str>,
+}
+
+/// Whether two IPv4 addresses are in the same network of `prefix` bits.
+pub fn same_network(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix.min(32))) };
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
 /// What the running manager opened at start.
 #[derive(Debug, Clone, Serialize)]
 pub struct Active {
@@ -152,6 +224,8 @@ pub struct Active {
     pub network: Option<SocketAddr>,
     /// Why the network address could not be opened, if it could not.
     pub error: Option<String>,
+    /// The network of the network address: the address and its prefix length.
+    pub subnet: Option<(Ipv4Addr, u8)>,
 }
 
 impl Active {
@@ -162,7 +236,38 @@ impl Active {
             local: local_addr(port),
             network: None,
             error: None,
+            subnet: None,
         }
+    }
+
+    /// Why the computer at `remote` may not use the network address right
+    /// now, or `None` when it may. Checked on every request from the network.
+    pub fn refuse(&self, limits: Limits, remote: IpAddr, now: i64, password_set: bool) -> Option<&'static str> {
+        if !password_set {
+            return Some(REFUSED_NO_PASSWORD);
+        }
+        if limits.expires_at.is_some_and(|end| now >= end) {
+            return Some(REFUSED_EXPIRED);
+        }
+        if !limits.allow_other_networks {
+            let same = match (remote, self.subnet) {
+                (IpAddr::V4(r), Some((ip, prefix))) => same_network(r, ip, prefix),
+                // Network unknown: only this computer's own address is certain.
+                _ => self.network.is_some_and(|n| n.ip() == remote),
+            };
+            if !same {
+                return Some(REFUSED_OTHER_NETWORK);
+            }
+        }
+        None
+    }
+
+    /// The network of the network address, written as `192.168.1.0/24`.
+    pub fn subnet_text(&self) -> Option<String> {
+        self.subnet.map(|(ip, prefix)| {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix.min(32))) };
+            format!("{}/{prefix}", Ipv4Addr::from(u32::from(ip) & mask))
+        })
     }
 
     pub fn local_url(&self) -> String {
@@ -174,10 +279,13 @@ impl Active {
         self.network.map(|a| format!("{scheme}://{a}/"))
     }
 
-    /// Whether a request's `Host` names one of the configured host names.
+    /// Whether a request's `Host` names one of the configured host names, or
+    /// the network address itself (which matters when that address is outside
+    /// the private ranges the general rule accepts).
     pub fn host_allowed(&self, authority: &str) -> bool {
         let host = crate::net::host_without_port(authority);
         self.effective.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+            || self.network.is_some_and(|n| host.parse::<IpAddr>().is_ok_and(|ip| ip == n.ip()))
     }
 }
 
@@ -216,23 +324,32 @@ pub fn load_tls(cert_file: &str, key_file: &str) -> Result<Arc<rustls::ServerCon
 pub struct LocalAddress {
     pub ip: String,
     pub interface: String,
-    /// `lan` or `tailscale`.
+    /// `lan`, `tailscale`, or `other` for an address outside the private ranges.
     pub kind: &'static str,
+    /// Length of the network prefix, for example 24.
+    pub prefix: u8,
 }
 
-/// This machine's private IPv4 addresses, LAN first.
+/// This machine's IPv4 addresses on its networks: LAN first, then addresses
+/// outside the private ranges, then Tailscale.
 pub fn local_addresses() -> Vec<LocalAddress> {
     let networks = sysinfo::Networks::new_with_refreshed_list();
     let mut out: Vec<LocalAddress> = Vec::new();
     for (name, data) in networks.iter() {
         for net in data.ip_networks() {
             let IpAddr::V4(v4) = net.addr else { continue };
-            if v4.is_loopback() || v4.is_link_local() || !crate::net::is_private_ip(&net.addr) {
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
                 continue;
             }
-            let kind = if v4.is_private() { "lan" } else { "tailscale" };
+            let kind = if v4.is_private() {
+                "lan"
+            } else if crate::net::is_private_ip(&net.addr) {
+                "tailscale"
+            } else {
+                "other"
+            };
             if !out.iter().any(|a| a.ip == v4.to_string()) {
-                out.push(LocalAddress { ip: v4.to_string(), interface: name.clone(), kind });
+                out.push(LocalAddress { ip: v4.to_string(), interface: name.clone(), kind, prefix: net.prefix });
             }
         }
     }
@@ -256,6 +373,13 @@ mod tests {
         for bad in ["0.0.0.0", "127.0.0.1", "8.8.8.8", "localhost", "192.168.1"] {
             assert!(settings(bad).validate().is_err(), "{bad} must be refused");
         }
+        // Outside the private ranges: never an address this computer lacks,
+        // even when "it is internal" is ticked.
+        let foreign = NetSettings { address: "8.8.8.8".into(), internal_confirmed: true, ..Default::default() };
+        assert!(foreign.validate().unwrap_err().contains("not an address of this computer"));
+        // The tick is dropped where it means nothing.
+        let private = NetSettings { address: "10.0.0.5".into(), internal_confirmed: true, ..Default::default() };
+        assert!(!private.validate().unwrap().internal_confirmed);
         assert!(NetSettings { port: Some(0), ..Default::default() }.validate().is_err());
     }
 
@@ -313,6 +437,40 @@ mod tests {
     }
 
     #[test]
+    fn other_computers_are_refused_by_the_rules() {
+        let mut active = Active::local_only(7878);
+        active.network = Some("192.0.1.90:7878".parse().unwrap());
+        active.subnet = Some(("192.0.1.90".parse().unwrap(), 24));
+        assert_eq!(active.subnet_text().unwrap(), "192.0.1.0/24");
+        let near: IpAddr = "192.0.1.17".parse().unwrap();
+        let far: IpAddr = "192.0.2.17".parse().unwrap();
+        let open = Limits::default();
+
+        // Never without a password, whoever asks.
+        assert_eq!(active.refuse(open, near, 100, false), Some(REFUSED_NO_PASSWORD));
+        // Same network only, unless other networks are allowed.
+        assert_eq!(active.refuse(open, near, 100, true), None);
+        assert_eq!(active.refuse(open, far, 100, true), Some(REFUSED_OTHER_NETWORK));
+        let any = Limits { allow_other_networks: true, expires_at: None };
+        assert_eq!(active.refuse(any, far, 100, true), None);
+        // A time limit closes it for everyone once it has passed.
+        let timed = Limits { allow_other_networks: false, expires_at: Some(200) };
+        assert_eq!(active.refuse(timed, near, 199, true), None);
+        assert_eq!(active.refuse(timed, near, 200, true), Some(REFUSED_EXPIRED));
+
+        assert!(same_network("10.1.2.3".parse().unwrap(), "10.1.9.9".parse().unwrap(), 16));
+        assert!(!same_network("10.1.2.3".parse().unwrap(), "10.2.2.3".parse().unwrap(), 16));
+
+        // "Open for 30 minutes" becomes an end time; switching access off clears it.
+        let s = NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(30), ..Default::default() }.validate().unwrap();
+        let left = s.expires_at.unwrap() - chrono::Utc::now().timestamp();
+        assert!((1790..=1800).contains(&left), "{left}");
+        let off = NetSettings { expires_at: Some(5), ..Default::default() }.validate().unwrap();
+        assert_eq!(off.expires_at, None);
+        assert!(NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(0), ..Default::default() }.validate().is_err());
+    }
+
+    #[test]
     fn configured_host_names_are_answered() {
         let mut active = Active::local_only(7878);
         assert_eq!(active.local_url(), "http://127.0.0.1:7878/");
@@ -321,6 +479,10 @@ mod tests {
         active.effective.hosts = vec!["portal.example.lan".into()];
         assert!(active.host_allowed("Portal.Example.lan:7878"));
         assert!(!active.host_allowed("evil.example.com"));
+        // The network address itself is answered, private range or not.
+        assert!(!active.host_allowed("192.0.1.90:7878"));
+        active.network = Some("192.0.1.90:7878".parse().unwrap());
+        assert!(active.host_allowed("192.0.1.90:7878") && !active.host_allowed("192.0.1.91:7878"));
         active.network = Some("192.168.1.20:7878".parse().unwrap());
         active.effective.https = true;
         assert_eq!(active.network_url().unwrap(), "https://192.168.1.20:7878/");

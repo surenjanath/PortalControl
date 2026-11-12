@@ -22,7 +22,7 @@ CFG.network = (ctx) => {
     const status = h("div", { class: "box", style: "margin-bottom:18px" }, facts([
       ["Port", data.port],
       ["On this computer", h("span", { class: "rowf" }, link(data.local.url), yesNo(data.local.open))],
-      ...(data.network.length ? data.network.map((n) => [n.kind === "tailscale" ? "Tailscale" : "Local network", h("span", { class: "rowf" }, link(n.url), yesNo(n.open), h("span", { class: "dim" }, n.interface))])
+      ...(data.network.length ? data.network.map((n) => [n.kind === "tailscale" ? "Tailscale" : n.kind === "other" ? "Network" : "Local network", h("span", { class: "rowf" }, link(n.url), yesNo(n.open), h("span", { class: "dim" }, n.interface))])
         : [["Other computers", "This computer has no local-network or Tailscale address right now."]]),
     ]));
     const meaning = !data.local.open ? "Nothing answers on port " + data.port + ". Start the target, then press Check again."

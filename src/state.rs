@@ -113,6 +113,10 @@ pub struct AppState {
     pub net: OnceLock<crate::netcfg::Active>,
     /// `--bind` and `--port` as given on the command line.
     pub cli_net: OnceLock<(Option<std::net::IpAddr>, Option<u16>)>,
+    /// Limits on other computers that can change while running.
+    pub net_limits: Mutex<crate::netcfg::Limits>,
+    /// Computers that used the network address since the start.
+    pub clients: Mutex<HashMap<std::net::IpAddr, crate::netcfg::ClientSeen>>,
     /// Set when the manager should start again after it has stopped.
     pub restart: std::sync::atomic::AtomicBool,
 }
@@ -144,6 +148,8 @@ impl AppState {
             serve_args: OnceLock::new(),
             net: OnceLock::new(),
             cli_net: OnceLock::new(),
+            net_limits: Mutex::new(crate::netcfg::Limits::default()),
+            clients: Mutex::new(HashMap::new()),
             restart: std::sync::atomic::AtomicBool::new(false),
         })
     }

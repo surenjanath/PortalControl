@@ -5,20 +5,35 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in · PortalControl</title>
 <meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
 <link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
 <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
-<main style="min-height:100%;display:flex;align-items:center;justify-content:center;padding:20px">
-  <form id="login" class="box" style="width:min(380px,100%);padding:26px">
-    <div class="brand" style="padding:0;font-size:22px">Portal<span>Control</span></div>
-    <p class="sub" style="margin:4px 0 20px">Sign in to manage this machine's projects.</p>
-    <label class="f"><span>Password</span>
-      <input type="password" id="password" autocomplete="current-password" autofocus required></label>
-    <div class="formfoot"><button class="btn hl" type="submit" id="submit">Sign in</button><span class="errtxt" id="error" role="alert"></span></div>
-    <p class="hint" style="margin-top:18px">Forgot it? On this machine run <span class="mono">portalcontrol stop</span>, then
-      <span class="mono">portalcontrol reset-password</span>, and start PortalControl again.</p>
+<main class="signin">
+  <form id="login" class="box signin-card" novalidate>
+    <img src="/assets/icon.svg" width="60" height="60" alt="">
+    <h1 class="brand">Portal<span>Control</span></h1>
+    <p class="sub" id="where">Sign in to manage this machine's projects.</p>
+
+    <label class="f" for="password"><span>Password</span></label>
+    <div class="signin-field">
+      <input type="password" id="password" autocomplete="current-password" autofocus required aria-describedby="error caps">
+      <button type="button" class="btn ghost sm" id="reveal" aria-pressed="false">Show</button>
+    </div>
+    <div class="hint" id="caps" hidden>Caps Lock is on.</div>
+    <div class="errtxt signin-error" id="error" role="alert"></div>
+
+    <button class="btn hl signin-submit" type="submit" id="submit">Sign in</button>
+
+    <details class="hint">
+      <summary>Forgot the password?</summary>
+      It can only be reset on the computer PortalControl runs on. There, run
+      <span class="mono">portalcontrol stop</span>, then <span class="mono">portalcontrol reset-password</span>,
+      and start PortalControl again.
+    </details>
   </form>
+  <p class="signin-foot">Sign-in is locked for a while after several wrong passwords, and every attempt is recorded.</p>
 </main>
 <script src="/assets/js/login.js"></script>
 </body>

@@ -237,3 +237,20 @@
     .cols { grid-template-columns: 1fr; } .g2, .g-cards { grid-template-columns: 1fr; }
     .dep { grid-template-columns: 1fr; gap: 4px; } .dep .r { text-align: left; }
   }
+
+  /* ---- sign-in page ---- */
+  .signin { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px 16px; }
+  .signin-card { width: min(400px, 100%); padding: 30px 28px 24px; text-align: center; box-shadow: var(--shadow); }
+  .signin-card img { display: block; margin: 0 auto 12px; }
+  .signin-card .brand { padding: 0; font-size: 24px; margin: 0; }
+  .signin-card .sub { margin: 4px 0 22px; }
+  .signin-card label.f, .signin-card details { text-align: left; }
+  .signin-card label.f { margin-bottom: 6px; }
+  .signin-field { display: flex; gap: 8px; }
+  .signin-field input { flex: 1; min-width: 0; }
+  .signin-card #caps { text-align: left; color: var(--warn); margin-top: 6px; }
+  .signin-error { min-height: 20px; margin: 8px 0 4px; text-align: left; }
+  .signin-submit { width: 100%; justify-content: center; padding: 10px 14px; font-size: 14.5px; }
+  .signin-card details { margin-top: 18px; }
+  .signin-card summary { cursor: pointer; }
+  .signin-foot { max-width: 400px; text-align: center; font-size: 12px; color: var(--dim); margin: 0; }
