@@ -221,6 +221,7 @@ mod tests {
             db_file: db_file.map(str::to_string),
             backup_on_deploy: true,
             start_order: 0,
+            python_env: None,
         }
     }
 

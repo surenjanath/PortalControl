@@ -89,6 +89,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("portal_targets", "db_file", "TEXT"),
     ("portal_targets", "backup_on_deploy", "INTEGER NOT NULL DEFAULT 0"),
     ("portal_targets", "start_order", "INTEGER NOT NULL DEFAULT 0"),
+    ("portal_targets", "python_env", "TEXT"),
 ];
 
 /// Execution-history rows kept per target; older ones are pruned.
@@ -119,6 +120,9 @@ pub struct Target {
     pub backup_on_deploy: bool,
     /// Position in the project's start sequence (lower starts first).
     pub start_order: i64,
+    /// Python environment activated for runs: `None` for none, `auto`, or a
+    /// folder. See `pyenv.rs`.
+    pub python_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -154,6 +158,8 @@ pub struct TargetInput {
     pub backup_on_deploy: Option<bool>,
     #[serde(default)]
     pub start_order: Option<i64>,
+    #[serde(default)]
+    pub python_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,7 +213,7 @@ pub struct Db {
 
 const TARGET_COLS: &str = "id, name, working_directory, script_name, git_branch, \
      current_git_status, created_at, health_url, run_mode, autostart, timeout_secs, \
-     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order";
+     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order, python_env";
 
 const RUN_COLS: &str = "h.id, h.target_id, h.triggered_by, h.status, h.exit_code, h.duration_ms, \
      h.executed_at, h.commit_sha, h.commit_message, h.label";
@@ -240,6 +246,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         db_file: r.get::<_, Option<String>>(18)?.filter(|s| !s.is_empty()),
         backup_on_deploy: r.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
         start_order: r.get::<_, Option<i64>>(20)?.unwrap_or(0),
+        python_env: r.get::<_, Option<String>>(21)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -387,8 +394,8 @@ impl Db {
             c.execute(
                 "INSERT INTO portal_targets (name, working_directory, script_name, git_branch, \
                  health_url, run_mode, autostart, timeout_secs, description, project, env_vars, \
-                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy, start_order) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy, start_order, python_env) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     t.name,
                     t.working_directory,
@@ -407,6 +414,7 @@ impl Db {
                     t.db_file,
                     t.backup_on_deploy.unwrap_or(false) as i64,
                     t.start_order.unwrap_or(0),
+                    t.python_env,
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -420,7 +428,7 @@ impl Db {
                 "UPDATE portal_targets SET name=?1, working_directory=?2, script_name=?3, \
                  git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8, \
                  description=?9, project=?10, env_vars=?11, schedule=?12, auto_deploy=?13, \
-                 auto_restart=?14, db_file=?15, backup_on_deploy=?16, start_order=?17 WHERE id=?18",
+                 auto_restart=?14, db_file=?15, backup_on_deploy=?16, start_order=?17, python_env=?18 WHERE id=?19",
                 params![
                     t.name,
                     t.working_directory,
@@ -439,6 +447,7 @@ impl Db {
                     t.db_file,
                     t.backup_on_deploy.unwrap_or(false) as i64,
                     t.start_order.unwrap_or(0),
+                    t.python_env,
                     id
                 ],
             )?;

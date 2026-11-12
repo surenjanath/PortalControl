@@ -4,6 +4,7 @@
 //! directory. Output is streamed line by line to WebSocket clients; nothing
 //! is buffered beyond a small bounded tail kept for history.
 
+use crate::pyenv::PyEnv;
 use crate::db::Target;
 use crate::state::{AppState, LogTail, RunHandle, MAX_LINE_BYTES};
 use crate::util::log;
@@ -132,7 +133,7 @@ pub fn parse_env(text: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-fn build_command(dir: &Path, script: &str, env: &[(String, String)]) -> Command {
+fn build_command(dir: &Path, script: &str, env: &[(String, String)], python: Option<&PyEnv>) -> Command {
     let (shell_binary, shell_switch) = shell();
     let mut cmd = Command::new(shell_binary);
     #[cfg(windows)]
@@ -155,15 +156,30 @@ fn build_command(dir: &Path, script: &str, env: &[(String, String)]) -> Command 
         cmd.process_group(0);
     }
     hide_window(&mut cmd);
-    cmd.current_dir(dir)
-        .env("PYTHONUNBUFFERED", "1")
-        .env("PORTALCONTROL", "1")
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    cmd.current_dir(dir).env("PYTHONUNBUFFERED", "1").env("PORTALCONTROL", "1");
+    // Before the target's own variables, so those can still override PATH.
+    if let Some(python) = python {
+        python.apply(&mut cmd);
+    }
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd
+}
+
+/// The Python environment a run of `target` is started in, if any.
+fn python_env(dir: &Path, target: &Target) -> Result<Option<PyEnv>, String> {
+    crate::pyenv::resolve(dir, target.python_env.as_deref()).map_err(|e| format!("Python environment: {e}"))
+}
+
+/// Appended to the command line shown in the log.
+fn python_note(python: &Option<PyEnv>) -> String {
+    match python {
+        Some(p) => format!("  (Python environment: {})", p.root.display()),
+        None => String::new(),
+    }
 }
 
 /// Terminate a process and all of its descendants.
@@ -262,15 +278,16 @@ pub async fn start_run(
 ) -> Result<i64, String> {
     let dir = validate_target_paths(&target.working_directory, &target.script_name)?;
     let env = parse_env(&target.env_vars).map_err(|e| format!("environment variables: {e}"))?;
+    let python = python_env(&dir, target)?;
     let is_service = target.run_mode == "SERVICE";
     if target.backup_on_deploy && triggered_by != "AUTO_RESTART" {
         crate::backup::before_run(state, target).await;
     }
     let job = Job {
-        cmd: build_command(&dir, &target.script_name, &env),
+        cmd: build_command(&dir, &target.script_name, &env, python.as_ref()),
         slot: target.id,
         label: None,
-        describe: format!("{} {} \"{}\"", shell().0, shell().1, target.script_name),
+        describe: format!("{} {} \"{}\"{}", shell().0, shell().1, target.script_name, python_note(&python)),
         env_names: env.into_iter().map(|(k, _)| k).collect(),
         timeout: if is_service {
             None
@@ -298,6 +315,7 @@ pub async fn start_command(
         return Err(format!("working directory does not exist: {}", target.working_directory));
     }
     let env = parse_env(&target.env_vars).map_err(|e| format!("environment variables: {e}"))?;
+    let python = python_env(&dir, target)?;
     // A relative program path (the project's virtualenv) is resolved against the directory.
     let executable = if program.contains(['/', '\\']) {
         dir.join(program)
@@ -309,10 +327,11 @@ pub async fn start_command(
     #[cfg(not(windows))]
     cmd.process_group(0);
     hide_window(&mut cmd);
-    cmd.current_dir(&dir)
-        .env("PYTHONUNBUFFERED", "1")
-        .env("PORTALCONTROL", "1")
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    cmd.current_dir(&dir).env("PYTHONUNBUFFERED", "1").env("PORTALCONTROL", "1");
+    if let Some(python) = &python {
+        python.apply(&mut cmd);
+    }
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -321,7 +340,7 @@ pub async fn start_command(
         cmd,
         slot: command_slot(target.id),
         label: Some(label.to_string()),
-        describe: format!("{program} {}", args.join(" ")),
+        describe: format!("{program} {}{}", args.join(" "), python_note(&python)),
         env_names: env.into_iter().map(|(k, _)| k).collect(),
         timeout: Some(COMMAND_TIMEOUT),
         is_service: false,
@@ -870,6 +889,35 @@ mod tests {
         let feed = state.activity.lock().unwrap();
         assert!(feed.iter().any(|e| e["message"].as_str().unwrap().contains("started (scheduled)")));
         assert!(feed.iter().any(|e| e["level"] == "ok" && e["kind"] == "run"));
+    }
+
+    #[tokio::test]
+    async fn chosen_python_environment_is_switched_on_for_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // An environment that lives outside the project folder.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (folder, exe) = if cfg!(windows) { ("Scripts", "python.exe") } else { ("bin", "python") };
+        std::fs::create_dir_all(elsewhere.path().join(folder)).unwrap();
+        std::fs::write(elsewhere.path().join(folder).join(exe), "").unwrap();
+
+        let name = script(dir.path(), "venv", "echo venv=%VIRTUAL_ENV%", "echo venv=$VIRTUAL_ENV");
+        let (state, mut target) = setup(dir.path(), &name, "TASK", 30).await;
+
+        // Not set: nothing is switched on.
+        let rec = wait_done(&state, start_run(&state, &target, "MANUAL").await.unwrap()).await;
+        let logs = rec.captured_logs.unwrap();
+        assert!(!logs.contains("Python environment"), "{logs}");
+
+        target.python_env = Some(elsewhere.path().to_string_lossy().into_owned());
+        let rec = wait_done(&state, start_run(&state, &target, "MANUAL").await.unwrap()).await;
+        let logs = rec.captured_logs.unwrap();
+        assert!(logs.contains(&format!("venv={}", elsewhere.path().display())), "{logs}");
+        assert!(logs.contains("(Python environment: "), "{logs}");
+
+        // A folder that is gone stops the run with a clear reason.
+        target.python_env = Some(dir.path().join("gone").to_string_lossy().into_owned());
+        let err = start_run(&state, &target, "MANUAL").await.unwrap_err();
+        assert!(err.starts_with("Python environment: "), "{err}");
     }
 
     #[tokio::test]

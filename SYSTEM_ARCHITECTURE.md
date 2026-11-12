@@ -1,0 +1,452 @@
+# PortalControl: System Architecture
+
+This file is the source of truth for how PortalControl is built. It is updated with
+every feature, refactor and schema change; the rules for that are in
+[section 7](#7-the-update-protocol). `README.md` explains how to *use* the program; this
+file explains how it *works*.
+
+| | |
+| --- | --- |
+| Document version | 1.1.0 |
+| Application version | 0.6.0 (`Cargo.toml`) |
+| Last updated | 2026-11-12 |
+
+## 1. System Overview
+
+**Purpose.** PortalControl is a process supervisor and deployment dashboard for one
+machine. It registers project folders ("targets"), runs their start or deploy scripts
+through the machine's own shell, keeps long-running services alive, tracks each
+folder's Git state, probes application health, records resource use, takes SQLite
+backups and runs security scans. Everything is driven from a web dashboard served by
+the program itself.
+
+**Primary users.** A developer or administrator who runs several applications (Django,
+Node, workers such as qcluster or Celery) on a workstation or a small server and wants
+one place to start, stop, deploy and watch them, without Docker, a CI server or a
+process manager per project.
+
+**Form.** One executable (`portalcontrol`, about 4.4 MB on Windows). The dashboard,
+SQLite and libgit2 are compiled in. It needs no installer, no runtime and no other
+files; it creates its data folder on first start.
+
+**Core lifecycle.**
+
+1. A person registers a target in the dashboard: a folder, a script inside it, and
+   options (run mode, health URL, schedule, environment, Python environment).
+2. The target is stored in SQLite.
+3. A run is triggered: by hand, on a schedule, by a new commit (auto-deploy), by a
+   webhook, by a crash (auto-restart), or at manager start (autostart).
+4. The runner starts the script in the target folder through `cmd.exe /C` or
+   `/bin/sh -c`, with the target's environment applied.
+5. Output is read line by line, broadcast over a WebSocket to open dashboards, and a
+   bounded tail is kept.
+6. When the process ends, its status, exit code, duration, commit and log tail are
+   written to the history table.
+7. Background workers keep observing every target (Git every 30 s, health every 15 s,
+   metrics every 5 s) and push changes to the dashboard and the tray icon.
+
+**System boundary.**
+
+```
+                         one machine, one user account
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │                                                                          │
+ │  Browser ── HTTP + WebSocket ──┐          Tray icon (Windows, macOS)     │
+ │  (dashboard, loopback/LAN/     │                 │ open / stop / status  │
+ │   Tailscale only)              ▼                 ▼                       │
+ │                    ┌─────────────────────────────────────┐               │
+ │  portalcontrol     │  HTTP API + embedded dashboard      │  api.rs       │
+ │  stop / CLI ─────► │  (axum, guards: host, origin, auth) │  auth.rs      │
+ │                    ├─────────────────────────────────────┤  net.rs       │
+ │                    │  Shared state (AppState)            │  state.rs     │
+ │                    ├───────────┬───────────┬─────────────┤               │
+ │                    │ runner    │ workers   │ automation  │               │
+ │                    │ processes │ git       │ cron        │               │
+ │                    │ log pump  │ health    │ auto-deploy │               │
+ │                    │           │ metrics   │ auto-restart│               │
+ │                    ├───────────┴───────────┴─────────────┤               │
+ │                    │  SQLite (portalcontrol.db)  db.rs   │               │
+ │                    └──────┬──────────────┬───────────────┘               │
+ │                           │              │                               │
+ │              spawns       ▼              ▼   reads                       │
+ │   ┌───────────────────────────┐   ┌──────────────────────┐               │
+ │   │ target scripts and their  │   │ project folders:     │               │
+ │   │ process trees (your apps) │   │ files, .git, venvs   │               │
+ │   └───────────────────────────┘   └──────────────────────┘               │
+ └───────────────────────────────────────────┬──────────────────────────────┘
+                                             │ outbound only
+                     ┌───────────────────────┴───────────────────────┐
+                     │ Git remotes (fetch / fast-forward pull)       │
+                     │ Health URLs of the supervised applications    │
+                     │ Inbound: deploy webhooks, from allowed hosts  │
+                     └───────────────────────────────────────────────┘
+```
+
+## 2. Technology Stack
+
+| Layer | Technology | Notes |
+| --- | --- | --- |
+| Language | Rust, edition 2021 | One binary crate, `portalcontrol` |
+| Async runtime | tokio (multi-thread, 2 to 4 workers) | Processes, sockets, timers, signals |
+| HTTP and WebSocket | axum 0.8 | REST API under `/api`, live events on `/ws` |
+| Frontend | Plain HTML, CSS and JavaScript | No framework, no build step; files in `web/` are embedded with `include_str!` |
+| Database | SQLite through rusqlite (`bundled`) | One file, `portalcontrol.db`, in the data folder |
+| Git | libgit2 through git2 (`vendored-libgit2`) | No `git` program is run at runtime. HTTPS uses WinHTTP on Windows and vendored OpenSSL elsewhere |
+| Metrics | sysinfo | Host and per-process-tree CPU and memory |
+| Scheduling | Built-in cron parser, chrono for local time | `automation.rs` |
+| Password hashing | pbkdf2, sha2, getrandom | Salted PBKDF2-HMAC-SHA256 |
+| Tray icon | tray-icon and tao | Windows and macOS only; Linux builds have none |
+| Windows resources | winresource (build dependency) | Icon, version details and a manifest (DPI awareness, common controls 6) in the exe. The build fails without it, because the About window needs those controls |
+| Windows system calls | windows-sys | Attaching to the parent terminal and the native About window (`TaskDialogIndirect`) |
+| Login autostart | Registry Run key (winreg), launchd agent, systemd user unit | `autostart.rs` |
+| External tools, optional | `bandit`, `pip-audit` | Only for security scans; found on PATH |
+| Deployment | Copy the executable | Windows build links the C runtime statically (`.cargo/config.toml`). macOS: `scripts/make-macos-app.sh` builds `PortalControl.app` |
+| Supported systems | Windows x64, macOS, Linux | Built on the system it runs on |
+
+There are no third-party web APIs. The only outbound network traffic is Git fetches and
+health probes that the user configured.
+
+## 3. Core Services & Modules
+
+### 3.1 Repository layout
+
+| Path | Responsibility |
+| --- | --- |
+| `Cargo.toml`, `Cargo.lock` | Dependencies, version, size-optimised release profile |
+| `.cargo/config.toml` | Static C runtime on Windows |
+| `build.rs` | Embeds the Windows icon and manifest; records the build commit and time for the About page |
+| `src/` | The program (see 3.2) |
+| `web/` | The dashboard (see 3.3) |
+| `assets/` | `icon.ico`, `icon.icns`, `tray.rgba`, `tray-mac.rgba`; all drawn by `scripts/make-icon.py` |
+| `scripts/` | `install-autostart.ps1` / `.sh` (build, install, register autostart), `make-icon.py`, `make-macos-app.sh` |
+| `README.md` | User guide |
+| `prd.md` | Original product requirements |
+| `SYSTEM_ARCHITECTURE.md` | This file |
+
+### 3.2 Backend modules (`src/`)
+
+| Module | Responsibility |
+| --- | --- |
+| `main.rs` | Command line (`serve`, `stop`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, shutdown, tray status text, author and build details |
+| `api.rs` | Every HTTP route, request guards, input validation, the embedded assets, project detection and generated start scripts, quick commands, export and import |
+| `state.rs` | `AppState`: everything kept in memory and shared between modules |
+| `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool |
+| `runner.rs` | Starts scripts and one-off commands, pumps their output, enforces timeouts, kills process trees, queues crashed services for restart |
+| `pyenv.rs` | Works out and activates a target's Python environment (see 3.6) |
+| `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files |
+| `health.rs` | Worker that probes each health URL (15 s) with a small built-in HTTP/1.1 client: `LIVE`, `SLOW`, `DOWN` |
+| `metrics.rs` | Worker that samples the host and every process tree (5 s), keeps 15 minutes in memory and one row per target per minute in SQLite for 7 days |
+| `automation.rs` | Cron schedules, deploy (pull then run), auto-deploy on new commits, auto-restart with crash-loop detection, deploy webhooks |
+| `security.rs` | Runs `bandit` and `pip-audit`, reduces their JSON to counters, stores the report |
+| `backup.rs` | Consistent SQLite snapshots of a target's database (`VACUUM INTO`), restore, pruning |
+| `auth.rs` | Optional dashboard password, sessions, sign-in lockout, the control token |
+| `net.rs` | Which addresses may be bound and which `Host` values are answered |
+| `autostart.rs` | Register and remove start at login on the three systems |
+| `tray.rs` | Tray or menu-bar icon: status tooltip, menu, runs the user-interface loop on the main thread. Holds the native About window for Windows (`about_window`); macOS uses the system About panel |
+| `util.rs` | Time formatting and the manager's own log file |
+
+### 3.3 Frontend (`web/`)
+
+A single page. `index.html` is the shell; scripts are loaded in order and share plain
+global functions. Routing is by URL hash (`#/target/3/logs`).
+
+| File | Holds |
+| --- | --- |
+| `index.html`, `login.html`, `styles.css`, `icon.svg` | Page shell, sign-in page, all styling (dark and light tokens), the icon |
+| `js/core.js` | DOM helper `h`, icons, the API client, formatters, shared state, target status and actions |
+| `js/components.js` | Charts, log viewer, tables, tiles, form fields |
+| `js/router.js` | Hash routing, view lifecycle, sidebar |
+| `js/pages-home.js` | Dashboard and Projects |
+| `js/pages-project.js` | Project page with grouped terminals |
+| `js/pages-new.js` | New Target page with project detection |
+| `js/target.js` | Target page frame, tabs, saving |
+| `js/target-config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
+| `js/target-python.js` | Configuration section "Python Environment" (`CFG.python`) |
+| `js/target-tabs.js`, `js/target-metrics.js` | Deployments, Commands, Logs, Security and Metrics tabs |
+| `js/pages-global.js` | Deployments, Security, Activity and Settings pages |
+| `js/pages-about.js` | About page |
+| `js/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
+| `js/login.js` | Sign-in form |
+
+A new script must be added in two places: a `<script>` tag in `index.html` and the
+`ASSETS` list in `src/api.rs`. A test fails if they disagree.
+
+### 3.4 How the pieces talk to each other
+
+- **Browser to backend.** JSON over HTTP for every action and for the periodic refresh
+  (`/api/targets`, `/api/system`). One WebSocket (`/ws`) carries live events: log
+  lines, run started and finished, health and Git changes, activity entries.
+- **Modules to each other.** All of them hold an `Arc<AppState>`. They read and write
+  the shared maps in `AppState`, call `db`, and announce changes with `AppState::emit`,
+  which feeds the WebSocket broadcast channel.
+- **Workers.** `git`, `health`, `metrics` and `automation` each run one long-lived
+  tokio task started from `main.rs`.
+- **Manager to supervised processes.** Only through the operating system: spawn, read
+  stdout and stderr pipes, kill the process tree. stdin is closed.
+- **Command line to a running manager.** `portalcontrol stop` posts to
+  `/api/system/shutdown`, authenticated with the control token file in the data folder.
+- **Tray to manager.** With the tray on, the user-interface loop owns the main thread
+  and the manager runs on a second thread. They exchange three signals: ready, status
+  (checked every 3 s, sent when it changes) and done; "Stop" in the menu notifies the
+  manager.
+
+### 3.5 Windowed program on Windows
+
+The Windows executable is built for the windows subsystem (`windows_subsystem =
+"windows"` in `main.rs`), so no terminal opens when it is started from Explorer, a
+shortcut or the login Run key. At start it calls `AttachConsole` for the parent process,
+so commands run from a terminal still print there. Consequences that the code handles:
+
+- `open_browser` starts `cmd /C start` with `CREATE_NO_WINDOW`, like every other program
+  the manager spawns, so no terminal flashes.
+- When the port is already taken and there is no terminal to show the error in, the
+  dashboard of the running instance is opened instead.
+- `cmd` and PowerShell do not wait for a windowed program, so its output appears after
+  the prompt has returned.
+
+### 3.6 Python environment of a target
+
+`portal_targets.python_env` holds one of three things:
+
+| Value | Meaning |
+| --- | --- |
+| empty | Nothing is activated. The script runs with whatever is on PATH. This is what targets that existed before 0.5.0 have, and targets created through the API without the field |
+| `auto` | Use `.venv`, `venv` or `env` in the working directory if one has a Python for this system. Default for targets created on the New Target page |
+| a folder | That environment, wherever it is. A relative path is taken from the working directory. A conda environment folder works |
+
+Activation is done by `pyenv::PyEnv::apply` just before the process starts: the
+environment's program folder goes to the front of `PATH`, `VIRTUAL_ENV` is set and
+`PYTHONHOME` is removed. The target's own environment variables are applied afterwards
+and can override this. A named folder with no Python in it stops the run with an error
+instead of silently using another Python. Quick commands use the same environment; with
+the setting empty they still prefer an environment found in the folder, as before.
+
+## 4. Data Models & State Management
+
+### 4.1 Database
+
+One SQLite file, `portalcontrol.db`, in the data folder
+(`%LOCALAPPDATA%\PortalControl`, `~/Library/Application Support/PortalControl` or
+`~/.local/share/portalcontrol`; `--data-dir` overrides it).
+
+**`portal_targets`**: one row per target.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `name` | TEXT | Shown name, up to 100 characters |
+| `working_directory` | TEXT | The project folder |
+| `script_name` | TEXT | Script inside that folder |
+| `git_branch` | TEXT, default `main` | Branch followed on `origin` |
+| `current_git_status` | TEXT | `UP_TO_DATE`, `UPDATES_AVAILABLE` or `DIRTY` |
+| `created_at` | DATETIME | UTC |
+| `health_url` | TEXT, nullable | Probed every 15 s |
+| `run_mode` | TEXT | `TASK` (runs to completion) or `SERVICE` (long-running) |
+| `autostart` | INTEGER | Start when the manager starts |
+| `timeout_secs` | INTEGER, default 300 | Tasks only |
+| `description` | TEXT | |
+| `project` | TEXT, default `Default` | Groups targets |
+| `env_vars` | TEXT | `.env` format, one `KEY=VALUE` per line |
+| `schedule` | TEXT, nullable | Cron expression |
+| `auto_deploy` | INTEGER | Deploy when `origin` has new commits |
+| `auto_restart` | INTEGER | Restart a crashed service |
+| `webhook_token` | TEXT, nullable | Secret in the deploy webhook URL |
+| `db_file` | TEXT, nullable | SQLite file inside the folder to back up |
+| `backup_on_deploy` | INTEGER | Snapshot before each run |
+| `start_order` | INTEGER, default 0 | Position in the project's start sequence |
+| `python_env` | TEXT, nullable | See 3.6 (added in 0.5.0) |
+
+**`process_execution_history`**: one row per run or quick command; the newest 200 per
+target are kept.
+
+| Column | Meaning |
+| --- | --- |
+| `id`, `target_id` (FK, cascade) | |
+| `triggered_by` | `MANUAL`, `RESTART`, `SCHEDULE`, `GIT_AUTO`, `AUTO_RESTART`, `WEBHOOK`, `ROLLBACK`, `SYSTEM_AUTO` or `COMMAND` |
+| `status` | `RUNNING`, `SUCCESS` or `FAILED` |
+| `exit_code`, `duration_ms`, `executed_at` | |
+| `captured_logs` | Last 2,000 lines, at most 512 KB |
+| `commit_sha`, `commit_message` | Commit that was checked out |
+| `label` | Name of the quick command, if it was one |
+
+**`security_scan_reports`**: `id`, `target_id` (FK, cascade), `critical_issues_found`,
+`vulnerable_packages_found`, `raw_payload_json`, `scanned_at`.
+
+**`settings`**: `key`, `value`. Holds the dashboard password hash.
+
+**`metric_points`**: one row per target per minute, kept 7 days. Primary key
+(`target_id`, `t`); `t` is unix seconds at the start of the minute. Columns `cpu`,
+`mem`, `mem_max`, `procs`, `latency`, `probes`, `probes_up`.
+
+**Migrations.** The base tables are created with `CREATE TABLE IF NOT EXISTS`. Columns
+added later are listed in `MIGRATIONS` in `db.rs` and applied with
+`add_column_if_missing` at every start, so an older database is upgraded in place and
+nothing is lost. Every added column is nullable or has a default.
+
+**Other files in the data folder.** `portalcontrol.log` (the manager's own log),
+`control.token` (see 5), `backups/<target id>/` (database snapshots).
+
+### 4.2 In-memory state (`AppState`)
+
+Lost on restart and rebuilt by the workers:
+
+| Field | Holds |
+| --- | --- |
+| `running` | Live runs by slot: target id for the script, negative target id for a quick command. Each has pid, start time, trigger, a cancel handle and the log tail |
+| `health`, `health_history` | Latest probe per target and a ring of recent probes |
+| `git` | Latest repository inspection per target |
+| `metrics` | 15 minutes of 5-second samples for the host, the manager and each tree |
+| `activity` | The last 300 notable events |
+| `restart_queue`, `restart_log` | Crashed services waiting to restart, and recent restarts for crash-loop detection |
+| `auto_deploy_failed` | Commit an auto-deploy last failed on, so it is not retried forever |
+| `scans_running`, `starting_projects` | What is in progress |
+| `auth` | Password hash, sessions, failed sign-ins, control token |
+| `events` | Broadcast channel feeding every WebSocket client |
+| `shutdown` | Notified to stop the manager |
+
+### 4.3 Browser state
+
+The dashboard keeps `targets`, `sys` and `activity` in globals, refreshed by polling and
+by WebSocket events. Only preferences (theme, notification choice) are in
+`localStorage`. The session is an HttpOnly, SameSite=Strict cookie.
+
+### 4.4 Process lifecycle
+
+`start_run` validates the folder and script, resolves the Python environment, builds the
+command, takes the `running` lock (so a target cannot start twice), spawns, inserts a
+`RUNNING` history row, and starts pump tasks for stdout and stderr. A watcher waits for
+exit, timeout or cancel, kills the tree if needed, writes the final row and announces
+the result. On manager shutdown every tree is killed; nothing is left orphaned.
+
+## 5. Security & Authentication
+
+PortalControl runs shell scripts, so the design keeps it off the internet and limits
+what a request can make it run.
+
+- **Bind addresses.** Only loopback, private-LAN and Tailscale (`100.64.0.0/10`)
+  addresses are accepted. `0.0.0.0` and public addresses are refused (`net.rs`).
+- **Host and Origin checks.** Requests whose `Host` is not `localhost` or a private
+  address are rejected (DNS rebinding). Requests with a foreign `Origin` are rejected,
+  so another web page cannot drive the API.
+- **Password, optional.** Stored only as a salted PBKDF2-HMAC-SHA256 hash in
+  `settings`. Signing in gives a random 256-bit session token in an HttpOnly cookie;
+  sessions live in memory and end when the manager restarts, on sign-out and when the
+  password changes. Repeated wrong passwords lock sign-in for a short while. Without a
+  password, anyone who can reach the bound address can use it, which is why the default
+  is `127.0.0.1`.
+- **Control token.** A random token written to `control.token` in the data folder at
+  start. `portalcontrol stop` sends it. Being able to read the file proves access to
+  this user's files.
+- **Password recovery.** `portalcontrol reset-password` clears the hash directly in the
+  database; it needs file access and the manager stopped.
+- **What can be executed.** Only a script file that exists inside the registered
+  folder; names with path traversal or shell metacharacters are rejected. Quick
+  commands are a fixed list of program and arguments, run without a shell; nothing typed
+  in the dashboard is executed. Generated start scripts contain only the detected
+  command.
+- **Webhooks.** A deploy webhook needs no session; its unguessable per-target token in
+  the URL is its credential, and it can only trigger that target's deploy.
+- **Secrets.** Target environment variables are stored in plain text in the local
+  database and are masked in the dashboard until revealed. Exports include them. Git
+  credentials are never stored; libgit2 uses the user's credential helper.
+- **Browser hardening.** A Content-Security-Policy allows scripts only from the program
+  itself; there are no inline scripts.
+- **Limits.** Log lines are capped at 8 KB; tasks are killed at their timeout; stdin is
+  closed so a script cannot wait for input forever.
+
+## 6. Current State & Known Limitations
+
+**Working and covered by tests (76 at the time of writing).** Target registration and
+validation, running and stopping scripts, services with auto-restart, timeouts, quick
+commands, live logs, history, Git state, pull, rollback, deploy, auto-deploy, cron
+schedules, webhooks, health probes and history, metrics and 7-day history, security
+scan parsing, SQLite backups and restore, projects with start order, project detection
+with generated start scripts and worker launchers (qcluster, Celery, Node), password
+protection, export and import, login autostart, Python environment selection.
+
+**Working, checked by hand only.** The dashboard pages, the Windows tray icon and its
+status text, the About page, the native About window on Windows, starting with no
+terminal window. The tray menu entries were not clicked during development on Windows
+except through the `about` command, and printing into an interactive `cmd` or
+PowerShell window after `AttachConsole` was not observed directly (output through pipes
+and files was).
+
+**Written but not yet run on the real system.** The macOS menu-bar icon, its About
+panel and `scripts/make-macos-app.sh`. They use the same code as Windows but have not been built
+or started on a Mac.
+
+**Nothing is mocked or stubbed.** Fixed values worth knowing: probe every 15 s, Git
+inspection every 30 s, fetch every 5 min, metrics every 5 s, tray status every 3 s,
+quick-command timeout 900 s, default port 7878.
+
+**Limitations and technical debt.**
+
+- One machine only. There is no agent for remote hosts and no shared database.
+- One user. A password protects the dashboard, but there are no accounts or roles.
+- No TLS. Health checks of `https://` URLs only test that the port answers. The
+  dashboard itself is plain HTTP, which is acceptable on loopback and a tailnet only.
+- Environment variables are stored unencrypted.
+- Security scans cover Python only and do not use the target's Python environment
+  setting yet; `pip-audit` reads `requirements.txt`, else an environment inside the
+  folder.
+- The Python version on the Python Environment page comes from `pyvenv.cfg`, so conda
+  environments show none.
+- Generated start scripts bake in the Python found in the folder at the time they are
+  written; they rely on activation when the environment is elsewhere.
+- The Windows executable is not code-signed (SmartScreen may warn) and the macOS app is
+  only ad-hoc signed.
+- No Linux tray icon.
+- `api.rs` is about 2,600 lines and holds project detection and script generation as
+  well as the routes; these are candidates for their own modules.
+- The frontend uses global functions across script files; load order matters.
+- No automated browser tests.
+
+**Next steps under consideration.** Run the macOS build and fix what it shows; use the
+target's Python environment for security scans; split `api.rs`; encrypt stored
+environment variables.
+
+## 7. The Update Protocol
+
+These rules apply every time the system is changed. "Update the architecture file"
+means: do all of the following in the same piece of work as the code change, before it
+is committed.
+
+1. **Read first.** Read this file before changing the code, and check the plan against
+   it. If the code and this file disagree, the code is right: fix the file and say so.
+2. **New feature.** Add it where it belongs: a row in 3.2 or 3.3 for a new file, a
+   paragraph or subsection in section 3 for new behaviour, and section 1 if it changes
+   the lifecycle or the boundary diagram.
+3. **Schema change.** Update the table in 4.1 in the same change that adds the entry to
+   `MIGRATIONS`. State the default and what existing rows get. New columns must be
+   nullable or have a default so older databases upgrade in place.
+4. **New dependency or tool.** Add it to section 2 with what it is used for.
+5. **Security-relevant change.** Anything that touches binding, authentication, what
+   can be executed, or stored secrets is described in section 5.
+6. **State and limits.** Move items in section 6 between "working", "not yet run" and
+   "limitations" as they change. Remove a limitation only when it is really gone. Add
+   any new debt the change introduces.
+7. **Facts, not plans.** Describe what the code does now. Planned work goes only under
+   "Next steps". Never describe something as working unless it was run; say how it was
+   checked when that is not an automated test.
+8. **Versions.** Bump the application version in `Cargo.toml` using these rules: patch
+   for fixes, minor for new features or schema additions, major for a change that
+   breaks existing data or the API. Bump the document version the same way for the size
+   of the documentation change. Update the header table at the top.
+9. **Version History.** Add one row at the top of the table below for every change,
+   with the date, both versions and the notable changes. Never edit old rows except to
+   correct a mistake.
+10. **Keep the README in step.** User-facing behaviour is also described in
+    `README.md`; update both.
+11. **Remove what is gone.** When code is deleted, delete its description here too.
+
+### Version History
+
+| Document | Application | Date | Changes |
+| --- | --- | --- | --- |
+| 1.1.0 | 0.6.0 | 2026-11-12 | Windows build is a windowed program: no terminal window, attaches to the parent terminal for command output, opens the dashboard when started twice (3.5). Native About window from the tray menu and the new `about` command; macOS uses the system About panel. Author, homepage and tagline in `Cargo.toml`, `/api/system` (`author`, `homepage`, `tagline`) and the About page. New dependency windows-sys; the manifest now requests common controls 6 and is required at build time. |
+| 1.0.0 | 0.5.0 | 2026-11-12 | First version of this file. In this release: application icon embedded in the Windows executable and used as the browser-tab icon; tray icon on Windows and menu-bar icon on macOS with status tooltip and menu (`tray.rs`, `--no-tray`); macOS app bundle script; C runtime linked statically on Windows; per-target Python environment (`pyenv.rs`, new column `portal_targets.python_env`, `GET /api/fs/pyenv`); About page with version, commit and build time (`/api/system` gained `commit`, `built_at`, `sqlite`, `libgit2`, `started_at`). |
+
+Earlier history, before this file existed, is in the Git log: 0.4.0 added metric
+history, project detection with generated start scripts and the redesigned New Target
+page; before that came the split dashboard, login, start order, rollback, Node support,
+automation, multi-process projects, quick commands and backups.

@@ -44,6 +44,7 @@ const ICONS = {
   download: ["M12 4v12", "M7 11l5 5 5-5", "M4 20h16"],
   moon: ["M20 14A8 8 0 1 1 10 4a6 6 0 0 0 10 10z"],
   chevron: ["M9 6l6 6-6 6"],
+  info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 8h.01", "M11 12h1v5h1"],
   pull: ["M12 3v13", "M7 11l5 5 5-5", "M5 21h14"],
 };
 function icon(name) { return s("svg", { class: "ic", viewBox: "0 0 24 24", "aria-hidden": "true" }, (ICONS[name] || []).map((d) => s("path", { d }))); }

@@ -32,6 +32,7 @@ function resolve(r) {
   if (a === "security") return securityView();
   if (a === "activity") return activityView();
   if (a === "settings") return settingsView();
+  if (a === "about") return aboutView();
   if (a === "target" && b) return targetView(Number(b), c || "configuration", d);
   return simple("404", () => empty("Page not found", "This address does not match a page.", h("a", { class: "btn", href: "#/" }, "Back to dashboard")));
 }
@@ -50,7 +51,8 @@ function renderSide(r) {
       item("deployments", "Deployments", "list", a === "deployments", sys && sys.active_runs ? sys.active_runs + " active" : null),
       item("security", "Security", "shield", a === "security"),
       item("activity", "Activity", "activity", a === "activity", failing ? failing + " failing" : null),
-      item("settings", "Settings", "settings", a === "settings")),
+      item("settings", "Settings", "settings", a === "settings"),
+      item("about", "About", "info", a === "about")),
     h("button", { class: "btn ghost sm", type: "button", style: "margin:8px 4px 0;justify-content:flex-start;color:var(--dim)", onclick: openPalette, title: "Search and jump (Ctrl+K)" }, "Search…", h("span", { class: "right mono", style: "font-size:11px" }, "Ctrl K")),
     h("div", { class: "side-h" }, "Targets", h("a", { href: "#/new", title: "New target" }, icon("plus"))),
     h("div", { class: "side-list" }, byProject(targets).map(([project, list]) => [

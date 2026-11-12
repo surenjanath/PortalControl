@@ -1,13 +1,13 @@
 "use strict";
 // ------------------------------------------------------------------ target --
 const TABS = [["configuration", "Configuration"], ["deployments", "Deployments"], ["commands", "Commands"], ["logs", "Logs"], ["metrics", "Metrics"], ["security", "Security"]];
-const SUBS = [["general", "General"], ["processes", "Related Processes"], ["environment", "Environment Variables"], ["git", "Git Source"], ["health", "Health Check"], ["schedule", "Scheduled Task"],
+const SUBS = [["general", "General"], ["processes", "Related Processes"], ["environment", "Environment Variables"], ["python", "Python Environment"], ["git", "Git Source"], ["health", "Health Check"], ["schedule", "Scheduled Task"],
   ["webhooks", "Webhooks"], ["backups", "Database Backups"], ["advanced", "Advanced"], ["danger", "Danger Zone"]];
 
 async function saveTarget(t, patch, msg) {
   const body = Object.assign({ name: t.name, description: t.description, project: t.project, working_directory: t.working_directory, script_name: t.script_name,
     git_branch: t.git_branch, health_url: t.health_url || "", run_mode: t.run_mode, timeout_secs: t.timeout_secs, autostart: t.autostart, env_vars: t.env_vars,
-    schedule: t.schedule || "", auto_deploy: t.auto_deploy, auto_restart: t.auto_restart, db_file: t.db_file || "", backup_on_deploy: t.backup_on_deploy, start_order: t.start_order }, patch);
+    schedule: t.schedule || "", auto_deploy: t.auto_deploy, auto_restart: t.auto_restart, db_file: t.db_file || "", backup_on_deploy: t.backup_on_deploy, start_order: t.start_order, python_env: t.python_env || "" }, patch);
   await api("PUT", "/api/targets/" + t.id, body);
   toast(msg || "Configuration saved");
   await refresh(true);

@@ -6,7 +6,7 @@
 use crate::automation::{self, Cron};
 use crate::db::{Target, TargetInput};
 use crate::state::AppState;
-use crate::{auth, autostart, backup, git, health, net, runner, security};
+use crate::{auth, autostart, backup, git, health, net, pyenv, runner, security};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
@@ -33,6 +33,7 @@ const CSS: &str = "text/css; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
 const ASSETS: &[(&str, &str, &str)] = &[
     ("styles.css", CSS, include_str!("../web/styles.css")),
+    ("icon.svg", "image/svg+xml", include_str!("../web/icon.svg")),
     ("js/core.js", JS, include_str!("../web/js/core.js")),
     ("js/components.js", JS, include_str!("../web/js/components.js")),
     ("js/router.js", JS, include_str!("../web/js/router.js")),
@@ -42,8 +43,10 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("js/target-metrics.js", JS, include_str!("../web/js/target-metrics.js")),
     ("js/target.js", JS, include_str!("../web/js/target.js")),
     ("js/target-config.js", JS, include_str!("../web/js/target-config.js")),
+    ("js/target-python.js", JS, include_str!("../web/js/target-python.js")),
     ("js/target-tabs.js", JS, include_str!("../web/js/target-tabs.js")),
     ("js/pages-global.js", JS, include_str!("../web/js/pages-global.js")),
+    ("js/pages-about.js", JS, include_str!("../web/js/pages-about.js")),
     ("js/app.js", JS, include_str!("../web/js/app.js")),
     ("js/login.js", JS, include_str!("../web/js/login.js")),
 ];
@@ -127,6 +130,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/targets/{id}/processes", get(target_processes))
         .route("/api/fs/list", get(fs_list))
         .route("/api/fs/port", get(fs_port))
+        .route("/api/fs/pyenv", get(fs_pyenv))
         .route("/api/fs/starter", post(fs_starter))
         .route("/api/projects/{name}/start", post(project_start))
         .route("/api/projects/{name}/stop", post(project_stop))
@@ -426,6 +430,19 @@ fn clean_input(mut t: TargetInput) -> Result<TargetInput, String> {
         return Err("start order must be between 0 and 999".into());
     }
     t.start_order = Some(order);
+
+    t.python_env = match t.python_env.take().map(|s| s.trim().trim_matches('"').to_string()) {
+        Some(s) if s.eq_ignore_ascii_case(pyenv::AUTO) => Some(pyenv::AUTO.to_string()),
+        Some(s) if !s.is_empty() => {
+            if s.chars().count() > 500 {
+                return Err("Python environment: the path is limited to 500 characters".into());
+            }
+            pyenv::resolve(std::path::Path::new(&t.working_directory), Some(&s))
+                .map_err(|e| format!("Python environment: {e}"))?;
+            Some(s)
+        }
+        _ => None,
+    };
     Ok(t)
 }
 
@@ -537,6 +554,7 @@ async fn target_view(state: &Arc<AppState>, t: Target) -> Value {
     v["restart_pending"] = json!(restart_pending);
     v["next_run"] = json!(automation::next_run(t.schedule.as_deref()));
     v["env_count"] = json!(runner::parse_env(&t.env_vars).map(|e| e.len()).unwrap_or(0));
+    v["python"] = pyenv::describe(std::path::Path::new(&t.working_directory), t.python_env.as_deref());
     v
 }
 
@@ -1225,9 +1243,9 @@ const NPM_SCRIPTS: &[(&str, &str, &str, bool)] = &[
     ("migrate", "Run migrations", "Run the project's migrate script.", true),
 ];
 
-fn detect_commands(dir: &std::path::Path) -> Vec<ResolvedCommand> {
+fn detect_commands(dir: &std::path::Path, python_env: Option<&str>) -> Vec<ResolvedCommand> {
     let mut out = Vec::new();
-    let python = project_python(dir);
+    let python = pyenv::command_python(dir, python_env);
     let mut from_python = |list: &[QuickCommand]| {
         for c in list {
             out.push(ResolvedCommand {
@@ -1287,8 +1305,8 @@ fn detect_commands(dir: &std::path::Path) -> Vec<ResolvedCommand> {
 async fn list_commands(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     let dir = std::path::PathBuf::from(&t.working_directory);
-    let python = project_python(&dir);
-    let commands: Vec<Value> = detect_commands(&dir)
+    let python = pyenv::command_python(&dir, t.python_env.as_deref());
+    let commands: Vec<Value> = detect_commands(&dir, t.python_env.as_deref())
         .iter()
         .map(|c| {
             json!({
@@ -1310,7 +1328,7 @@ async fn run_command(
 ) -> AppResult {
     let t = load_target(&state, id).await?;
     let dir = std::path::PathBuf::from(&t.working_directory);
-    let Some(cmd) = detect_commands(&dir).into_iter().find(|c| c.id == command) else {
+    let Some(cmd) = detect_commands(&dir, t.python_env.as_deref()).into_iter().find(|c| c.id == command) else {
         return Err(fail(StatusCode::NOT_FOUND, "this command is not available for the target"));
     };
     if cmd.backup_first && t.backup_on_deploy {
@@ -1777,6 +1795,19 @@ fn port_in_use(port: u16) -> bool {
 /// Check a port before it goes into a start script: whether something is
 /// listening on it now, whether another target already claims it, and the
 /// next port that is clear of both.
+/// Which Python environment a setting leads to, before it is saved.
+async fn fs_pyenv(Query(q): Params) -> AppResult {
+    let dir = q.get("dir").map(|d| d.trim().trim_matches('"').to_string()).unwrap_or_default();
+    if dir.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "dir is required"));
+    }
+    let setting = q.get("env").cloned();
+    let shown = tokio::task::spawn_blocking(move || pyenv::describe(std::path::Path::new(&dir), setting.as_deref()))
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    Ok(ok(shown))
+}
+
 async fn fs_port(State(state): State<Arc<AppState>>, Query(q): Params) -> AppResult {
     let Some(port) = q.get("port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0) else {
         return Err(fail(StatusCode::BAD_REQUEST, "port must be a number between 1 and 65535"));
@@ -2111,6 +2142,14 @@ async fn system(State(state): State<Arc<AppState>>) -> AppResult {
     Ok(ok(json!({
         "name": "PortalControl-Core",
         "version": env!("CARGO_PKG_VERSION"),
+        "author": crate::AUTHOR,
+        "homepage": crate::HOMEPAGE,
+        "tagline": crate::TAGLINE,
+        "commit": option_env!("PORTALCONTROL_COMMIT"),
+        "built_at": option_env!("PORTALCONTROL_BUILT").and_then(|s| s.parse::<u64>().ok()),
+        "sqlite": rusqlite::version(),
+        "libgit2": git::library_version(),
+        "started_at": chrono::Utc::now().timestamp() - state.started.elapsed().as_secs() as i64,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "shell": format!("{shell_binary} {shell_switch}"),
@@ -2509,16 +2548,16 @@ mod tests {
     fn node_projects_get_commands_and_processes() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
-        assert!(detect_commands(p).is_empty());
+        assert!(detect_commands(p, None).is_empty());
         std::fs::write(
             p.join("package.json"),
             r#"{"name":"portal-ui","scripts":{"build":"vite build","dev":"vite","lint":"eslint .","evil; rm -rf /":"x"}}"#,
         )
         .unwrap();
-        let ids: Vec<String> = detect_commands(p).iter().map(|c| c.id.clone()).collect();
+        let ids: Vec<String> = detect_commands(p, None).iter().map(|c| c.id.clone()).collect();
         assert_eq!(ids, vec!["npm-install", "npm-run-build", "npm-run-lint"]);
         std::fs::write(p.join("package-lock.json"), "{}").unwrap();
-        let cmds = detect_commands(p);
+        let cmds = detect_commands(p, None);
         assert_eq!(cmds[1].id, "npm-ci");
         assert_eq!(cmds[2].shown(), "npm run build");
         assert!(cmds[2].changes && !cmds[3].changes);
@@ -2533,7 +2572,7 @@ mod tests {
 
         // A Django project with a front end gets both sets.
         std::fs::write(p.join("manage.py"), "").unwrap();
-        let ids: Vec<String> = detect_commands(p).iter().map(|c| c.id.clone()).collect();
+        let ids: Vec<String> = detect_commands(p, None).iter().map(|c| c.id.clone()).collect();
         assert!(ids.contains(&"migrate".to_string()) && ids.contains(&"npm-run-build".to_string()));
     }
 

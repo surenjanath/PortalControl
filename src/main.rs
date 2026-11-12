@@ -5,6 +5,11 @@
 //! host's native shell, streams the output over WebSockets and runs security
 //! scans. See `prd.md` and `README.md`.
 
+// A windowed program on Windows: no terminal opens when it is started from
+// Explorer, a shortcut or at login. Run from a terminal, it attaches to that
+// terminal instead (see `attach_parent_console`).
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod api;
 mod auth;
 mod automation;
@@ -15,19 +20,48 @@ mod git;
 mod health;
 mod metrics;
 mod net;
+mod pyenv;
 mod runner;
 mod security;
 mod state;
+#[cfg(any(windows, target_os = "macos"))]
+mod tray;
 mod util;
 
 use state::AppState;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 use util::log;
 
 const DEFAULT_PORT: u16 = 7878;
+
+/// Shown on the About page and in the tray's About window.
+pub const TAGLINE: &str = "Start, deploy and watch your projects from one place.";
+pub const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
+pub const HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
+
+/// Commit and time of this build, when the build recorded them.
+pub fn build_stamp() -> String {
+    let built = option_env!("PORTALCONTROL_BUILT")
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|t| t.with_timezone(&chrono::Local).format("built %Y-%m-%d %H:%M").to_string());
+    let commit = option_env!("PORTALCONTROL_COMMIT").map(|c| format!("commit {c}"));
+    [commit, built].into_iter().flatten().collect::<Vec<_>>().join(", ")
+}
+
+/// A windowed program has no terminal of its own. When it was started from
+/// one, connect to it so `portalcontrol stop`, `--help` and errors are shown.
+/// Output that was redirected to a file or a pipe is left alone.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: a plain system call with no pointers.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
 
 const HELP: &str = "\
 PortalControl-Core - native cross-platform automation supervisor
@@ -42,6 +76,7 @@ COMMANDS:
     uninstall-autostart   Remove the login autostart entry
     autostart-status      Show whether autostart is installed
     reset-password        Remove the dashboard password (stop the manager first)
+    about                 Show the version and who made it
 
 OPTIONS:
     --bind <IP>           Address to listen on (default 127.0.0.1).
@@ -51,6 +86,8 @@ OPTIONS:
     --data-dir <DIR>      Where the SQLite database and log file live
     --detach              Run in the background without a console window
     --open                Open the dashboard in the default browser
+    --no-tray             Do not show the tray icon (Windows notification
+                          area, macOS menu bar)
     -h, --help            Show this help
     -V, --version         Show the version
 
@@ -64,6 +101,7 @@ struct Opts {
     data_dir: Option<PathBuf>,
     detach: bool,
     open: bool,
+    no_tray: bool,
 }
 
 impl Opts {
@@ -86,6 +124,9 @@ impl Opts {
         if let Some(d) = &self.data_dir {
             out.extend(["--data-dir".to_string(), d.to_string_lossy().into_owned()]);
         }
+        if self.no_tray {
+            out.push("--no-tray".to_string());
+        }
         out
     }
 }
@@ -98,6 +139,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         data_dir: None,
         detach: false,
         open: false,
+        no_tray: false,
     };
     let mut command_seen = false;
     let mut it = args.iter();
@@ -126,8 +168,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--data-dir" => opts.data_dir = Some(PathBuf::from(value("--data-dir")?)),
             "--detach" => opts.detach = true,
             "--open" => opts.open = true,
+            "--no-tray" => opts.no_tray = true,
             "serve" | "stop" | "install-autostart" | "uninstall-autostart" | "autostart-status"
-            | "reset-password"
+            | "reset-password" | "about"
                 if !command_seen =>
             {
                 opts.command = arg.clone();
@@ -171,6 +214,8 @@ pub fn worker_threads() -> usize {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opts = match parse_args(&args) {
         Ok(o) => o,
@@ -198,6 +243,15 @@ fn main() -> ExitCode {
             None => println!("Autostart is not installed."),
         }),
         "stop" => stop_remote(&opts),
+        "about" => {
+            println!("PortalControl {}", env!("CARGO_PKG_VERSION"));
+            println!("{TAGLINE}");
+            println!("Created by {AUTHOR} ({HOMEPAGE})");
+            println!("{}", build_stamp());
+            #[cfg(windows)]
+            tray::about_and_wait(&format!("http://{}/", opts.addr()));
+            Ok(())
+        }
         "reset-password" => reset_password(&opts),
         _ => {
             if opts.detach {
@@ -318,10 +372,16 @@ fn stop_remote(opts: &Opts) -> Result<(), String> {
     }
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     let mut cmd = if cfg!(windows) {
         let mut c = std::process::Command::new("cmd.exe");
         c.args(["/C", "start", "", url]);
+        // Without this, cmd would open a terminal of its own for a moment.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         c
     } else if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
@@ -341,6 +401,94 @@ fn open_browser(url: &str) {
 
 fn serve(opts: Opts) -> Result<(), String> {
     check_bind(&opts)?;
+    // With a tray icon the user-interface loop owns the main thread and the
+    // manager runs beside it; `tray::run` exits the process when it is done.
+    #[cfg(any(windows, target_os = "macos"))]
+    if !opts.no_tray {
+        let config = tray::Config {
+            url: format!("http://{}/", opts.addr()),
+            serve_args: opts.passthrough_args(),
+            data_dir: opts.data_dir.clone().unwrap_or_else(default_data_dir),
+        };
+        tray::run(config, move |link| {
+            let link = Arc::new(link);
+            let (ready, status) = (link.clone(), link.clone());
+            run_manager(
+                opts,
+                Hooks {
+                    quit: link.quit.clone(),
+                    on_ready: Box::new(move || ready.ready()),
+                    on_status: Some(Box::new(move |tip, line| status.status(tip, line))),
+                },
+            )
+        });
+    }
+    run_manager(
+        opts,
+        Hooks { quit: Arc::new(tokio::sync::Notify::new()), on_ready: Box::new(|| {}), on_status: None },
+    )
+}
+
+/// How the tray icon, when there is one, is tied to the manager.
+struct Hooks {
+    /// Stops the manager from outside (the tray menu).
+    quit: Arc<tokio::sync::Notify>,
+    /// Called once the manager is listening.
+    on_ready: Box<dyn FnOnce() + Send>,
+    /// Receives the hover text and the menu's status line when they change.
+    on_status: Option<Box<dyn Fn(String, String) + Send + Sync>>,
+}
+
+/// Hover text and one-line summary for the tray icon.
+/// `services` is (running, total); `down` names targets whose health check fails.
+fn status_text(addr: SocketAddr, targets: usize, services: (usize, usize), tasks_running: usize, down: &[String]) -> (String, String) {
+    let mut parts = Vec::new();
+    if targets == 0 {
+        parts.push("No targets yet".to_string());
+    } else if services.1 > 0 {
+        parts.push(format!("{} of {} services running", services.0, services.1));
+    } else if tasks_running == 0 {
+        parts.push("Nothing running".to_string());
+    }
+    if tasks_running > 0 {
+        parts.push(format!("{tasks_running} task{} running", if tasks_running == 1 { "" } else { "s" }));
+    }
+    if !down.is_empty() {
+        parts.push(format!("{} down", down.len()));
+    }
+    let line = parts.join(", ");
+
+    let mut tip = format!("PortalControl {}\n{addr}\n{line}", env!("CARGO_PKG_VERSION"));
+    if !down.is_empty() {
+        tip.push_str(&format!("\nDown: {}", down.join(", ")));
+    }
+    // Windows shows at most 127 characters.
+    if tip.chars().count() > 120 {
+        tip = tip.chars().take(119).collect::<String>() + "\u{2026}";
+    }
+    (tip, line)
+}
+
+async fn tray_status(state: &AppState) -> (String, String) {
+    let targets = state.db.list_targets().await.unwrap_or_default();
+    let running: Vec<i64> = state.running.lock().await.keys().copied().collect();
+    let is_service = |id: &i64| targets.iter().any(|t| t.id == *id && t.run_mode == "SERVICE");
+    let total_services = targets.iter().filter(|t| t.run_mode == "SERVICE").count();
+    let running_services = running.iter().filter(|id| is_service(id)).count();
+    let down: Vec<String> = match state.health.lock() {
+        Ok(health) => targets
+            .iter()
+            .filter(|t| health.get(&t.id).is_some_and(|h| h.status == "DOWN"))
+            .map(|t| t.name.clone())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    status_text(state.bind, targets.len(), (running_services, total_services), running.len() - running_services, &down)
+}
+
+/// The manager itself.
+fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
+    let Hooks { quit, on_ready, on_status } = hooks;
     let addr = opts.addr();
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)
@@ -358,6 +506,13 @@ fn serve(opts: Opts) -> Result<(), String> {
     rt.block_on(async move {
         // Bind first: if another instance owns the port, fail before touching the DB.
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Started by a double click while it is already running: there is
+            // no terminal to show the error in, so show the dashboard instead.
+            if !std::io::IsTerminal::is_terminal(&std::io::stderr())
+                && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+            {
+                open_browser(&format!("http://{addr}/"));
+            }
             format!("cannot listen on {addr}: {e} (is PortalControl already running?)")
         })?;
 
@@ -398,12 +553,31 @@ fn serve(opts: Opts) -> Result<(), String> {
         if opts.open {
             open_browser(&format!("http://{addr}/"));
         }
+        on_ready();
+        if let Some(push) = on_status {
+            let st = state.clone();
+            tokio::spawn(async move {
+                let mut shown = String::new();
+                loop {
+                    let (tip, line) = tray_status(&st).await;
+                    if tip != shown {
+                        shown = tip.clone();
+                        push(tip, line);
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            });
+        }
 
         let app = api::router(state.clone());
         let outcome = tokio::select! {
             r = axum::serve(listener, app) => r.map_err(|e| format!("server error: {e}")),
             _ = tokio::signal::ctrl_c() => {
                 log("interrupt received, shutting down");
+                Ok(())
+            }
+            _ = quit.notified() => {
+                log("stop chosen in the tray menu, shutting down");
                 Ok(())
             }
             _ = state.shutdown.notified() => {
@@ -452,7 +626,30 @@ mod tests {
         assert!(check_bind(&o).is_ok());
 
         let o = parse_args(&args(&["serve", "--detach", "--open"])).unwrap();
-        assert!(o.detach && o.open);
+        assert!(o.detach && o.open && !o.no_tray);
+
+        let o = parse_args(&args(&["--no-tray"])).unwrap();
+        assert!(o.no_tray);
+        assert_eq!(o.passthrough_args(), args(&["--no-tray"]));
+    }
+
+    #[test]
+    fn tray_status_text_covers_the_common_cases() {
+        let addr: SocketAddr = "127.0.0.1:7878".parse().unwrap();
+        let (tip, line) = status_text(addr, 0, (0, 0), 0, &[]);
+        assert_eq!(line, "No targets yet");
+        assert_eq!(tip, format!("PortalControl {}\n127.0.0.1:7878\nNo targets yet", env!("CARGO_PKG_VERSION")));
+
+        let (tip, line) = status_text(addr, 5, (3, 4), 1, &["api".to_string()]);
+        assert_eq!(line, "3 of 4 services running, 1 task running, 1 down");
+        assert!(tip.ends_with("\nDown: api"));
+
+        assert_eq!(status_text(addr, 2, (0, 0), 0, &[]).1, "Nothing running");
+        assert_eq!(status_text(addr, 2, (0, 0), 2, &[]).1, "2 tasks running");
+
+        let many: Vec<String> = (0..40).map(|i| format!("service-number-{i}")).collect();
+        let (tip, _) = status_text(addr, 40, (40, 40), 0, &many);
+        assert_eq!(tip.chars().count(), 120);
     }
 
     #[test]

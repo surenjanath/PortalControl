@@ -202,7 +202,8 @@ function newView(cloneId) {
         const db = (info.sqlite_files || [])[0];
         const body = { name: f.name.value, working_directory: dir, script_name: script, git_branch: f.branch.value, run_mode: st ? st.run_mode : f.mode.value,
           health_url: f.health.value, description: f.desc.value, project: f.project.value, autostart: f.autostart.checked,
-          auto_restart: isService() && f.restart.checked, db_file: db && f.backup.checked ? db : "", backup_on_deploy: !!(db && f.backup.checked) };
+          auto_restart: isService() && f.restart.checked, db_file: db && f.backup.checked ? db : "", backup_on_deploy: !!(db && f.backup.checked),
+          python_env: src ? src.python_env || "" : "auto" };
         if (src) Object.assign(body, { env_vars: src.env_vars, schedule: src.schedule || "", timeout_secs: src.timeout_secs });
         const extra = workers.filter((x) => x.box.checked).map((x) => x.w);
         // Companions are grouped with the main process: give them a real project.

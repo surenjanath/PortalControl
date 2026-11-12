@@ -89,6 +89,26 @@ Auto-deploy is switched off by a rollback, otherwise the next fetch would undo i
 Only code is rolled back; migrations already applied to the database are not reversed
 (restore a database snapshot for that).
 
+## Python environment
+
+Each target can have a virtualenv (or conda environment) switched on for its runs. Set it
+under **Configuration → Python Environment**:
+
+| Choice | What happens |
+| --- | --- |
+| None | The script runs as it is, with whatever `python` is on `PATH` |
+| Automatic | `.venv`, `venv` or `env` in the working directory is used if it has a Python for this system |
+| A folder I choose | That environment, wherever it lives. A relative path is taken from the working directory |
+
+Switching on means what an `activate` script does: the environment's programs go to the
+front of `PATH` and `VIRTUAL_ENV` is set, so a plain `python` or `pip` in your script is
+the environment's. Quick commands use it too. The page shows which environment and Python
+version is in use, and checks a folder as you type it. If a chosen folder has no Python
+in it, the run stops with that reason instead of quietly using another Python.
+
+New targets start on **Automatic**. Targets that existed before version 0.5.0 stay on
+**None**, so they run exactly as before until you change it.
+
 ## Quick commands
 
 The **Commands** tab of a target offers one-click maintenance commands for the project
@@ -181,6 +201,66 @@ cargo build --release
 ./target/release/portalcontrol --open        # foreground, opens the dashboard
 ```
 
+## No terminal window on Windows
+
+`portalcontrol.exe` is a windowed program: double-clicking it, a shortcut, or the login
+autostart start it with no terminal window at all. It lives in the tray. Double-clicking
+it again while it is running opens the dashboard.
+
+Commands typed in a terminal (`portalcontrol stop`, `--help`, `about`) still print there.
+One side effect: `cmd` and PowerShell do not wait for a windowed program, so the prompt
+comes back first and the text appears after it. Use `start /wait portalcontrol stop` in a
+batch file that must wait.
+
+## About page
+
+**About** in the sidebar shows which PortalControl is running: version, the commit it was
+built from and when, the SQLite and libgit2 versions inside it, the machine, the address,
+uptime, and where the program and its data folder are. **Copy details** puts all of it on
+the clipboard.
+
+A new version replaces only the program file. Targets, history and settings live in the
+data folder and are kept; new database columns are added automatically at start.
+
+## Tray icon and app icon
+
+On **Windows** and **macOS** a running manager shows the PortalControl icon in the
+notification area (next to the clock) or in the menu bar:
+
+Hovering over the icon shows the version, the address and what is running, for example
+`3 of 4 services running, 1 down`, followed by the names of targets whose health check
+fails. The same summary is the first line of the menu. It refreshes every few seconds.
+
+The menu (right click on Windows, click on macOS):
+
+- **Open dashboard** opens it in the default browser. On Windows a left click on the
+  icon does the same.
+- **Settings…** opens the dashboard's Settings page.
+- **Start at login** is a tick box for the login autostart described below, with the
+  options this manager was started with.
+- **Open data folder** and **View log** open the database folder and `portalcontrol.log`.
+- **About PortalControl** opens a small window (not the browser) with the version, who
+  made it, the dashboard address and the build details. `portalcontrol about` shows the
+  same window.
+- **Quit → Stop PortalControl and its services** shuts the manager down, the same as
+  `portalcontrol stop`.
+
+Windows puts new icons in the hidden-icons flyout (the `^` arrow); drag it onto the
+taskbar to keep it visible. Start with `--no-tray` to run without the icon, for example
+over SSH on a Mac, where no menu bar is available. Linux builds have no tray icon, so
+servers need no desktop libraries.
+
+The Windows executable carries the icon itself. On macOS, build a double-clickable
+application that carries it and lives in the menu bar (no Dock icon, no terminal):
+
+```sh
+sh scripts/make-macos-app.sh            # writes target/release/PortalControl.app
+open target/release/PortalControl.app
+```
+
+The icon files in `assets/` are drawn by `python scripts/make-icon.py` (needs Pillow);
+`web/icon.svg` is the same design for the browser tab.
+
 ## Starting automatically at login
 
 | Platform | Mechanism | Installed by |
@@ -215,12 +295,14 @@ install-autostart     Start PortalControl automatically at login
 uninstall-autostart   Remove the login autostart entry
 autostart-status      Show whether autostart is installed
 reset-password        Remove the dashboard password (stop the manager first)
+about                 Show the version and who made it
 
 --bind <IP>           Address to listen on (default 127.0.0.1)
 --port <PORT>         Port to listen on (default 7878)
 --data-dir <DIR>      Where the SQLite database and log file live
 --detach              Run in the background without a console window
 --open                Open the dashboard in the default browser
+--no-tray             Do not show the tray icon (Windows, macOS)
 ```
 
 Data lives in `%LOCALAPPDATA%\PortalControl` (Windows),
@@ -333,6 +415,8 @@ binding it to a network such as your tailnet.
 | POST | `/api/projects/{name}/start`, `/stop` | Start a project in order / stop it in reverse |
 | GET | `/assets/{file}` | The dashboard's stylesheet and scripts |
 | GET | `/api/targets/{id}/commands` | Quick commands available for the target |
+| GET | `/api/fs/pyenv?dir=…&env=…` | Which Python environment a setting leads to |
+| GET | `/api/system` | Version, build, host and runtime details (the About page) |
 | POST | `/api/targets/{id}/commands/{command}`, `/commands/stop` | Run a quick command / stop the running one |
 | GET / POST | `/api/targets/{id}/backups` | List database snapshots / take one now |
 | POST / DELETE | `/api/targets/{id}/backups/{file}/restore`, `/backups/{file}` | Restore / delete a snapshot |
@@ -356,7 +440,11 @@ cargo run -- --port 7979 --data-dir ./dev-data
 
 The source is in `src/` (`runner.rs`, `git.rs`, `health.rs`, `security.rs`,
 `automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api.rs`, `db.rs`,
-`autostart.rs`, `net.rs`).
+`autostart.rs`, `net.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
+Windows executable and records the build commit and time.
+
+How the parts fit together, the database schema and the rules for keeping the
+documentation current are in [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
 
 The dashboard lives in `web/` and is compiled into the binary (`ASSETS` in
 `src/api.rs`), so the result is still one executable. It is plain HTML, CSS and
@@ -374,8 +462,10 @@ JavaScript with no build step and no dependencies:
 | `js/pages-project.js` | Project page (grouped terminals) and New target |
 | `js/target.js` | The target page frame: header, tabs, saving |
 | `js/target-config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, …) |
+| `js/target-python.js` | The Python Environment section of the Configuration tab |
 | `js/target-tabs.js` | Deployments, Commands, Logs, Metrics and Security tabs |
 | `js/pages-global.js` | Deployments, Security, Activity and Settings pages |
+| `js/pages-about.js` | About page |
 | `js/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
 
 The scripts are ordinary (non-module) scripts loaded in that order and share one global

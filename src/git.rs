@@ -125,6 +125,12 @@ fn commit_info(repo: &Repository, oid: Oid, state: &'static str) -> Option<Commi
     Some(info)
 }
 
+/// Version of the libgit2 compiled into this binary, for the About page.
+pub fn library_version() -> String {
+    let (major, minor, rev) = git2::Version::get().libgit2_version();
+    format!("{major}.{minor}.{rev}")
+}
+
 /// One-time libgit2 configuration.
 pub fn init() {
     // SAFETY: called once at startup before any repository is opened.
