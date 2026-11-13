@@ -71,6 +71,50 @@ CREATE TABLE IF NOT EXISTS metric_points (
 
 CREATE INDEX IF NOT EXISTS idx_history_target ON process_execution_history(target_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_scans_target ON security_scan_reports(target_id, id DESC);
+
+-- Problems the monitor found (monitor.rs), with the AI's analysis when it ran.
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    trigger TEXT NOT NULL,           -- what the rules saw: failure, crash_loop, health_down, error_burst, new_error
+    severity TEXT NOT NULL,          -- info, warning, critical
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    cause TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'none',   -- one of the actions that were offered, or none
+    action_label TEXT NOT NULL DEFAULT '',
+    action_reason TEXT NOT NULL DEFAULT '',
+    analysed_by TEXT NOT NULL DEFAULT '',  -- model name, or '' for rules only
+    excerpt TEXT NOT NULL DEFAULT '',      -- the log lines that were looked at
+    status TEXT NOT NULL DEFAULT 'open',   -- open, resolved, dismissed
+    note TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(target_id) REFERENCES portal_targets(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, id DESC);
+
+-- The trace of one incident, from log lines to fix: what the rules saw, what
+-- was asked of the AI model and what it answered, the email and the fix.
+CREATE TABLE IF NOT EXISTS ai_traces (
+    trace_id TEXT PRIMARY KEY,       -- TR-<local date>-<time>-<4 hex>
+    incident_id INTEGER,
+    target_id INTEGER,
+    run_id INTEGER,                  -- the run whose output triggered it
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    trigger TEXT NOT NULL,
+    what TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',  -- '' when no model was asked
+    prompt TEXT NOT NULL DEFAULT '',
+    answer TEXT NOT NULL DEFAULT '', -- the model's raw answer
+    status TEXT NOT NULL DEFAULT 'rules',  -- rules (no model), ok, failed
+    error TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER,
+    prompt_tokens INTEGER,
+    answer_tokens INTEGER,
+    email TEXT NOT NULL DEFAULT '',  -- what happened to the alert email
+    applied TEXT NOT NULL DEFAULT '' -- the fix someone applied
+);
+CREATE INDEX IF NOT EXISTS idx_traces_incident ON ai_traces(incident_id);
 "#;
 
 /// Columns added after the first release. Applied to both fresh and existing
@@ -91,12 +135,14 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("portal_targets", "start_order", "INTEGER NOT NULL DEFAULT 0"),
     ("portal_targets", "python_env", "TEXT"),
     ("portal_targets", "webhook_secret", "TEXT"),
+    ("incidents", "trace_id", "TEXT NOT NULL DEFAULT ''"),
+    ("incidents", "run_id", "INTEGER"),
 ];
 
 /// Execution-history rows kept per target; older ones are pruned.
 const RUNS_KEPT_PER_TARGET: i64 = 200;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Target {
     pub id: i64,
     pub name: String,
@@ -208,6 +254,79 @@ pub struct MetricPoint {
     pub latency: Option<f64>,
     pub probes: i64,
     pub probes_up: i64,
+}
+
+/// The trace of one incident (see `monitor.rs`).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Trace {
+    pub trace_id: String,
+    pub incident_id: Option<i64>,
+    pub target_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub created_at: String,
+    pub trigger: String,
+    pub what: String,
+    pub model: String,
+    pub prompt: String,
+    pub answer: String,
+    pub status: String,
+    pub error: String,
+    pub duration_ms: Option<i64>,
+    pub prompt_tokens: Option<i64>,
+    pub answer_tokens: Option<i64>,
+    pub email: String,
+    pub applied: String,
+}
+
+/// One incident (see `monitor.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Incident {
+    pub id: i64,
+    pub target_id: Option<i64>,
+    pub created_at: String,
+    pub trigger: String,
+    pub severity: String,
+    pub title: String,
+    pub summary: String,
+    pub cause: String,
+    pub action: String,
+    pub action_label: String,
+    pub action_reason: String,
+    pub analysed_by: String,
+    pub excerpt: String,
+    pub status: String,
+    pub note: String,
+    /// Links the incident to its `ai_traces` record.
+    pub trace_id: String,
+    /// The run whose output triggered it.
+    pub run_id: Option<i64>,
+}
+
+const INCIDENT_COLS: &str = "id, target_id, created_at, trigger, severity, title, summary, cause, action, \
+     action_label, action_reason, analysed_by, excerpt, status, note, trace_id, run_id";
+/// Incidents kept; older ones are pruned.
+const INCIDENTS_KEPT: i64 = 500;
+
+fn row_to_incident(r: &Row) -> rusqlite::Result<Incident> {
+    Ok(Incident {
+        id: r.get(0)?,
+        target_id: r.get(1)?,
+        created_at: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        trigger: r.get(3)?,
+        severity: r.get(4)?,
+        title: r.get(5)?,
+        summary: r.get(6)?,
+        cause: r.get(7)?,
+        action: r.get(8)?,
+        action_label: r.get(9)?,
+        action_reason: r.get(10)?,
+        analysed_by: r.get(11)?,
+        excerpt: r.get(12)?,
+        status: r.get(13)?,
+        note: r.get(14)?,
+        trace_id: r.get(15)?,
+        run_id: r.get(16)?,
+    })
 }
 
 #[derive(Clone)]
@@ -619,6 +738,149 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    pub async fn insert_incident(&self, i: Incident) -> Result<i64, String> {
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO incidents (target_id, trigger, severity, title, summary, cause, action, action_label, \
+                 action_reason, analysed_by, excerpt, trace_id, run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    i.target_id,
+                    i.trigger,
+                    i.severity,
+                    i.title,
+                    i.summary,
+                    i.cause,
+                    i.action,
+                    i.action_label,
+                    i.action_reason,
+                    i.analysed_by,
+                    i.excerpt,
+                    i.trace_id,
+                    i.run_id
+                ],
+            )?;
+            let id = c.last_insert_rowid();
+            c.execute(
+                "DELETE FROM incidents WHERE id NOT IN (SELECT id FROM incidents ORDER BY id DESC LIMIT ?1)",
+                [INCIDENTS_KEPT],
+            )?;
+            Ok(id)
+        })
+        .await
+    }
+
+    /// Newest first; `open_only` leaves out resolved and dismissed ones.
+    pub async fn list_incidents(&self, open_only: bool, limit: i64) -> Result<Vec<Incident>, String> {
+        self.call(move |c| {
+            let sql = format!(
+                "SELECT {INCIDENT_COLS} FROM incidents {} ORDER BY id DESC LIMIT ?1",
+                if open_only { "WHERE status='open'" } else { "" }
+            );
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map([limit], row_to_incident)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn get_incident(&self, id: i64) -> Result<Option<Incident>, String> {
+        self.call(move |c| {
+            c.query_row(&format!("SELECT {INCIDENT_COLS} FROM incidents WHERE id=?1"), [id], row_to_incident)
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn set_incident_status(
+        &self,
+        id: i64,
+        status: &'static str,
+        note: String,
+    ) -> Result<bool, String> {
+        self.call(move |c| {
+            Ok(c.execute("UPDATE incidents SET status=?1, note=?2 WHERE id=?3", params![status, note, id])?
+                > 0)
+        })
+        .await
+    }
+
+    pub async fn insert_trace(&self, t: Trace) -> Result<(), String> {
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO ai_traces (trace_id, incident_id, target_id, run_id, trigger, what, model, prompt, answer, \
+                 status, error, duration_ms, prompt_tokens, answer_tokens) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    t.trace_id, t.incident_id, t.target_id, t.run_id, t.trigger, t.what, t.model, t.prompt, t.answer,
+                    t.status, t.error, t.duration_ms, t.prompt_tokens, t.answer_tokens
+                ],
+            )?;
+            c.execute(
+                "DELETE FROM ai_traces WHERE trace_id NOT IN \
+                 (SELECT trace_id FROM ai_traces ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
+                [INCIDENTS_KEPT],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_trace(&self, trace_id: String) -> Result<Option<Trace>, String> {
+        self.call(move |c| {
+            c.query_row(
+                "SELECT trace_id, incident_id, target_id, run_id, created_at, trigger, what, model, prompt, answer, \
+                 status, error, duration_ms, prompt_tokens, answer_tokens, email, applied FROM ai_traces WHERE trace_id=?1",
+                [trace_id],
+                |r| {
+                    Ok(Trace {
+                        trace_id: r.get(0)?,
+                        incident_id: r.get(1)?,
+                        target_id: r.get(2)?,
+                        run_id: r.get(3)?,
+                        created_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        trigger: r.get(5)?,
+                        what: r.get(6)?,
+                        model: r.get(7)?,
+                        prompt: r.get(8)?,
+                        answer: r.get(9)?,
+                        status: r.get(10)?,
+                        error: r.get(11)?,
+                        duration_ms: r.get(12)?,
+                        prompt_tokens: r.get(13)?,
+                        answer_tokens: r.get(14)?,
+                        email: r.get(15)?,
+                        applied: r.get(16)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Record a later step of a trace: `email` or `applied`.
+    pub async fn trace_note(
+        &self,
+        trace_id: String,
+        column: &'static str,
+        text: String,
+    ) -> Result<(), String> {
+        debug_assert!(column == "email" || column == "applied");
+        self.call(move |c| {
+            c.execute(
+                &format!("UPDATE ai_traces SET {column}=?1 WHERE trace_id=?2"),
+                params![text, trace_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn open_incident_count(&self) -> Result<i64, String> {
+        self.call(|c| c.query_row("SELECT COUNT(*) FROM incidents WHERE status='open'", [], |r| r.get(0)))
+            .await
     }
 
     pub async fn set_webhook_secret(&self, id: i64, secret: Option<String>) -> Result<(), String> {

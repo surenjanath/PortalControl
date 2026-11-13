@@ -9,9 +9,9 @@ use git2::{
 };
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 pub const UP_TO_DATE: &str = "UP_TO_DATE";
@@ -70,6 +70,159 @@ pub struct PullOutcome {
     pub from: Option<String>,
     pub to: Option<String>,
     pub commits: usize,
+}
+
+/// Access tokens for private HTTPS remotes, by host (`github.com`). Loaded
+/// from the database at start and replaced when they change in Settings;
+/// kept here so every libgit2 network call (clone, fetch, pull) can use them.
+static TOKENS: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+pub fn set_tokens(tokens: HashMap<String, String>) {
+    if let Ok(mut t) = TOKENS.write() {
+        *t = Some(tokens);
+    }
+}
+
+/// The host of a remote URL, lower-case and without user or port:
+/// `https://user@GitHub.com:443/a/b.git` -> `github.com`.
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split('/').next()?;
+    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = host.split(':').next()?.trim().to_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn token_for(url: &str) -> Option<String> {
+    let host = url_host(url)?;
+    TOKENS.read().ok()?.as_ref()?.get(&host).cloned()
+}
+
+/// Credentials for a network operation: a saved token for the host first,
+/// then the user's Git credential helper, then the platform default.
+fn credential_callbacks<'a>(config: git2::Config) -> RemoteCallbacks<'a> {
+    let mut attempts = 0;
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |url, username, allowed| {
+        attempts += 1;
+        if attempts > 3 {
+            return Err(git2::Error::from_str(
+                "authentication failed: for a private repository, add an access token for this host",
+            ));
+        }
+        if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
+            if let Some(token) = token_for(url) {
+                // GitHub, GitLab, Gitea and Bitbucket accept a token as the
+                // password with any user name.
+                return Cred::userpass_plaintext(username.unwrap_or("portalcontrol"), &token);
+            }
+            if let Ok(cred) = Cred::credential_helper(&config, url, username) {
+                return Ok(cred);
+            }
+        }
+        if allowed.contains(CredentialType::DEFAULT) {
+            return Cred::default();
+        }
+        Err(git2::Error::from_str(
+            "the repository was not found, or it is private: check the URL, or save an access token for this host",
+        ))
+    });
+    callbacks
+}
+
+/// Is this a remote libgit2 can clone here? SSH is not compiled in.
+pub fn check_clone_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("enter the repository URL".into());
+    }
+    if url.starts_with("git@") || url.starts_with("ssh://") {
+        return Err("SSH addresses are not supported; use the HTTPS address \
+                    (for a private repository, add an access token)"
+            .into());
+    }
+    if url.contains(char::is_whitespace) {
+        return Err("the URL contains spaces".into());
+    }
+    if !(url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("file://")
+        || Path::new(url).is_absolute())
+    {
+        return Err("use an https:// address".into());
+    }
+    Ok(())
+}
+
+/// The folder name a repository would get: `https://x/acme/shop.git` -> `shop`.
+pub fn repo_folder_name(url: &str) -> String {
+    let last = url.trim().trim_end_matches('/').rsplit(['/', '\\', ':']).next().unwrap_or("");
+    let name: String = last
+        .trim_end_matches(".git")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    let name = name.trim_matches(['-', '.']).to_string();
+    if name.is_empty() {
+        "project".into()
+    } else {
+        name
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Cloned {
+    pub dir: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+}
+
+/// Clone `url` into `dest`, which must not exist yet or be an empty folder.
+/// `branch` checks out that branch instead of the remote's default.
+/// `progress(received_objects, total_objects)` is called as data arrives.
+pub fn clone_repo(
+    url: &str,
+    dest: &Path,
+    branch: Option<&str>,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Cloned, String> {
+    check_clone_url(url)?;
+    if dest.exists() && std::fs::read_dir(dest).map(|mut d| d.next().is_some()).unwrap_or(true) {
+        return Err(format!("{} already exists and is not empty", dest.display()));
+    }
+    let config = git2::Config::open_default().map_err(|e| e.message().to_string())?;
+    let mut callbacks = credential_callbacks(config);
+    let mut last = 0;
+    callbacks.transfer_progress(move |p| {
+        // Report every 2% or so, not every object.
+        let step = (p.total_objects() / 50).max(1);
+        if p.received_objects() >= last + step || p.received_objects() == p.total_objects() {
+            last = p.received_objects();
+            progress(p.received_objects(), p.total_objects());
+        }
+        true
+    });
+    let mut fetch = FetchOptions::new();
+    fetch.remote_callbacks(callbacks);
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch);
+    if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
+        builder.branch(b);
+    }
+    let created = !dest.exists();
+    let repo = builder.clone(url.trim(), dest).map_err(|e| {
+        if created {
+            // Leave nothing half-cloned behind.
+            let _ = std::fs::remove_dir_all(dest);
+        }
+        e.message().to_string()
+    })?;
+    let head = repo.head().ok();
+    Ok(Cloned {
+        dir: dest.to_path_buf(),
+        branch: head.as_ref().and_then(|h| h.shorthand().map(str::to_string)),
+        head: head.and_then(|h| h.target()).map(|o| o.to_string()),
+    })
 }
 
 /// Remove `user:password@` from an http(s) remote URL before showing it.
@@ -214,24 +367,7 @@ pub fn fetch(dir: &Path) -> Result<(), String> {
     let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
     let mut remote = repo.find_remote("origin").map_err(|_| "no 'origin' remote configured".to_string())?;
     let config = repo.config().map_err(|e| e.message().to_string())?;
-
-    let mut attempts = 0;
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |url, username, allowed| {
-        attempts += 1;
-        if attempts > 3 {
-            return Err(git2::Error::from_str("authentication failed"));
-        }
-        if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            if let Ok(cred) = Cred::credential_helper(&config, url, username) {
-                return Ok(cred);
-            }
-        }
-        if allowed.contains(CredentialType::DEFAULT) {
-            return Cred::default();
-        }
-        Err(git2::Error::from_str("no usable credentials for this remote"))
-    });
+    let callbacks = credential_callbacks(config);
     let mut options = FetchOptions::new();
     options.remote_callbacks(callbacks);
     remote.fetch(&[] as &[&str], Some(&mut options), None).map_err(|e| e.message().to_string())
@@ -579,6 +715,52 @@ pub fn spawn_worker(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_urls_and_folder_names() {
+        assert_eq!(url_host("https://user@GitHub.com:443/a/b.git").as_deref(), Some("github.com"));
+        assert_eq!(url_host("http://gitlab.local/x").as_deref(), Some("gitlab.local"));
+        assert_eq!(url_host("not a url"), None);
+        assert!(check_clone_url("git@github.com:a/b.git").unwrap_err().contains("SSH"));
+        assert!(check_clone_url("ftp://x/y").is_err());
+        assert!(check_clone_url("https://github.com/a/b").is_ok());
+        assert_eq!(repo_folder_name("https://github.com/acme/shop.git"), "shop");
+        assert_eq!(repo_folder_name("https://github.com/acme/my shop/"), "my-shop");
+        assert_eq!(repo_folder_name("https://x/"), "x");
+    }
+
+    #[test]
+    fn clones_into_a_new_folder_and_refuses_a_full_one() {
+        let (_upstream, bare) = bare_with_commit();
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("app");
+        // (A local clone copies objects directly, so it reports no transfer progress.)
+        let c = clone_repo(bare.to_str().unwrap(), &dest, None, |_, _| {}).unwrap();
+        assert!(dest.join(".git").is_dir() && c.head.is_some());
+        assert!(c.branch.is_some());
+        let err = clone_repo(bare.to_str().unwrap(), &dest, None, |_, _| {}).unwrap_err();
+        assert!(err.contains("not empty"));
+        // A failed clone leaves no folder behind.
+        let missing = parent.path().join("nothing");
+        assert!(clone_repo("/definitely/not/a/repo", &missing, None, |_, _| {}).is_err());
+        assert!(!missing.exists());
+    }
+
+    /// A bare repository with one commit, as a clone source.
+    fn bare_with_commit() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let repo = Repository::init(&work).unwrap();
+        std::fs::write(work.join("README.md"), "hello").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        let bare = dir.path().join("origin.git");
+        git2::build::RepoBuilder::new().bare(true).clone(work.to_str().unwrap(), &bare).unwrap();
+        (dir, bare)
+    }
     use git2::{IndexAddOption, Signature};
 
     fn commit_all(repo: &Repository, msg: &str) -> git2::Oid {

@@ -1,6 +1,6 @@
 [package]
 name = "portalcontrol"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Surenjanath Singh"]
 homepage = "https://github.com/surenjanath"
@@ -15,7 +15,9 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "time", "sync", "signal"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: JSON objects keep the order they are written in. The AI
+# monitor relies on it: a schema must list the analysis before the action.
+serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Local wall-clock time for cron schedules.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -28,6 +30,10 @@ sha2 = "0.10"
 hmac = "0.12"
 # Encryption at rest of stored secrets (already linked in for TLS).
 ring = "0.17"
+# Email alerts: TLS to the mail server (rustls is already linked in for HTTPS)
+# and Mozilla's root certificates to verify it.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 getrandom = "0.2"
 axum-server = { version = "0.9.2", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

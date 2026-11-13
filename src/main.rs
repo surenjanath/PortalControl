@@ -10,6 +10,7 @@
 // terminal instead (see `attach_parent_console`).
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod alerts;
 mod api;
 mod auth;
 mod automation;
@@ -18,9 +19,12 @@ mod backup;
 mod db;
 mod git;
 mod health;
+mod mail;
 mod metrics;
+mod monitor;
 mod net;
 mod netcfg;
+mod ollama;
 mod pdf;
 mod pyenv;
 mod report;
@@ -630,10 +634,12 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         }
 
         git::init();
+        api::load_git_tokens(&state).await;
         git::spawn_worker(state.clone());
         health::spawn_worker(state.clone());
         metrics::spawn_worker(state.clone());
         automation::spawn_worker(state.clone());
+        monitor::spawn_worker(state.clone());
 
         log(&format!(
             "PortalControl-Core {} listening on http://{addr}  (data: {})",

@@ -45,6 +45,7 @@ const ICONS = {
   moon: ["M20 14A8 8 0 1 1 10 4a6 6 0 0 0 10 10z"],
   chevron: ["M9 6l6 6-6 6"],
   info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 8h.01", "M11 12h1v5h1"],
+  bell: ["M6 9a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 15 6 9z", "M10.3 20a1.9 1.9 0 0 0 3.4 0"],
   pull: ["M12 3v13", "M7 11l5 5 5-5", "M5 21h14"],
 };
 function icon(name) { return s("svg", { class: "ic", viewBox: "0 0 24 24", "aria-hidden": "true" }, (ICONS[name] || []).map((d) => s("path", { d }))); }
@@ -148,7 +149,7 @@ let targets = [], sys = null, activity = [], loaded = false, wsUp = false;
 let authInfo = null;               // { password_set, authenticated, min_password_chars }
 let refreshTimer = null;
 const sinks = new Set();           // views listening to websocket messages
-const ui = { projFilter: "", depStatus: "all", depTarget: "all", actLevel: "all" };
+const ui = { projFilter: "", depStatus: "all", depTarget: "all", actLevel: "all", incOpen: true };
 const T = (id) => targets.find((t) => t.id === Number(id));
 const go = (path) => { location.hash = "#/" + path; };
 
