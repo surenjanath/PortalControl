@@ -74,11 +74,7 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
 
 /// Minimal HTTP/1.1 request. Returns the status code of the response.
 /// For `https://` URLs only TCP reachability is verified (returns `None`).
-pub async fn http_request(
-    method: &str,
-    url: &str,
-    timeout: Duration,
-) -> Result<Option<u16>, String> {
+pub async fn http_request(method: &str, url: &str, timeout: Duration) -> Result<Option<u16>, String> {
     http_request_with(method, url, timeout, "").await
 }
 
@@ -108,18 +104,12 @@ pub async fn http_request_with(
             u.path,
             env!("CARGO_PKG_VERSION")
         );
-        stream
-            .write_all(req.as_bytes())
-            .await
-            .map_err(|e| format!("write failed: {e}"))?;
+        stream.write_all(req.as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
 
         let mut buf = [0u8; 64];
         let mut filled = 0;
         while filled < buf.len() && !buf[..filled].contains(&b'\n') {
-            let n = stream
-                .read(&mut buf[filled..])
-                .await
-                .map_err(|e| format!("read failed: {e}"))?;
+            let n = stream.read(&mut buf[filled..]).await.map_err(|e| format!("read failed: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -188,11 +178,7 @@ pub async fn probe_target(state: &Arc<AppState>, target_id: i64, url: &str) -> H
     };
     if let Ok(mut history) = state.health_history.lock() {
         let ring = history.entry(target_id).or_default();
-        ring.push_back(HealthSample {
-            t: now_secs(),
-            status: info.status,
-            latency_ms: info.latency_ms,
-        });
+        ring.push_back(HealthSample { t: now_secs(), status: info.status, latency_ms: info.latency_ms });
         while ring.len() > HEALTH_HISTORY {
             ring.pop_front();
         }

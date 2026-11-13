@@ -148,11 +148,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut command_seen = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        let mut value = |name: &str| {
-            it.next()
-                .cloned()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
+        let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} requires a value"));
         match arg.as_str() {
             "-h" | "--help" => opts.command = "help".into(),
             "-V" | "--version" => opts.command = "version".into(),
@@ -163,18 +159,20 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--port" => {
                 let v = value("--port")?;
                 opts.port = Some(
-                    v.parse::<u16>()
-                        .ok()
-                        .filter(|p| *p != 0)
-                        .ok_or_else(|| format!("invalid port: {v}"))?,
+                    v.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| format!("invalid port: {v}"))?,
                 );
             }
             "--data-dir" => opts.data_dir = Some(PathBuf::from(value("--data-dir")?)),
             "--detach" => opts.detach = true,
             "--open" => opts.open = true,
             "--no-tray" => opts.no_tray = true,
-            "serve" | "stop" | "install-autostart" | "uninstall-autostart" | "autostart-status"
-            | "reset-password" | "about"
+            "serve"
+            | "stop"
+            | "install-autostart"
+            | "uninstall-autostart"
+            | "autostart-status"
+            | "reset-password"
+            | "about"
                 if !command_seen =>
             {
                 opts.command = arg.clone();
@@ -211,10 +209,7 @@ pub fn default_data_dir() -> PathBuf {
 
 /// A small fixed pool keeps the manager's idle footprint low.
 pub fn worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .clamp(2, 4)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4)
 }
 
 /// Upper limit of the blocking thread pool (tokio's own default).
@@ -366,10 +361,7 @@ fn reset_password(opts: &Opts) -> Result<(), String> {
             "PortalControl is running at {addr}. Stop it first (portalcontrol stop), then run reset-password again."
         ));
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     let db = db::Db::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
     let had = rt.block_on(db.get_setting(auth::PASSWORD_KEY))?.is_some();
     rt.block_on(db.set_setting(auth::PASSWORD_KEY, None))?;
@@ -387,19 +379,13 @@ fn reset_password(opts: &Opts) -> Result<(), String> {
 fn stop_remote(opts: &Opts) -> Result<(), String> {
     let addr = control_addr(opts);
     let url = format!("http://{addr}/api/system/shutdown");
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     // Authenticates the request when a dashboard password is set.
     let data_dir = opts.data_dir.clone().unwrap_or_else(default_data_dir);
     let token = std::fs::read_to_string(data_dir.join(CONTROL_TOKEN_FILE)).unwrap_or_default();
     let token: String = token.trim().chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    let headers = if token.is_empty() {
-        String::new()
-    } else {
-        format!("X-PortalControl-Token: {token}\r\n")
-    };
+    let headers =
+        if token.is_empty() { String::new() } else { format!("X-PortalControl-Token: {token}\r\n") };
     match rt.block_on(health::http_request_with("POST", &url, Duration::from_secs(5), &headers)) {
         Ok(Some(200)) => {
             println!("PortalControl at {addr} is shutting down.");
@@ -480,7 +466,13 @@ struct Hooks {
 
 /// Hover text and one-line summary for the tray icon.
 /// `services` is (running, total); `down` names targets whose health check fails.
-fn status_text(addr: SocketAddr, targets: usize, services: (usize, usize), tasks_running: usize, down: &[String]) -> (String, String) {
+fn status_text(
+    addr: SocketAddr,
+    targets: usize,
+    services: (usize, usize),
+    tasks_running: usize,
+    down: &[String],
+) -> (String, String) {
     let mut parts = Vec::new();
     if targets == 0 {
         parts.push("No targets yet".to_string());
@@ -522,7 +514,13 @@ async fn tray_status(state: &AppState) -> (String, String) {
             .collect(),
         Err(_) => Vec::new(),
     };
-    status_text(state.bind, targets.len(), (running_services, total_services), running.len() - running_services, &down)
+    status_text(
+        state.bind,
+        targets.len(),
+        (running_services, total_services),
+        running.len() - running_services,
+        &down,
+    )
 }
 
 /// The manager itself.
@@ -550,8 +548,8 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
     let restart = rt.block_on(async move {
         // The port and the network address may be stored in the database.
         let db_path = data_dir.join("portalcontrol.db");
-        let db = db::Db::open(&db_path)
-            .map_err(|e| format!("cannot open database {}: {e}", db_path.display()))?;
+        let db =
+            db::Db::open(&db_path).map_err(|e| format!("cannot open database {}: {e}", db_path.display()))?;
         let saved = netcfg::NetSettings::load(&db).await;
         let plan = netcfg::effective(&saved, opts.bind, opts.port, DEFAULT_PORT);
 
@@ -580,14 +578,17 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
 
         // The door for other computers, if one is configured. When it cannot
         // be opened the manager still runs, reachable locally, and says why.
-        let mut active = netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None, subnet: None };
+        let mut active =
+            netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None, subnet: None };
         let mut network_listener = None;
         let mut tls = None;
         if let Some(ip) = plan.network {
             let net_addr = SocketAddr::new(ip, plan.port);
             let opened = (|| {
-                let tls = if plan.https { Some(netcfg::load_tls(&plan.cert_file, &plan.key_file)?) } else { None };
-                let listener = std::net::TcpListener::bind(net_addr).map_err(|e| format!("cannot listen on {net_addr}: {e}"))?;
+                let tls =
+                    if plan.https { Some(netcfg::load_tls(&plan.cert_file, &plan.key_file)?) } else { None };
+                let listener = std::net::TcpListener::bind(net_addr)
+                    .map_err(|e| format!("cannot listen on {net_addr}: {e}"))?;
                 listener.set_nonblocking(true).map_err(|e| e.to_string())?;
                 Ok::<_, String>((listener, tls))
             })();
@@ -595,7 +596,10 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
                 Ok((listener, config)) => {
                     active.network = Some(net_addr);
                     if let IpAddr::V4(v4) = ip {
-                        let prefix = netcfg::local_addresses().iter().find(|a| a.ip == v4.to_string()).map(|a| a.prefix);
+                        let prefix = netcfg::local_addresses()
+                            .iter()
+                            .find(|a| a.ip == v4.to_string())
+                            .map(|a| a.prefix);
                         active.subnet = Some((v4, prefix.unwrap_or(24)));
                     }
                     network_listener = Some(listener);
@@ -667,7 +671,8 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
 
         let app = api::router(state.clone());
         // Everything from other computers passes the network guard first.
-        let network_app = app.clone().layer(axum::middleware::from_fn_with_state(state.clone(), api::network_guard));
+        let network_app =
+            app.clone().layer(axum::middleware::from_fn_with_state(state.clone(), api::network_guard));
         let network_server = async move {
             let Some(listener) = network_listener else {
                 return std::future::pending::<Result<(), String>>().await;
@@ -675,16 +680,24 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
             match tls {
                 Some(config) => {
                     // Marked so sign-in cookies are sent back over HTTPS only.
-                    let service = network_app.layer(axum::Extension(api::ViaTls)).into_make_service_with_connect_info::<SocketAddr>();
-                    axum_server::from_tcp_rustls(listener, axum_server::tls_rustls::RustlsConfig::from_config(config))
-                        .map_err(|e| format!("network server error: {e}"))?
-                        .serve(service)
-                        .await
-                        .map_err(|e| format!("network server error: {e}"))
+                    let service = network_app
+                        .layer(axum::Extension(api::ViaTls))
+                        .into_make_service_with_connect_info::<SocketAddr>();
+                    axum_server::from_tcp_rustls(
+                        listener,
+                        axum_server::tls_rustls::RustlsConfig::from_config(config),
+                    )
+                    .map_err(|e| format!("network server error: {e}"))?
+                    .serve(service)
+                    .await
+                    .map_err(|e| format!("network server error: {e}"))
                 }
                 None => {
-                    let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| format!("network server error: {e}"))?;
-                    axum::serve(listener, network_app.into_make_service_with_connect_info::<SocketAddr>()).await.map_err(|e| format!("network server error: {e}"))
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .map_err(|e| format!("network server error: {e}"))?;
+                    axum::serve(listener, network_app.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                        .map_err(|e| format!("network server error: {e}"))
                 }
             }
         };
@@ -742,7 +755,13 @@ mod tests {
     #[test]
     fn parses_commands_and_options() {
         let o = parse_args(&args(&[
-            "install-autostart", "--port", "9000", "--bind", "100.101.102.103", "--data-dir", "/x y",
+            "install-autostart",
+            "--port",
+            "9000",
+            "--bind",
+            "100.101.102.103",
+            "--data-dir",
+            "/x y",
         ]))
         .unwrap();
         assert_eq!(o.command, "install-autostart");
@@ -765,7 +784,10 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:7878".parse().unwrap();
         let (tip, line) = status_text(addr, 0, (0, 0), 0, &[]);
         assert_eq!(line, "No targets yet");
-        assert_eq!(tip, format!("PortalControl {}\n127.0.0.1:7878\nNo targets yet", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            tip,
+            format!("PortalControl {}\n127.0.0.1:7878\nNo targets yet", env!("CARGO_PKG_VERSION"))
+        );
 
         let (tip, line) = status_text(addr, 5, (3, 4), 1, &["api".to_string()]);
         assert_eq!(line, "3 of 4 services running, 1 task running, 1 down");

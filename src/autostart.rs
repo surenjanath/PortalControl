@@ -73,10 +73,7 @@ fn xml_escape(s: &str) -> String {
 #[cfg(any(unix, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn launchd_plist(exe: &str, serve_args: &[String], log_path: &str) -> String {
-    let mut args = format!(
-        "        <string>{}</string>\n        <string>serve</string>\n",
-        xml_escape(exe)
-    );
+    let mut args = format!("        <string>{}</string>\n        <string>serve</string>\n", xml_escape(exe));
     for a in serve_args {
         args.push_str(&format!("        <string>{}</string>\n", xml_escape(a)));
     }
@@ -179,8 +176,7 @@ mod launchd {
     use std::process::Command;
 
     pub fn plist_path(home: &Path) -> PathBuf {
-        home.join("Library/LaunchAgents")
-            .join(format!("{LAUNCHD_LABEL}.plist"))
+        home.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist"))
     }
 
     pub fn install_at(
@@ -240,9 +236,7 @@ mod platform {
     use super::*;
 
     fn home() -> Result<PathBuf, String> {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "HOME is not set".to_string())
+        std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| "HOME is not set".to_string())
     }
 
     pub fn install(serve_args: &[String]) -> Result<String, String> {
@@ -347,7 +341,9 @@ mod tests {
         );
         assert!(p.contains("<string>com.portalcontrol.core</string>"));
         assert!(p.contains("<string>/Users/ict/bin/portal &amp; control</string>"));
-        assert!(p.contains("<string>serve</string>\n        <string>--port</string>\n        <string>9000</string>"));
+        assert!(p.contains(
+            "<string>serve</string>\n        <string>--port</string>\n        <string>9000</string>"
+        ));
         assert!(p.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert_eq!(p.matches("<dict>").count(), p.matches("</dict>").count());
     }
@@ -364,11 +360,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let calls = tmp.path().join("launchctl.calls");
         let fake = tmp.path().join("launchctl");
-        std::fs::write(
-            &fake,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", calls.display()),
-        )
-        .unwrap();
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", calls.display())).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let fake = fake.to_string_lossy().into_owned();
         let exe = PathBuf::from("/Users/ict/.local/bin/portalcontrol");

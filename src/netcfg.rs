@@ -76,10 +76,8 @@ impl NetSettings {
     pub fn validate(mut self) -> Result<Self, String> {
         self.address = self.address.trim().to_string();
         if !self.address.is_empty() {
-            let ip: IpAddr = self
-                .address
-                .parse()
-                .map_err(|_| format!("\"{}\" is not an IP address", self.address))?;
+            let ip: IpAddr =
+                self.address.parse().map_err(|_| format!("\"{}\" is not an IP address", self.address))?;
             if ip.is_loopback() || ip.is_unspecified() {
                 return Err("choose an address of this computer on your network; 127.0.0.1 is always on, and 0.0.0.0 (every network) is not allowed".into());
             }
@@ -124,9 +122,16 @@ impl NetSettings {
                 continue;
             }
             let label_ok = |l: &str| {
-                !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                !l.is_empty()
+                    && l.len() <= 63
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             };
-            if host.len() > 253 || !host.split('.').all(label_ok) || !host.bytes().any(|b| b.is_ascii_alphabetic()) {
+            if host.len() > 253
+                || !host.split('.').all(label_ok)
+                || !host.bytes().any(|b| b.is_ascii_alphabetic())
+            {
                 return Err(format!("\"{raw}\" is not a host name (use letters, digits, dots and dashes, without http:// or a port)"));
             }
             hosts.push(host);
@@ -163,7 +168,12 @@ pub struct Effective {
     pub port_from_cli: bool,
 }
 
-pub fn effective(saved: &NetSettings, cli_bind: Option<IpAddr>, cli_port: Option<u16>, default_port: u16) -> Effective {
+pub fn effective(
+    saved: &NetSettings,
+    cli_bind: Option<IpAddr>,
+    cli_port: Option<u16>,
+    default_port: u16,
+) -> Effective {
     let network = match cli_bind {
         Some(ip) => (!ip.is_loopback()).then_some(ip),
         None => saved.address.parse().ok(),
@@ -198,7 +208,8 @@ pub const REFUSED_NO_PASSWORD: &str =
     "This PortalControl is not open to other computers: no dashboard password is set. Set one on the computer it runs on.";
 pub const REFUSED_EXPIRED: &str =
     "Network access to this PortalControl has ended. Open it again on the computer it runs on (Settings, Network).";
-pub const REFUSED_OTHER_NETWORK: &str = "Only computers on the same network as this PortalControl may connect.";
+pub const REFUSED_OTHER_NETWORK: &str =
+    "Only computers on the same network as this PortalControl may connect.";
 
 /// One computer that used the network address since the manager started.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -242,7 +253,13 @@ impl Active {
 
     /// Why the computer at `remote` may not use the network address right
     /// now, or `None` when it may. Checked on every request from the network.
-    pub fn refuse(&self, limits: Limits, remote: IpAddr, now: i64, password_set: bool) -> Option<&'static str> {
+    pub fn refuse(
+        &self,
+        limits: Limits,
+        remote: IpAddr,
+        now: i64,
+        password_set: bool,
+    ) -> Option<&'static str> {
         if !password_set {
             return Some(REFUSED_NO_PASSWORD);
         }
@@ -306,14 +323,16 @@ pub fn load_tls(cert_file: &str, key_file: &str) -> Result<Arc<rustls::ServerCon
             "certificate file {cert_file}: no certificate found (expected a PEM file with a BEGIN CERTIFICATE block)"
         ));
     }
-    let key = PrivateKeyDer::from_pem_file(key_file)
-        .map_err(|e| format!("private key file {key_file}: {e} (expected a PEM file with a BEGIN PRIVATE KEY block)"))?;
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("the certificate and the private key do not belong together: {e}"))?;
+    let key = PrivateKeyDer::from_pem_file(key_file).map_err(|e| {
+        format!("private key file {key_file}: {e} (expected a PEM file with a BEGIN PRIVATE KEY block)")
+    })?;
+    let mut config =
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("the certificate and the private key do not belong together: {e}"))?;
     // HTTP/1.1 only: the live log stream is a WebSocket.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
@@ -349,7 +368,12 @@ pub fn local_addresses() -> Vec<LocalAddress> {
                 "other"
             };
             if !out.iter().any(|a| a.ip == v4.to_string()) {
-                out.push(LocalAddress { ip: v4.to_string(), interface: name.clone(), kind, prefix: net.prefix });
+                out.push(LocalAddress {
+                    ip: v4.to_string(),
+                    interface: name.clone(),
+                    kind,
+                    prefix: net.prefix,
+                });
             }
         }
     }
@@ -375,23 +399,34 @@ mod tests {
         }
         // Outside the private ranges: never an address this computer lacks,
         // even when "it is internal" is ticked.
-        let foreign = NetSettings { address: "8.8.8.8".into(), internal_confirmed: true, ..Default::default() };
+        let foreign =
+            NetSettings { address: "8.8.8.8".into(), internal_confirmed: true, ..Default::default() };
         assert!(foreign.validate().unwrap_err().contains("not an address of this computer"));
         // The tick is dropped where it means nothing.
-        let private = NetSettings { address: "10.0.0.5".into(), internal_confirmed: true, ..Default::default() };
+        let private =
+            NetSettings { address: "10.0.0.5".into(), internal_confirmed: true, ..Default::default() };
         assert!(!private.validate().unwrap().internal_confirmed);
         assert!(NetSettings { port: Some(0), ..Default::default() }.validate().is_err());
     }
 
     #[test]
     fn host_names_are_tidied_and_checked() {
-        let s = NetSettings { hosts: vec![" Portal.Example.LAN. ".into(), "portal.example.lan".into(), "".into(), "pc-01".into()], ..Default::default() };
+        let s = NetSettings {
+            hosts: vec![
+                " Portal.Example.LAN. ".into(),
+                "portal.example.lan".into(),
+                "".into(),
+                "pc-01".into(),
+            ],
+            ..Default::default()
+        };
         assert_eq!(s.validate().unwrap().hosts, vec!["portal.example.lan", "pc-01"]);
         for bad in ["http://portal.lan", "portal.lan:7878", "bad host", "-x.lan", "192.168.1.5", "a..b"] {
             let s = NetSettings { hosts: vec![bad.into()], ..Default::default() };
             assert!(s.validate().is_err(), "{bad} must be refused");
         }
-        let many = NetSettings { hosts: (0..11).map(|i| format!("h{i}.lan")).collect(), ..Default::default() };
+        let many =
+            NetSettings { hosts: (0..11).map(|i| format!("h{i}.lan")).collect(), ..Default::default() };
         assert!(many.validate().is_err());
     }
 
@@ -419,7 +454,12 @@ mod tests {
 
     #[test]
     fn the_command_line_wins_over_stored_settings() {
-        let saved = NetSettings { address: "192.168.1.20".into(), port: Some(9000), https: true, ..Default::default() };
+        let saved = NetSettings {
+            address: "192.168.1.20".into(),
+            port: Some(9000),
+            https: true,
+            ..Default::default()
+        };
         let e = effective(&saved, None, None, 7878);
         assert_eq!((e.port, e.network, e.https), (9000, Some("192.168.1.20".parse().unwrap()), true));
         assert!(!e.bind_from_cli && !e.port_from_cli);
@@ -462,12 +502,16 @@ mod tests {
         assert!(!same_network("10.1.2.3".parse().unwrap(), "10.2.2.3".parse().unwrap(), 16));
 
         // "Open for 30 minutes" becomes an end time; switching access off clears it.
-        let s = NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(30), ..Default::default() }.validate().unwrap();
+        let s = NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(30), ..Default::default() }
+            .validate()
+            .unwrap();
         let left = s.expires_at.unwrap() - chrono::Utc::now().timestamp();
         assert!((1790..=1800).contains(&left), "{left}");
         let off = NetSettings { expires_at: Some(5), ..Default::default() }.validate().unwrap();
         assert_eq!(off.expires_at, None);
-        assert!(NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(0), ..Default::default() }.validate().is_err());
+        assert!(NetSettings { address: "10.0.0.5".into(), open_for_minutes: Some(0), ..Default::default() }
+            .validate()
+            .is_err());
     }
 
     #[test]

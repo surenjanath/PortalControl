@@ -44,18 +44,14 @@ pub fn host_header_allowed(authority: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<IpAddr>()
-        .map(|ip| is_private_ip(&ip))
-        .unwrap_or(false)
+    host.parse::<IpAddr>().map(|ip| is_private_ip(&ip)).unwrap_or(false)
 }
 
 /// Cross-site request check: when a browser sends `Origin`, it must be the
 /// dashboard's own origin (same authority as the Host header).
 pub fn origin_allowed(origin: &str, host_header: &str) -> bool {
     let o = origin.trim();
-    let authority = o
-        .strip_prefix("http://")
-        .or_else(|| o.strip_prefix("https://"));
+    let authority = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"));
     match authority {
         Some(a) => a.trim_end_matches('/').eq_ignore_ascii_case(host_header.trim()),
         None => false,
@@ -72,10 +68,28 @@ mod tests {
 
     #[test]
     fn private_ranges() {
-        for ok in ["127.0.0.1", "10.1.2.3", "192.168.1.5", "172.16.0.1", "100.64.0.1", "100.101.102.103", "100.127.255.255", "::1", "fd7a:115c:a1e0::1"] {
+        for ok in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.5",
+            "172.16.0.1",
+            "100.64.0.1",
+            "100.101.102.103",
+            "100.127.255.255",
+            "::1",
+            "fd7a:115c:a1e0::1",
+        ] {
             assert!(is_private_ip(&ip(ok)), "{ok} should be allowed");
         }
-        for bad in ["0.0.0.0", "8.8.8.8", "100.128.0.1", "100.63.255.255", "172.32.0.1", "2001:4860:4860::8888", "::"] {
+        for bad in [
+            "0.0.0.0",
+            "8.8.8.8",
+            "100.128.0.1",
+            "100.63.255.255",
+            "172.32.0.1",
+            "2001:4860:4860::8888",
+            "::",
+        ] {
             assert!(!is_private_ip(&ip(bad)), "{bad} should be rejected");
         }
     }

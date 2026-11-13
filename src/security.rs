@@ -37,11 +37,7 @@ enum ToolError {
     Failed(String),
 }
 
-async fn capture(
-    program: &str,
-    args: &[String],
-    dir: &Path,
-) -> Result<ToolOutput, std::io::Error> {
+async fn capture(program: &str, args: &[String], dir: &Path) -> Result<ToolOutput, std::io::Error> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(dir)
@@ -71,12 +67,7 @@ async fn capture(
 
 /// Run a Python CLI tool: first the console script on PATH, then
 /// `python -m <module>` so a `pip install --user` without PATH also works.
-async fn run_tool(
-    exe: &str,
-    module: &str,
-    args: &[String],
-    dir: &Path,
-) -> Result<ToolOutput, ToolError> {
+async fn run_tool(exe: &str, module: &str, args: &[String], dir: &Path) -> Result<ToolOutput, ToolError> {
     match capture(exe, args, dir).await {
         Ok(out) => return Ok(out),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -142,18 +133,10 @@ pub fn bandit_counts(report: &Value) -> (i64, i64, i64) {
 
 /// Number of packages with at least one known vulnerability in a pip-audit report.
 pub fn pip_audit_vulnerable(report: &Value) -> i64 {
-    let deps = report
-        .get("dependencies")
-        .and_then(Value::as_array)
-        .or_else(|| report.as_array());
+    let deps = report.get("dependencies").and_then(Value::as_array).or_else(|| report.as_array());
     deps.map(|d| {
         d.iter()
-            .filter(|p| {
-                p.get("vulns")
-                    .and_then(Value::as_array)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            })
+            .filter(|p| p.get("vulns").and_then(Value::as_array).map(|v| !v.is_empty()).unwrap_or(false))
             .count() as i64
     })
     .unwrap_or(0)
@@ -181,10 +164,8 @@ fn find_site_packages(dir: &Path) -> Option<PathBuf> {
 /// the declared requirements, else the project's virtualenv, else the
 /// ambient Python environment.
 pub fn pip_audit_plan(dir: &Path) -> (String, Vec<String>) {
-    let mut args: Vec<String> = ["--format", "json", "--progress-spinner", "off"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut args: Vec<String> =
+        ["--format", "json", "--progress-spinner", "off"].iter().map(|s| s.to_string()).collect();
     if dir.join("requirements.txt").is_file() {
         args.extend(["-r".to_string(), "requirements.txt".to_string()]);
         ("requirements.txt".into(), args)
@@ -207,24 +188,18 @@ async fn run_bandit(dir: &Path) -> Result<Value, String> {
         BANDIT_EXCLUDES.into(),
     ];
     match run_tool("bandit", "bandit", &args, dir).await {
-        Ok(out) => parse_json_output(&out.stdout).ok_or_else(|| {
-            format!("bandit produced no JSON report: {}", snippet(&out.stderr))
-        }),
-        Err(ToolError::NotInstalled) => {
-            Err("bandit is not installed (run: pip install bandit)".into())
-        }
+        Ok(out) => parse_json_output(&out.stdout)
+            .ok_or_else(|| format!("bandit produced no JSON report: {}", snippet(&out.stderr))),
+        Err(ToolError::NotInstalled) => Err("bandit is not installed (run: pip install bandit)".into()),
         Err(ToolError::Failed(e)) => Err(e),
     }
 }
 
 async fn run_pip_audit(dir: &Path, args: &[String]) -> Result<Value, String> {
     match run_tool("pip-audit", "pip_audit", args, dir).await {
-        Ok(out) => parse_json_output(&out.stdout).ok_or_else(|| {
-            format!("pip-audit produced no JSON report: {}", snippet(&out.stderr))
-        }),
-        Err(ToolError::NotInstalled) => {
-            Err("pip-audit is not installed (run: pip install pip-audit)".into())
-        }
+        Ok(out) => parse_json_output(&out.stdout)
+            .ok_or_else(|| format!("pip-audit produced no JSON report: {}", snippet(&out.stderr))),
+        Err(ToolError::NotInstalled) => Err("pip-audit is not installed (run: pip install pip-audit)".into()),
         Err(ToolError::Failed(e)) => Err(e),
     }
 }
@@ -233,10 +208,7 @@ async fn run_pip_audit(dir: &Path, args: &[String]) -> Result<Value, String> {
 pub fn start_scan(state: &Arc<AppState>, target: Target) -> Result<(), String> {
     let dir = PathBuf::from(&target.working_directory);
     if !dir.is_dir() {
-        return Err(format!(
-            "working directory does not exist: {}",
-            target.working_directory
-        ));
+        return Err(format!("working directory does not exist: {}", target.working_directory));
     }
     {
         let mut set = state.scans_running.lock().unwrap_or_else(|p| p.into_inner());
@@ -276,18 +248,11 @@ pub fn start_scan(state: &Arc<AppState>, target: Target) -> Result<(), String> {
             "pip_audit_error": audit.as_ref().err(),
             "pip_audit_mode": mode,
         });
-        let stored = state
-            .db
-            .insert_scan(id, high, vulnerable, payload.to_string())
-            .await;
+        let stored = state.db.insert_scan(id, high, vulnerable, payload.to_string()).await;
         if let Err(e) = &stored {
             log(&format!("failed to store scan report for target {id}: {e}"));
         }
-        state
-            .scans_running
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&id);
+        state.scans_running.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
         state.emit(json!({
             "type": "scan_finished",
             "target_id": id,

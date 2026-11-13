@@ -79,10 +79,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/targets", get(list_targets).post(create_target))
-        .route(
-            "/api/targets/{id}",
-            get(get_target).put(update_target).delete(delete_target),
-        )
+        .route("/api/targets/{id}", get(get_target).put(update_target).delete(delete_target))
         .route("/api/targets/{id}/run", post(run_target))
         .route("/api/targets/{id}/stop", post(stop_target))
         .route("/api/targets/{id}/restart", post(restart_target))
@@ -98,10 +95,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/targets/{id}/health/check", post(health_check))
         .route("/api/targets/{id}/health/history", get(health_history))
         .route("/api/targets/{id}/metrics", get(target_metrics))
-        .route(
-            "/api/targets/{id}/webhook",
-            post(webhook_enable).delete(webhook_disable),
-        )
+        .route("/api/targets/{id}/webhook", post(webhook_enable).delete(webhook_disable))
         .route("/api/webhooks/deploy/{token}", get(webhook_deploy).post(webhook_deploy))
         .route("/api/targets/{id}/commands", get(list_commands))
         .route("/api/targets/{id}/commands/stop", post(stop_command))
@@ -120,10 +114,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/system", get(system))
         .route("/api/system/metrics", get(system_metrics))
         .route("/api/system/log", get(system_log))
-        .route(
-            "/api/system/autostart",
-            post(autostart_install).delete(autostart_remove),
-        )
+        .route("/api/system/autostart", post(autostart_install).delete(autostart_remove))
         .route("/api/system/shutdown", post(shutdown))
         .route("/api/system/restart", post(restart))
         .route("/api/system/network", get(network_get).put(network_put))
@@ -162,7 +153,9 @@ fn html_page(body: &'static str) -> Response {
 async fn asset(Path(path): Path<String>) -> Response {
     match ASSETS.iter().find(|(name, _, _)| *name == path) {
         // `no-cache`: the browser revalidates, so a new build is picked up at once.
-        Some((_, mime, body)) => ([(CONTENT_TYPE, *mime), (CACHE_CONTROL, "no-cache")], *body).into_response(),
+        Some((_, mime, body)) => {
+            ([(CONTENT_TYPE, *mime), (CACHE_CONTROL, "no-cache")], *body).into_response()
+        }
         None => fail(StatusCode::NOT_FOUND, "no such asset"),
     }
 }
@@ -233,9 +226,7 @@ struct LoginRequest {
 
 async fn verify(state: &Arc<AppState>, password: String) -> bool {
     let Some(hash) = state.auth.current_hash() else { return false };
-    tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash)).await.unwrap_or(false)
 }
 
 async fn auth_login(
@@ -322,11 +313,7 @@ async fn auth_password(
     let hash = tokio::task::spawn_blocking(move || auth::hash_password(&new))
         .await
         .map_err(|e| internal(e.to_string()))?;
-    state
-        .db
-        .set_setting(auth::PASSWORD_KEY, Some(hash.clone()))
-        .await
-        .map_err(internal)?;
+    state.db.set_setting(auth::PASSWORD_KEY, Some(hash.clone())).await.map_err(internal)?;
     // Everyone else is signed out; the caller gets a fresh session.
     state.auth.set_hash(Some(hash));
     let token = state.auth.create_session();
@@ -355,12 +342,7 @@ async fn guard(state: State<Arc<AppState>>, req: Request, next: Next) -> Respons
 }
 
 async fn checked(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    let host = req
-        .headers()
-        .get(HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let host = req.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let named = state.net.get().is_some_and(|n| n.host_allowed(&host));
     if !net::host_header_allowed(&host) && !named {
         return fail(StatusCode::FORBIDDEN, "forbidden host");
@@ -398,10 +380,7 @@ pub async fn network_guard(
     let ip = remote.ip();
     let now = chrono::Utc::now().timestamp();
     let limits = *state.net_limits.lock().unwrap_or_else(|p| p.into_inner());
-    let refused = state
-        .net
-        .get()
-        .and_then(|n| n.refuse(limits, ip, now, state.auth.password_set()));
+    let refused = state.net.get().and_then(|n| n.refuse(limits, ip, now, state.auth.password_set()));
 
     // Remember who came by, and note it when that is news.
     let news = {
@@ -581,10 +560,7 @@ async fn target_view(state: &Arc<AppState>, t: Target, extras: &mut Extras) -> V
                 "triggered_by": h.triggered_by,
             })
         };
-        (
-            r.get(&t.id).map(view),
-            r.get(&runner::command_slot(t.id)).map(view),
-        )
+        (r.get(&t.id).map(view), r.get(&runner::command_slot(t.id)).map(view))
     };
     let health = state.health.lock().ok().and_then(|m| m.get(&t.id).cloned());
     let (health_recent, uptime_pct) = state
@@ -605,21 +581,11 @@ async fn target_view(state: &Arc<AppState>, t: Target, extras: &mut Extras) -> V
         })
         .unwrap_or((json!([]), None));
     let git = state.git.lock().ok().and_then(|m| m.get(&t.id).cloned());
-    let scan_running = state
-        .scans_running
-        .lock()
-        .map(|s| s.contains(&t.id))
-        .unwrap_or(false);
-    let metrics = if running.is_some() {
-        state.metrics.lock().ok().and_then(|m| m.latest(t.id))
-    } else {
-        None
-    };
-    let restart_pending = state
-        .restart_queue
-        .lock()
-        .map(|q| q.iter().any(|(id, _)| *id == t.id))
-        .unwrap_or(false);
+    let scan_running = state.scans_running.lock().map(|s| s.contains(&t.id)).unwrap_or(false);
+    let metrics =
+        if running.is_some() { state.metrics.lock().ok().and_then(|m| m.latest(t.id)) } else { None };
+    let restart_pending =
+        state.restart_queue.lock().map(|q| q.iter().any(|(id, _)| *id == t.id)).unwrap_or(false);
     let scan = extras.scans.remove(&t.id);
     let last_run = extras.last_runs.remove(&t.id);
 
@@ -654,10 +620,8 @@ struct Extras {
 async fn load_extras(state: &Arc<AppState>, targets: &[Target]) -> Extras {
     let (scans, last_runs) = tokio::join!(state.db.latest_scan_summaries(), state.db.last_runs());
     // Looking for Python environments touches the disk: off the async threads.
-    let wanted: Vec<(i64, String, Option<String>)> = targets
-        .iter()
-        .map(|t| (t.id, t.working_directory.clone(), t.python_env.clone()))
-        .collect();
+    let wanted: Vec<(i64, String, Option<String>)> =
+        targets.iter().map(|t| (t.id, t.working_directory.clone(), t.python_env.clone())).collect();
     let python = tokio::task::spawn_blocking(move || {
         wanted
             .into_iter()
@@ -692,10 +656,7 @@ async fn get_target(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> 
     Ok(ok(one_target_view(&state, t).await))
 }
 
-async fn create_target(
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<TargetInput>,
-) -> AppResult {
+async fn create_target(State(state): State<Arc<AppState>>, Json(input): Json<TargetInput>) -> AppResult {
     let input = clean_input(input).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     let id = state.db.insert_target(input).await.map_err(internal)?;
     let t = load_target(&state, id).await?;
@@ -787,11 +748,8 @@ async fn run_target(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> 
 
 async fn stop_target(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     load_target(&state, id).await?;
-    let had_pending_restart = state
-        .restart_queue
-        .lock()
-        .map(|q| q.iter().any(|(tid, _)| *tid == id))
-        .unwrap_or(false);
+    let had_pending_restart =
+        state.restart_queue.lock().map(|q| q.iter().any(|(tid, _)| *tid == id)).unwrap_or(false);
     reset_restart_state(&state, id);
     if runner::stop_run(&state, id).await {
         Ok(ok(json!({"stopping": true})))
@@ -867,8 +825,7 @@ async fn target_logs(State(state): State<Arc<AppState>>, Path(id): Path<i64>) ->
     load_target(&state, id).await?;
     let live = {
         let r = state.running.lock().await;
-        r.get(&id)
-            .map(|h| (h.run_id, h.tail.lock().map(|t| t.joined()).unwrap_or_default()))
+        r.get(&id).map(|h| (h.run_id, h.tail.lock().map(|t| t.joined()).unwrap_or_default()))
     };
     if let Some((run_id, logs)) = live {
         return Ok(ok(json!({"run_id": run_id, "live": true, "logs": logs})));
@@ -903,11 +860,7 @@ async fn clear_history(State(state): State<Arc<AppState>>, Path(id): Path<i64>) 
 }
 
 async fn recent_runs(State(state): State<Arc<AppState>>, Query(q): Params) -> AppResult {
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(100)
-        .clamp(1, 500);
+    let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500);
     let runs = state.db.list_recent_runs(limit).await.map_err(internal)?;
     Ok(ok(json!(runs)))
 }
@@ -1033,11 +986,17 @@ async fn target_network(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
         let ours = script.contains(GENERATED_MARKER);
         // Only a script PortalControl wrote can be rewritten from the dashboard.
         let starter = ours
-            .then(|| detect_project(&dir).starters.into_iter().find(|s| s.script().eq_ignore_ascii_case(&t.script_name)))
+            .then(|| {
+                detect_project(&dir)
+                    .starters
+                    .into_iter()
+                    .find(|s| s.script().eq_ignore_ascii_case(&t.script_name))
+            })
             .flatten();
         let answers = |ip: &str| {
-            port.and_then(|p| format!("{ip}:{p}").parse::<std::net::SocketAddr>().ok())
-                .is_some_and(|addr| std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok())
+            port.and_then(|p| format!("{ip}:{p}").parse::<std::net::SocketAddr>().ok()).is_some_and(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+            })
         };
         let network: Vec<Value> = netcfg::local_addresses()
             .into_iter()
@@ -1129,11 +1088,7 @@ async fn metrics_history(
 async fn webhook_enable(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     load_target(&state, id).await?;
     let token = automation::new_token();
-    state
-        .db
-        .set_webhook_token(id, Some(token.clone()))
-        .await
-        .map_err(internal)?;
+    state.db.set_webhook_token(id, Some(token.clone())).await.map_err(internal)?;
     state.activity("info", "target", Some(id), "Deploy webhook URL generated");
     state.emit(json!({"type": "targets_changed"}));
     Ok(ok(json!({"webhook_token": token})))
@@ -1171,11 +1126,8 @@ async fn webhook_deploy(
 // ------------------------------------------------------- activity / tools --
 
 async fn activity(State(state): State<Arc<AppState>>) -> AppResult {
-    let events: Vec<Value> = state
-        .activity
-        .lock()
-        .map(|ring| ring.iter().rev().cloned().collect())
-        .unwrap_or_default();
+    let events: Vec<Value> =
+        state.activity.lock().map(|ring| ring.iter().rev().cloned().collect()).unwrap_or_default();
     Ok(ok(json!(events)))
 }
 
@@ -1195,9 +1147,8 @@ async fn fs_inspect(Query(q): Params) -> AppResult {
     if raw.is_empty() || !dir.is_absolute() {
         return Ok(ok(json!({"exists": false, "error": "enter an absolute path"})));
     }
-    let report = tokio::task::spawn_blocking(move || inspect_dir(&dir))
-        .await
-        .map_err(|e| internal(e.to_string()))?;
+    let report =
+        tokio::task::spawn_blocking(move || inspect_dir(&dir)).await.map_err(|e| internal(e.to_string()))?;
     Ok(ok(report))
 }
 
@@ -1239,11 +1190,8 @@ fn inspect_dir(dir: &std::path::Path) -> Value {
         ("Dockerfile", "Dockerfile"),
         (".env", ".env file"),
     ];
-    let detected: Vec<&str> = markers
-        .iter()
-        .filter(|(file, _)| dir.join(file).exists())
-        .map(|(_, label)| *label)
-        .collect();
+    let detected: Vec<&str> =
+        markers.iter().filter(|(file, _)| dir.join(file).exists()).map(|(_, label)| *label).collect();
 
     let workers: Vec<Value> = detect_workers(dir)
         .iter()
@@ -1329,12 +1277,54 @@ struct QuickCommand {
 }
 
 const DJANGO_COMMANDS: &[QuickCommand] = &[
-    QuickCommand { id: "check", label: "System check", description: "Validate the project configuration.", args: &["manage.py", "check"], changes: false, backup_first: false },
-    QuickCommand { id: "showmigrations", label: "Show migrations", description: "List every migration and whether it has been applied.", args: &["manage.py", "showmigrations"], changes: false, backup_first: false },
-    QuickCommand { id: "pending", label: "Check for model changes", description: "Report model changes that have no migration yet. Nothing is written.", args: &["manage.py", "makemigrations", "--check", "--dry-run"], changes: false, backup_first: false },
-    QuickCommand { id: "migrate", label: "Apply migrations", description: "Run pending database migrations.", args: &["manage.py", "migrate", "--noinput"], changes: true, backup_first: true },
-    QuickCommand { id: "collectstatic", label: "Collect static files", description: "Copy static files into STATIC_ROOT.", args: &["manage.py", "collectstatic", "--noinput"], changes: true, backup_first: false },
-    QuickCommand { id: "clearsessions", label: "Clear expired sessions", description: "Delete expired rows from the session store.", args: &["manage.py", "clearsessions"], changes: true, backup_first: false },
+    QuickCommand {
+        id: "check",
+        label: "System check",
+        description: "Validate the project configuration.",
+        args: &["manage.py", "check"],
+        changes: false,
+        backup_first: false,
+    },
+    QuickCommand {
+        id: "showmigrations",
+        label: "Show migrations",
+        description: "List every migration and whether it has been applied.",
+        args: &["manage.py", "showmigrations"],
+        changes: false,
+        backup_first: false,
+    },
+    QuickCommand {
+        id: "pending",
+        label: "Check for model changes",
+        description: "Report model changes that have no migration yet. Nothing is written.",
+        args: &["manage.py", "makemigrations", "--check", "--dry-run"],
+        changes: false,
+        backup_first: false,
+    },
+    QuickCommand {
+        id: "migrate",
+        label: "Apply migrations",
+        description: "Run pending database migrations.",
+        args: &["manage.py", "migrate", "--noinput"],
+        changes: true,
+        backup_first: true,
+    },
+    QuickCommand {
+        id: "collectstatic",
+        label: "Collect static files",
+        description: "Copy static files into STATIC_ROOT.",
+        args: &["manage.py", "collectstatic", "--noinput"],
+        changes: true,
+        backup_first: false,
+    },
+    QuickCommand {
+        id: "clearsessions",
+        label: "Clear expired sessions",
+        description: "Delete expired rows from the session store.",
+        args: &["manage.py", "clearsessions"],
+        changes: true,
+        backup_first: false,
+    },
 ];
 
 const PYTHON_COMMANDS: &[QuickCommand] = &[
@@ -1488,7 +1478,8 @@ async fn run_command(
 ) -> AppResult {
     let t = load_target(&state, id).await?;
     let dir = std::path::PathBuf::from(&t.working_directory);
-    let Some(cmd) = detect_commands(&dir, t.python_env.as_deref()).into_iter().find(|c| c.id == command) else {
+    let Some(cmd) = detect_commands(&dir, t.python_env.as_deref()).into_iter().find(|c| c.id == command)
+    else {
         return Err(fail(StatusCode::NOT_FOUND, "this command is not available for the target"));
     };
     if cmd.backup_first && t.backup_on_deploy {
@@ -1509,11 +1500,7 @@ async fn stop_command(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -
 // ---------------------------------------------------------------- backups --
 
 fn data_dir(state: &Arc<AppState>) -> Result<std::path::PathBuf, Response> {
-    state
-        .data_dir
-        .get()
-        .cloned()
-        .ok_or_else(|| internal("data directory is not configured".into()))
+    state.data_dir.get().cloned().ok_or_else(|| internal("data directory is not configured".into()))
 }
 
 async fn list_backups(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
@@ -1614,18 +1601,13 @@ struct ImportRequest {
 /// Register the targets of an export. A target whose folder and script are
 /// already registered is skipped; one that fails validation (for example the
 /// folder does not exist on this machine) is reported, not created.
-async fn import_config(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ImportRequest>,
-) -> AppResult {
+async fn import_config(State(state): State<Arc<AppState>>, Json(req): Json<ImportRequest>) -> AppResult {
     if req.targets.len() > 500 {
         return Err(fail(StatusCode::BAD_REQUEST, "an import is limited to 500 targets"));
     }
     let existing = state.db.list_targets().await.map_err(internal)?;
-    let mut seen: Vec<(String, String)> = existing
-        .iter()
-        .map(|t| (t.working_directory.to_lowercase(), t.script_name.to_lowercase()))
-        .collect();
+    let mut seen: Vec<(String, String)> =
+        existing.iter().map(|t| (t.working_directory.to_lowercase(), t.script_name.to_lowercase())).collect();
     let (mut created, mut skipped, mut errors) = (0, 0, Vec::new());
     for input in req.targets {
         let name = input.name.clone();
@@ -1681,11 +1663,8 @@ impl Starter {
 
     fn body(&self, host: &str, port: Option<u16>) -> String {
         let port_text = port.map(|p| p.to_string()).unwrap_or_default();
-        let lines: Vec<String> = self
-            .lines
-            .iter()
-            .map(|l| l.replace("{host}", host).replace("{port}", &port_text))
-            .collect();
+        let lines: Vec<String> =
+            self.lines.iter().map(|l| l.replace("{host}", host).replace("{port}", &port_text)).collect();
         let many = lines.len() > 1;
         let mut out = String::new();
         if cfg!(windows) {
@@ -1729,7 +1708,10 @@ fn python_deps(dir: &std::path::Path) -> String {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten().take(2_000) {
             let name = entry.file_name().to_string_lossy().to_lowercase();
-            if (name.starts_with("requirements") && name.ends_with(".txt")) || name == "pyproject.toml" || name == "pipfile" {
+            if (name.starts_with("requirements") && name.ends_with(".txt"))
+                || name == "pyproject.toml"
+                || name == "pipfile"
+            {
                 text.push_str(&read_small(&entry.path()));
                 text.push('\n');
             }
@@ -1819,9 +1801,17 @@ fn detect_project(dir: &std::path::Path) -> ProjectInfo {
             run_mode: "TASK",
             port_env: false,
         });
-    } else if deps.contains("fastapi") && (has("main.py") || has("app.py") || dir.join("app").join("main.py").is_file()) {
+    } else if deps.contains("fastapi")
+        && (has("main.py") || has("app.py") || dir.join("app").join("main.py").is_file())
+    {
         (kind, label) = ("fastapi", "FastAPI");
-        let module = if has("main.py") { "main" } else if has("app.py") { "app" } else { "app.main" };
+        let module = if has("main.py") {
+            "main"
+        } else if has("app.py") {
+            "app"
+        } else {
+            "app.main"
+        };
         starters.push(service(
             "uvicorn",
             "Uvicorn server",
@@ -1831,7 +1821,13 @@ fn detect_project(dir: &std::path::Path) -> ProjectInfo {
         ));
     } else if deps.contains("streamlit") && (has("app.py") || has("main.py") || has("streamlit_app.py")) {
         (kind, label) = ("streamlit", "Streamlit");
-        let file = if has("streamlit_app.py") { "streamlit_app.py" } else if has("app.py") { "app.py" } else { "main.py" };
+        let file = if has("streamlit_app.py") {
+            "streamlit_app.py"
+        } else if has("app.py") {
+            "app.py"
+        } else {
+            "main.py"
+        };
         starters.push(service(
             "streamlit",
             "Streamlit app",
@@ -1841,7 +1837,13 @@ fn detect_project(dir: &std::path::Path) -> ProjectInfo {
         ));
     } else if deps.contains("flask") && (has("app.py") || has("wsgi.py") || has("application.py")) {
         (kind, label) = ("flask", "Flask");
-        let module = if has("app.py") { "app" } else if has("wsgi.py") { "wsgi" } else { "application" };
+        let module = if has("app.py") {
+            "app"
+        } else if has("wsgi.py") {
+            "wsgi"
+        } else {
+            "application"
+        };
         starters.push(service(
             "flask",
             "Flask server",
@@ -1856,7 +1858,8 @@ fn detect_project(dir: &std::path::Path) -> ProjectInfo {
         if kind == "unknown" {
             (kind, label) = ("node", "Node.js");
         }
-        for (script, id, text) in [("start", "npm-start", "npm start"), ("dev", "npm-dev", "npm dev server")] {
+        for (script, id, text) in [("start", "npm-start", "npm start"), ("dev", "npm-dev", "npm dev server")]
+        {
             if scripts.iter().any(|s| s == script) {
                 starters.push(Starter {
                     id,
@@ -1962,9 +1965,10 @@ async fn fs_pyenv(Query(q): Params) -> AppResult {
         return Err(fail(StatusCode::BAD_REQUEST, "dir is required"));
     }
     let setting = q.get("env").cloned();
-    let shown = tokio::task::spawn_blocking(move || pyenv::describe(std::path::Path::new(&dir), setting.as_deref()))
-        .await
-        .map_err(|e| internal(e.to_string()))?;
+    let shown =
+        tokio::task::spawn_blocking(move || pyenv::describe(std::path::Path::new(&dir), setting.as_deref()))
+            .await
+            .map_err(|e| internal(e.to_string()))?;
     Ok(ok(shown))
 }
 
@@ -2006,11 +2010,8 @@ async fn fs_list(State(state): State<Arc<AppState>>, Query(q): Params) -> AppRes
     let wanted = q.get("dir").map(|d| d.trim().trim_matches('"').to_string()).unwrap_or_default();
     // The drives the metrics worker already knows about. Probing every drive
     // letter here would stall for seconds on disconnected network drives.
-    let mut roots: Vec<String> = state
-        .metrics
-        .lock()
-        .map(|m| m.disks.iter().map(|d| d.mount.clone()).collect())
-        .unwrap_or_default();
+    let mut roots: Vec<String> =
+        state.metrics.lock().map(|m| m.disks.iter().map(|d| d.mount.clone()).collect()).unwrap_or_default();
     if roots.is_empty() {
         roots.push(if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() });
     }
@@ -2021,9 +2022,8 @@ async fn fs_list(State(state): State<Arc<AppState>>, Query(q): Params) -> AppRes
 }
 
 fn list_dir(wanted: &str, roots: Vec<String>) -> Value {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from);
+    let home =
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from);
     let dir = if wanted.is_empty() {
         home.clone().unwrap_or_else(|| std::path::PathBuf::from(roots.first().cloned().unwrap_or_default()))
     } else {
@@ -2264,10 +2264,7 @@ struct LauncherRequest {
     kind: String,
 }
 
-async fn fs_launcher(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<LauncherRequest>,
-) -> AppResult {
+async fn fs_launcher(State(state): State<Arc<AppState>>, Json(req): Json<LauncherRequest>) -> AppResult {
     let dir = std::path::PathBuf::from(req.dir.trim().trim_matches('"'));
     let shown = dir.display().to_string();
     let kind = req.kind;
@@ -2353,11 +2350,7 @@ fn tail_file(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> 
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf).into_owned();
-    Ok(if start > 0 {
-        text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or(text)
-    } else {
-        text
-    })
+    Ok(if start > 0 { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or(text) } else { text })
 }
 
 async fn system_log(State(state): State<Arc<AppState>>) -> AppResult {
@@ -2388,9 +2381,8 @@ async fn autostart_install(State(state): State<Arc<AppState>>) -> AppResult {
 }
 
 async fn autostart_remove(State(state): State<Arc<AppState>>) -> AppResult {
-    let result = tokio::task::spawn_blocking(autostart::uninstall)
-        .await
-        .map_err(|e| internal(e.to_string()))?;
+    let result =
+        tokio::task::spawn_blocking(autostart::uninstall).await.map_err(|e| internal(e.to_string()))?;
     match result {
         Ok(message) => {
             state.activity("info", "system", None, "Start at login disabled");
@@ -2420,11 +2412,7 @@ async fn restart(State(state): State<Arc<AppState>>) -> AppResult {
 /// whether the two differ, and what this machine could offer.
 async fn network_view(state: &Arc<AppState>) -> Value {
     let saved = netcfg::NetSettings::load(&state.db).await;
-    let active = state
-        .net
-        .get()
-        .cloned()
-        .unwrap_or_else(|| netcfg::Active::local_only(state.bind.port()));
+    let active = state.net.get().cloned().unwrap_or_else(|| netcfg::Active::local_only(state.bind.port()));
     let (cli_bind, cli_port) = state.cli_net.get().copied().unwrap_or((None, None));
     let next = netcfg::effective(&saved, cli_bind, cli_port, crate::DEFAULT_PORT);
     let addresses = tokio::task::spawn_blocking(netcfg::local_addresses).await.unwrap_or_default();
@@ -2444,7 +2432,9 @@ async fn network_view(state: &Arc<AppState>) -> Value {
 
     let mut warnings: Vec<String> = Vec::new();
     if let Some(e) = &active.error {
-        warnings.push(format!("Other computers cannot connect right now, because the network address could not be opened: {e}"));
+        warnings.push(format!(
+            "Other computers cannot connect right now, because the network address could not be opened: {e}"
+        ));
     }
     if !saved.address.is_empty() && !addresses.iter().any(|a| a.ip == saved.address) {
         warnings.push(format!(
@@ -2453,7 +2443,10 @@ async fn network_view(state: &Arc<AppState>) -> Value {
         ));
     }
     if saved.https && saved.address.is_empty() {
-        warnings.push("HTTPS is set up but has nothing to protect until an address for other computers is chosen.".into());
+        warnings.push(
+            "HTTPS is set up but has nothing to protect until an address for other computers is chosen."
+                .into(),
+        );
     }
     if next.network.is_some() && !next.https {
         warnings.push("Other computers connect without encryption: the password and everything on screen cross the network in clear text. That is fine on Tailscale or a network you trust; otherwise turn on HTTPS.".into());
@@ -2464,7 +2457,10 @@ async fn network_view(state: &Arc<AppState>) -> Value {
         ));
     }
     if next.network.is_some() && !password_set {
-        warnings.push("No dashboard password is set. Anyone who can reach the address can run the registered scripts.".into());
+        warnings.push(
+            "No dashboard password is set. Anyone who can reach the address can run the registered scripts."
+                .into(),
+        );
     }
 
     json!({
@@ -2499,7 +2495,10 @@ async fn network_get(State(state): State<Arc<AppState>>) -> AppResult {
     Ok(ok(network_view(&state).await))
 }
 
-async fn network_put(State(state): State<Arc<AppState>>, Json(input): Json<netcfg::NetSettings>) -> AppResult {
+async fn network_put(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<netcfg::NetSettings>,
+) -> AppResult {
     // Validation reads the certificate files.
     let settings = tokio::task::spawn_blocking(move || input.validate())
         .await
@@ -2645,7 +2644,8 @@ mod tests {
     #[test]
     fn directory_inspection_finds_scripts_and_project_type() {
         let dir = tempfile::tempdir().unwrap();
-        let (script, other) = if cfg!(windows) { ("deploy.bat", "deploy.sh") } else { ("deploy.sh", "deploy.bat") };
+        let (script, other) =
+            if cfg!(windows) { ("deploy.bat", "deploy.sh") } else { ("deploy.sh", "deploy.bat") };
         std::fs::write(dir.path().join(script), "echo hi\n").unwrap();
         std::fs::write(dir.path().join(other), "echo hi\n").unwrap();
         std::fs::write(dir.path().join("manage.py"), "").unwrap();
@@ -2733,7 +2733,9 @@ mod tests {
         std::fs::write(p.join("requirements.txt"), "fastapi\nuvicorn\n").unwrap();
         std::fs::write(p.join("main.py"), "app = FastAPI()").unwrap();
         assert_eq!(ids(p), ("fastapi".to_string(), vec!["uvicorn"]));
-        assert!(detect_project(p).starters[0].lines[0].contains("uvicorn main:app --host {host} --port {port}"));
+        assert!(
+            detect_project(p).starters[0].lines[0].contains("uvicorn main:app --host {host} --port {port}")
+        );
 
         // Django wins, and offers Waitress because it is in the requirements.
         std::fs::write(p.join("manage.py"), "").unwrap();
@@ -2768,7 +2770,9 @@ mod tests {
         assert_eq!(health.as_deref(), Some("http://127.0.0.1:8123/"));
         assert!(runner::validate_target_paths(&p.to_string_lossy(), &script).is_ok());
         let body = std::fs::read_to_string(p.join(&script)).unwrap();
-        assert!(body.contains("manage.py runserver 127.0.0.1:8123 --noreload") && body.contains(GENERATED_MARKER));
+        assert!(
+            body.contains("manage.py runserver 127.0.0.1:8123 --noreload") && body.contains(GENERATED_MARKER)
+        );
         assert!(!body.contains("{port}") && !body.contains("{host}"));
 
         // Changing the port regenerates our own script ...
@@ -2776,7 +2780,9 @@ mod tests {
         assert!(std::fs::read_to_string(p.join(&script)).unwrap().contains("0.0.0.0:9000"));
         // ... but a file the user wrote under that name is never overwritten.
         std::fs::write(p.join(&script), "my own script").unwrap();
-        assert!(create_starter(p, "runserver", "127.0.0.1", Some(8000)).unwrap_err().contains("already exists"));
+        assert!(create_starter(p, "runserver", "127.0.0.1", Some(8000))
+            .unwrap_err()
+            .contains("already exists"));
         assert_eq!(std::fs::read_to_string(p.join(&script)).unwrap(), "my own script");
 
         // The deploy task has no port and stops at the first failing step.
@@ -2802,7 +2808,8 @@ mod tests {
         std::fs::write(p.join("file.txt"), "").unwrap();
         let roots = || vec!["/".to_string()];
         let v = list_dir(&p.to_string_lossy(), roots());
-        let names: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> =
+            v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["Alpha", "beta_portal"]);
         assert_eq!(v["entries"][1]["project"], true);
         assert_eq!(v["entries"][0]["project"], false);
@@ -2851,14 +2858,32 @@ mod tests {
 
     #[test]
     fn public_paths_and_session_cookies() {
-        for open in ["/assets/styles.css", "/assets/js/core/app.js", "/api/auth/status", "/api/auth/login", "/api/webhooks/deploy/abc"] {
+        for open in [
+            "/assets/styles.css",
+            "/assets/js/core/app.js",
+            "/api/auth/status",
+            "/api/auth/login",
+            "/api/webhooks/deploy/abc",
+        ] {
             assert!(is_public_path(open), "{open}");
         }
-        for closed in ["/", "/api/targets", "/ws", "/api/auth/password", "/api/auth/logout", "/api/system/shutdown", "/api/webhooks"] {
+        for closed in [
+            "/",
+            "/api/targets",
+            "/ws",
+            "/api/auth/password",
+            "/api/auth/logout",
+            "/api/system/shutdown",
+            "/api/webhooks",
+        ] {
             assert!(!is_public_path(closed), "{closed}");
         }
         let cookie = session_cookie("tok", 60, false);
-        assert!(cookie.contains("pc_session=tok") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        assert!(
+            cookie.contains("pc_session=tok")
+                && cookie.contains("HttpOnly")
+                && cookie.contains("SameSite=Strict")
+        );
         assert!(!cookie.contains("Secure"));
         // Signed in over HTTPS: the cookie never travels over plain HTTP.
         assert!(session_cookie("tok", 60, true).ends_with("; Secure"));

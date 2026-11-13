@@ -37,10 +37,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     if text.len() % 2 != 0 {
         return None;
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
-        .collect()
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
 }
 
 /// `bytes` random bytes from the operating system, hex encoded.
@@ -68,7 +65,8 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     if *scheme != "pbkdf2-sha256" {
         return false;
     }
-    let (Ok(rounds), Some(salt), Some(expected)) = (rounds.parse::<u32>(), unhex(salt), unhex(expected)) else {
+    let (Ok(rounds), Some(salt), Some(expected)) = (rounds.parse::<u32>(), unhex(salt), unhex(expected))
+    else {
         return false;
     };
     if rounds == 0 || rounds > 10_000_000 || expected.len() != 32 {
@@ -160,11 +158,7 @@ impl Auth {
 
     pub fn control_token_matches(&self, presented: &str) -> bool {
         presented.len() == self.control_token.len()
-            && presented
-                .bytes()
-                .zip(self.control_token.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
+            && presented.bytes().zip(self.control_token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 
     /// Seconds until sign-in is allowed again, if it is currently locked.

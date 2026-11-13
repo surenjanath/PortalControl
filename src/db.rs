@@ -225,9 +225,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         working_directory: r.get(2)?,
         script_name: r.get(3)?,
         git_branch: r.get(4)?,
-        current_git_status: r
-            .get::<_, Option<String>>(5)?
-            .unwrap_or_else(|| "UP_TO_DATE".into()),
+        current_git_status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "UP_TO_DATE".into()),
         created_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
         health_url: r.get(7)?,
         run_mode: r.get(8)?,
@@ -275,20 +273,11 @@ fn row_to_run(r: &Row, extra: RunExtra) -> rusqlite::Result<RunRecord> {
         commit_message: r.get(8)?,
         label: r.get(9)?,
         target_name: if extra == RunExtra::TargetName { tail.clone() } else { None },
-        captured_logs: if extra == RunExtra::Logs {
-            Some(tail.unwrap_or_default())
-        } else {
-            None
-        },
+        captured_logs: if extra == RunExtra::Logs { Some(tail.unwrap_or_default()) } else { None },
     })
 }
 
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> rusqlite::Result<()> {
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
     let exists = {
         let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let names = st.query_map([], |r| r.get::<_, String>(1))?;
@@ -334,9 +323,7 @@ impl Db {
              WHERE status='RUNNING'",
             [],
         )?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Run a closure against the connection on the blocking thread pool.
@@ -357,8 +344,7 @@ impl Db {
 
     pub async fn list_targets(&self) -> Result<Vec<Target>, String> {
         self.call(|c| {
-            let mut st =
-                c.prepare(&format!("SELECT {TARGET_COLS} FROM portal_targets ORDER BY id"))?;
+            let mut st = c.prepare(&format!("SELECT {TARGET_COLS} FROM portal_targets ORDER BY id"))?;
             let rows = st.query_map([], row_to_target)?;
             rows.collect()
         })
@@ -367,12 +353,8 @@ impl Db {
 
     pub async fn get_target(&self, id: i64) -> Result<Option<Target>, String> {
         self.call(move |c| {
-            c.query_row(
-                &format!("SELECT {TARGET_COLS} FROM portal_targets WHERE id=?1"),
-                [id],
-                row_to_target,
-            )
-            .optional()
+            c.query_row(&format!("SELECT {TARGET_COLS} FROM portal_targets WHERE id=?1"), [id], row_to_target)
+                .optional()
         })
         .await
     }
@@ -457,16 +439,12 @@ impl Db {
     }
 
     pub async fn delete_target(&self, id: i64) -> Result<bool, String> {
-        self.call(move |c| Ok(c.execute("DELETE FROM portal_targets WHERE id=?1", [id])? > 0))
-            .await
+        self.call(move |c| Ok(c.execute("DELETE FROM portal_targets WHERE id=?1", [id])? > 0)).await
     }
 
     pub async fn set_git_status(&self, id: i64, status: &'static str) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET current_git_status=?1 WHERE id=?2",
-                params![status, id],
-            )?;
+            c.execute("UPDATE portal_targets SET current_git_status=?1 WHERE id=?2", params![status, id])?;
             Ok(())
         })
         .await
@@ -483,7 +461,15 @@ impl Db {
             let mut stored = 0;
             for p in &points {
                 let row = params![
-                    p.target_id, p.t, p.cpu, p.mem, p.mem_max, p.procs, p.latency, p.probes, p.probes_up
+                    p.target_id,
+                    p.t,
+                    p.cpu,
+                    p.mem,
+                    p.mem_max,
+                    p.procs,
+                    p.latency,
+                    p.probes,
+                    p.probes_up
                 ];
                 if st.execute(row).is_ok() {
                     stored += 1;
@@ -520,14 +506,12 @@ impl Db {
     }
 
     pub async fn prune_metric_points(&self, before: i64) -> Result<usize, String> {
-        self.call(move |c| c.execute("DELETE FROM metric_points WHERE t < ?1", [before]))
-            .await
+        self.call(move |c| c.execute("DELETE FROM metric_points WHERE t < ?1", [before])).await
     }
 
     pub async fn get_setting(&self, key: &'static str) -> Result<Option<String>, String> {
         self.call(move |c| {
-            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0))
-                .optional()
+            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()
         })
         .await
     }
@@ -550,10 +534,7 @@ impl Db {
 
     pub async fn set_auto_deploy(&self, id: i64, on: bool) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET auto_deploy=?1 WHERE id=?2",
-                params![on as i64, id],
-            )?;
+            c.execute("UPDATE portal_targets SET auto_deploy=?1 WHERE id=?2", params![on as i64, id])?;
             Ok(())
         })
         .await
@@ -561,10 +542,7 @@ impl Db {
 
     pub async fn set_webhook_token(&self, id: i64, token: Option<String>) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET webhook_token=?1 WHERE id=?2",
-                params![token, id],
-            )?;
+            c.execute("UPDATE portal_targets SET webhook_token=?1 WHERE id=?2", params![token, id])?;
             Ok(())
         })
         .await
@@ -578,8 +556,7 @@ impl Db {
         commit_sha: Option<String>,
         commit_message: Option<String>,
     ) -> Result<i64, String> {
-        self.start_run_labeled(target_id, triggered_by, commit_sha, commit_message, None)
-            .await
+        self.start_run_labeled(target_id, triggered_by, commit_sha, commit_message, None).await
     }
 
     pub async fn start_run_labeled(
@@ -857,13 +834,8 @@ mod tests {
     async fn history_cascades_on_target_delete() {
         let db = Db::open_in_memory().unwrap();
         let id = db.insert_target(input("a")).await.unwrap();
-        let run = db
-            .start_run(id, "MANUAL".into(), Some("abc123".into()), Some("fix".into()))
-            .await
-            .unwrap();
-        db.finish_run(run, "SUCCESS", Some(0), 12, "hello".into())
-            .await
-            .unwrap();
+        let run = db.start_run(id, "MANUAL".into(), Some("abc123".into()), Some("fix".into())).await.unwrap();
+        db.finish_run(run, "SUCCESS", Some(0), 12, "hello".into()).await.unwrap();
         db.insert_scan(id, 1, 2, "{}".into()).await.unwrap();
         let r = db.get_run(run).await.unwrap().unwrap();
         assert_eq!(r.status, "SUCCESS");

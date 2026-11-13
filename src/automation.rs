@@ -34,11 +34,8 @@ fn parse_field(field: &str, min: u32, max: u32, name: &str) -> Result<(u64, bool
     for part in field.split(',') {
         let (range, step) = match part.split_once('/') {
             Some((r, s)) => {
-                let step: u32 = s
-                    .parse()
-                    .ok()
-                    .filter(|s| *s > 0)
-                    .ok_or_else(|| format!("{name}: invalid step '{s}'"))?;
+                let step: u32 =
+                    s.parse().ok().filter(|s| *s > 0).ok_or_else(|| format!("{name}: invalid step '{s}'"))?;
                 (r, step)
             }
             None => (part, 1),
@@ -84,9 +81,7 @@ impl Cron {
         };
         let fields: Vec<&str> = expr.split_whitespace().collect();
         if fields.len() != 5 {
-            return Err(
-                "a schedule needs five fields: minute hour day-of-month month day-of-week".into(),
-            );
+            return Err("a schedule needs five fields: minute hour day-of-month month day-of-week".into());
         }
         let (minutes, _) = parse_field(fields[0], 0, 59, "minute")?;
         let (hours, _) = parse_field(fields[1], 0, 23, "hour")?;
@@ -96,15 +91,7 @@ impl Cron {
         if weekdays & (1 << 7) != 0 {
             weekdays |= 1; // 7 is Sunday too
         }
-        Ok(Self {
-            minutes,
-            hours,
-            days,
-            months,
-            weekdays,
-            days_restricted,
-            weekdays_restricted,
-        })
+        Ok(Self { minutes, hours, days, months, weekdays, days_restricted, weekdays_restricted })
     }
 
     fn day_matches(&self, month: u32, day: u32, weekday: u32) -> bool {
@@ -128,13 +115,7 @@ impl Cron {
     }
 
     fn matches_time(&self, t: &DateTime<Local>) -> bool {
-        self.matches(
-            t.minute(),
-            t.hour(),
-            t.day(),
-            t.month(),
-            t.weekday().num_days_from_sunday(),
-        )
+        self.matches(t.minute(), t.hour(), t.day(), t.month(), t.weekday().num_days_from_sunday())
     }
 
     /// The first matching minute strictly after `after`, within four years.
@@ -205,7 +186,8 @@ pub async fn pull(state: &Arc<AppState>, target: &Target) -> Result<git::PullOut
         .await
         .map_err(|e| format!("git worker failed: {e}"))??;
     if outcome.updated {
-        let short = |s: &Option<String>| s.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("?").to_string();
+        let short =
+            |s: &Option<String>| s.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("?").to_string();
         state.activity(
             "ok",
             "git",
@@ -219,14 +201,8 @@ pub async fn pull(state: &Arc<AppState>, target: &Target) -> Result<git::PullOut
             ),
         );
     }
-    git::refresh_target(
-        state,
-        target.id,
-        target.working_directory.clone(),
-        target.git_branch.clone(),
-        false,
-    )
-    .await;
+    git::refresh_target(state, target.id, target.working_directory.clone(), target.git_branch.clone(), false)
+        .await;
     Ok(outcome)
 }
 
@@ -243,9 +219,7 @@ pub async fn deploy(
         return Err("target is already running".into());
     }
     if pull_first && Path::new(&target.working_directory).join(".git").exists() {
-        pull(state, target)
-            .await
-            .map_err(|e| format!("git pull failed: {e}"))?;
+        pull(state, target).await.map_err(|e| format!("git pull failed: {e}"))?;
     }
     if is_service && is_running(state, target.id).await {
         runner::restart(state, target, trigger).await
@@ -262,11 +236,8 @@ pub async fn auto_deploy(state: &Arc<AppState>, target: &Target, info: &GitInfo)
         return;
     }
     let Some(remote) = info.remote_head.clone() else { return };
-    let already_failed = state
-        .auto_deploy_failed
-        .lock()
-        .map(|m| m.get(&target.id) == Some(&remote))
-        .unwrap_or(false);
+    let already_failed =
+        state.auto_deploy_failed.lock().map(|m| m.get(&target.id) == Some(&remote)).unwrap_or(false);
     if already_failed {
         return;
     }
@@ -278,22 +249,14 @@ pub async fn auto_deploy(state: &Arc<AppState>, target: &Target, info: &GitInfo)
             if let Ok(mut m) = state.auto_deploy_failed.lock() {
                 m.remove(&target.id);
             }
-            log(&format!(
-                "auto-deploy of '{}' started run {run_id} for {remote}",
-                target.name
-            ));
+            log(&format!("auto-deploy of '{}' started run {run_id} for {remote}", target.name));
         }
         Err(e) => {
             if let Ok(mut m) = state.auto_deploy_failed.lock() {
                 m.insert(target.id, remote);
             }
             log(&format!("auto-deploy of '{}' failed: {e}", target.name));
-            state.activity(
-                "error",
-                "deploy",
-                Some(target.id),
-                format!("Auto-deploy skipped: {e}"),
-            );
+            state.activity("error", "deploy", Some(target.id), format!("Auto-deploy skipped: {e}"));
         }
     }
 }
@@ -305,11 +268,8 @@ pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Resu
     if !is_service && is_running(state, target.id).await {
         return Err("target is already running".into());
     }
-    let (dir, branch, wanted) = (
-        target.working_directory.clone(),
-        target.git_branch.clone(),
-        sha.to_string(),
-    );
+    let (dir, branch, wanted) =
+        (target.working_directory.clone(), target.git_branch.clone(), sha.to_string());
     let outcome = tokio::task::spawn_blocking(move || git::rollback_to(Path::new(&dir), &branch, &wanted))
         .await
         .map_err(|e| format!("git worker failed: {e}"))?
@@ -330,14 +290,8 @@ pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Resu
             if target.auto_deploy { ". Auto-deploy was switched off." } else { "" }
         ),
     );
-    git::refresh_target(
-        state,
-        target.id,
-        target.working_directory.clone(),
-        target.git_branch.clone(),
-        false,
-    )
-    .await;
+    git::refresh_target(state, target.id, target.working_directory.clone(), target.git_branch.clone(), false)
+        .await;
     if is_service && is_running(state, target.id).await {
         runner::restart(state, target, "ROLLBACK").await
     } else {
@@ -349,13 +303,8 @@ pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Resu
 
 /// Targets of a project in start order (then by id).
 pub async fn project_members(state: &Arc<AppState>, project: &str) -> Result<Vec<Target>, String> {
-    let mut members: Vec<Target> = state
-        .db
-        .list_targets()
-        .await?
-        .into_iter()
-        .filter(|t| t.project == project)
-        .collect();
+    let mut members: Vec<Target> =
+        state.db.list_targets().await?.into_iter().filter(|t| t.project == project).collect();
     members.sort_by_key(|t| (t.start_order, t.id));
     Ok(members)
 }
@@ -369,11 +318,8 @@ async fn last_run_succeeded(state: &Arc<AppState>, target_id: i64, run_id: i64) 
 /// a health URL) answer its probe.
 async fn wait_until_ready(state: &Arc<AppState>, target: &Target, run_id: i64) -> Result<(), String> {
     let is_service = target.run_mode == "SERVICE";
-    let limit = if is_service {
-        Duration::from_secs(90)
-    } else {
-        Duration::from_secs(target.timeout_secs + 15)
-    };
+    let limit =
+        if is_service { Duration::from_secs(90) } else { Duration::from_secs(target.timeout_secs + 15) };
     let started = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -465,11 +411,7 @@ pub fn start_project(state: &Arc<AppState>, project: String) -> Result<(), Strin
                 format!("Project '{project}': {started} process(es) started in order"),
             ),
         }
-        state
-            .starting_projects
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&project);
+        state.starting_projects.lock().unwrap_or_else(|p| p.into_inner()).remove(&project);
     });
     Ok(())
 }
@@ -595,8 +537,19 @@ mod tests {
         assert_eq!(Cron::parse("@daily").unwrap(), Cron::parse("0 0 * * *").unwrap());
         assert!(Cron::parse("10/20 * * * *").unwrap().matches(50, 1, 1, 1, 1));
 
-        for bad in ["", "* * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *",
-            "*/0 * * * *", "5-1 * * * *", "a * * * *", "* * * * 8", "@yearlyish"] {
+        for bad in [
+            "",
+            "* * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "* * 0 * *",
+            "* * * 13 *",
+            "*/0 * * * *",
+            "5-1 * * * *",
+            "a * * * *",
+            "* * * * 8",
+            "@yearlyish",
+        ] {
             assert!(Cron::parse(bad).is_err(), "{bad:?} should be rejected");
         }
     }
