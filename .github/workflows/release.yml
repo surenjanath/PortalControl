@@ -50,10 +50,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build
+      - name: Test
         run: |
           rustup update stable
-          cargo build --release --locked
+          cargo test --release --locked
+      - name: Build
+        run: cargo build --release --locked
       - name: Package
         shell: pwsh
         run: |
@@ -78,6 +80,7 @@ jobs:
         run: |
           rustup update stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo test --release --locked
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
       - name: Package

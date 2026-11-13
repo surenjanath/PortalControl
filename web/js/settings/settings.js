@@ -6,7 +6,7 @@
 // The sections live in the other files of this folder.
 const SET = {};
 const SETTINGS_SUBS = [["access", "Access"], ["network", "Network"], ["startup", "Start at Login"], ["notifications", "Notifications"], ["transfer", "Export and Import"],
-  ["manager", "Manager"], ["resources", "Resources"], ["log", "Manager Log"], ["danger", "Danger Zone"]];
+  ["manager", "Manager"], ["resources", "Resources"], ["tools", "Scanner Tools"], ["log", "Manager Log"], ["danger", "Danger Zone"]];
 
 function settingsView(sub) {
   sub = sub || "access";

@@ -48,9 +48,7 @@ fn checked_name(file: &str) -> Result<&str, String> {
         && file.len() <= 200
         && file.ends_with(&format!(".{EXT}"))
         && !file.starts_with('.')
-        && file
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if ok {
         Ok(file)
     } else {
@@ -86,14 +84,10 @@ pub fn list(data_dir: &Path, target_id: i64) -> Vec<BackupInfo> {
 
 /// Take a snapshot now and prune old ones. Blocking: call off the runtime.
 pub fn create(data_dir: &Path, target: &Target) -> Result<BackupInfo, String> {
-    let db_file = target
-        .db_file
-        .as_deref()
-        .ok_or("no database file is configured for this target")?;
+    let db_file = target.db_file.as_deref().ok_or("no database file is configured for this target")?;
     let source = resolve_db(&target.working_directory, db_file)?;
     let dest_dir = dir_for(data_dir, target.id);
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
 
     let stem: String = source
         .file_stem()
@@ -151,10 +145,7 @@ pub fn restore(data_dir: &Path, target: &Target, file: &str) -> Result<BackupInf
     if !backup.is_file() {
         return Err("backup not found".into());
     }
-    let db_file = target
-        .db_file
-        .as_deref()
-        .ok_or("no database file is configured for this target")?;
+    let db_file = target.db_file.as_deref().ok_or("no database file is configured for this target")?;
     let live = resolve_db(&target.working_directory, db_file)?;
     let safety = create(data_dir, target)
         .map_err(|e| format!("could not snapshot the current database first: {e}"))?;
@@ -222,6 +213,7 @@ mod tests {
             backup_on_deploy: true,
             start_order: 0,
             python_env: None,
+            webhook_secret: None,
         }
     }
 
@@ -248,10 +240,7 @@ mod tests {
         assert!(first.size > 0 && first.file.starts_with("db-") && first.file.ends_with(".sqlite3"));
         assert_eq!(rows(&dir_for(data.path(), 7).join(&first.file)), vec!["first"]);
 
-        Connection::open(&db)
-            .unwrap()
-            .execute("INSERT INTO claims (name) VALUES ('second')", [])
-            .unwrap();
+        Connection::open(&db).unwrap().execute("INSERT INTO claims (name) VALUES ('second')", []).unwrap();
         assert_eq!(rows(&db), vec!["first", "second"]);
 
         // Restoring brings back the old content and keeps a snapshot of what was replaced.

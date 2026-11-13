@@ -34,7 +34,10 @@ fn stamp() {
     };
     if let Some(commit) = git(&["rev-parse", "--short", "HEAD"]).filter(|c| !c.is_empty()) {
         let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-        println!("cargo:rustc-env=PORTALCONTROL_COMMIT={commit}{}", if dirty { " + local changes" } else { "" });
+        println!(
+            "cargo:rustc-env=PORTALCONTROL_COMMIT={commit}{}",
+            if dirty { " + local changes" } else { "" }
+        );
     }
     if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         println!("cargo:rustc-env=PORTALCONTROL_BUILT={}", now.as_secs());

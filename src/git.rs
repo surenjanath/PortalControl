@@ -4,8 +4,8 @@
 use crate::state::AppState;
 use crate::util::{log, now_secs};
 use git2::{
-    build::CheckoutBuilder, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository,
-    Status, StatusOptions,
+    build::CheckoutBuilder, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository, Status,
+    StatusOptions,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -154,14 +154,7 @@ pub fn inspect(dir: &Path, branch: &str) -> GitInfo {
         Ok(r) => r,
         Err(e) => {
             let missing = e.code() == git2::ErrorCode::NotFound;
-            return GitInfo::not_repo(
-                branch,
-                if missing {
-                    None
-                } else {
-                    Some(e.message().to_string())
-                },
-            );
+            return GitInfo::not_repo(branch, if missing { None } else { Some(e.message().to_string()) });
         }
     };
 
@@ -179,14 +172,10 @@ pub fn inspect(dir: &Path, branch: &str) -> GitInfo {
     }
 
     let head_ref = repo.head().ok();
-    info.checked_out_branch = head_ref
-        .as_ref()
-        .filter(|h| h.is_branch())
-        .and_then(|h| h.shorthand().map(str::to_string));
+    info.checked_out_branch =
+        head_ref.as_ref().filter(|h| h.is_branch()).and_then(|h| h.shorthand().map(str::to_string));
     let head = head_ref.and_then(|h| h.target());
-    let remote = repo
-        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
-        .ok();
+    let remote = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")).ok();
     info.head = head.map(|o| o.to_string());
     info.remote_head = remote.map(|o| o.to_string());
     if let Some(c) = head.and_then(|h| commit_info(&repo, h, "synced")) {
@@ -194,13 +183,8 @@ pub fn inspect(dir: &Path, branch: &str) -> GitInfo {
         info.head_author = Some(c.author);
         info.head_time = Some(c.time);
     }
-    info.remote_summary = remote
-        .and_then(|r| commit_info(&repo, r, "synced"))
-        .map(|c| c.summary);
-    info.remote_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().map(strip_credentials));
+    info.remote_summary = remote.and_then(|r| commit_info(&repo, r, "synced")).map(|c| c.summary);
+    info.remote_url = repo.find_remote("origin").ok().and_then(|r| r.url().map(strip_credentials));
 
     if let (Some(h), Some(r)) = (head, remote) {
         if h != r {
@@ -228,9 +212,7 @@ pub fn inspect(dir: &Path, branch: &str) -> GitInfo {
 /// `refs/remotes/*` and FETCH_HEAD change; the working tree is untouched.
 pub fn fetch(dir: &Path) -> Result<(), String> {
     let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
-    let mut remote = repo
-        .find_remote("origin")
-        .map_err(|_| "no 'origin' remote configured".to_string())?;
+    let mut remote = repo.find_remote("origin").map_err(|_| "no 'origin' remote configured".to_string())?;
     let config = repo.config().map_err(|e| e.message().to_string())?;
 
     let mut attempts = 0;
@@ -252,9 +234,7 @@ pub fn fetch(dir: &Path) -> Result<(), String> {
     });
     let mut options = FetchOptions::new();
     options.remote_callbacks(callbacks);
-    remote
-        .fetch(&[] as &[&str], Some(&mut options), None)
-        .map_err(|e| e.message().to_string())
+    remote.fetch(&[] as &[&str], Some(&mut options), None).map_err(|e| e.message().to_string())
 }
 
 /// Recent history: commits waiting on `origin/<branch>` first, then the
@@ -263,9 +243,7 @@ pub fn recent_commits(dir: &Path, branch: &str, limit: usize) -> Result<Vec<Comm
     let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
     let err = |e: git2::Error| e.message().to_string();
     let head = repo.head().ok().and_then(|h| h.target());
-    let remote = repo
-        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
-        .ok();
+    let remote = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")).ok();
     let mut out = Vec::new();
 
     if let (Some(h), Some(r)) = (head, remote) {
@@ -328,16 +306,11 @@ pub fn changed_files(dir: &Path, limit: usize) -> Result<Vec<ChangedFile>, Strin
         .recurse_untracked_dirs(false)
         .include_ignored(false)
         .exclude_submodules(true);
-    let statuses = repo
-        .statuses(Some(&mut opts))
-        .map_err(|e| e.message().to_string())?;
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.message().to_string())?;
     Ok(statuses
         .iter()
         .take(limit)
-        .map(|e| ChangedFile {
-            path: e.path().unwrap_or("?").to_string(),
-            status: status_label(e.status()),
-        })
+        .map(|e| ChangedFile { path: e.path().unwrap_or("?").to_string(), status: status_label(e.status()) })
         .collect())
 }
 
@@ -378,9 +351,7 @@ pub fn pull_ff(dir: &Path, branch: &str) -> Result<PullOutcome, String> {
     }
 
     let mut opts = StatusOptions::new();
-    opts.include_untracked(false)
-        .include_ignored(false)
-        .exclude_submodules(true);
+    opts.include_untracked(false).include_ignored(false).exclude_submodules(true);
     let modified = repo.statuses(Some(&mut opts)).map_err(err)?.len();
     if modified > 0 {
         return Err(format!(
@@ -416,8 +387,7 @@ pub fn rollback_to(dir: &Path, branch: &str, sha: &str) -> Result<PullOutcome, S
     let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
     let err = |e: git2::Error| e.message().to_string();
     let target = Oid::from_str(sha.trim()).map_err(|_| "that is not a valid commit id".to_string())?;
-    repo.find_commit(target)
-        .map_err(|_| "that commit does not exist in this repository".to_string())?;
+    repo.find_commit(target).map_err(|_| "that commit does not exist in this repository".to_string())?;
 
     let head = repo.head().map_err(err)?;
     if !head.is_branch() || head.shorthand() != Some(branch) {
@@ -438,7 +408,8 @@ pub fn rollback_to(dir: &Path, branch: &str, sha: &str) -> Result<PullOutcome, S
     let remote_oid = repo
         .refname_to_id(&format!("refs/remotes/origin/{branch}"))
         .map_err(|_| format!("origin has no branch '{branch}', so a rollback could not be undone"))?;
-    let on_origin = |oid: Oid| oid == remote_oid || repo.graph_descendant_of(remote_oid, oid).unwrap_or(false);
+    let on_origin =
+        |oid: Oid| oid == remote_oid || repo.graph_descendant_of(remote_oid, oid).unwrap_or(false);
     if !on_origin(head_oid) {
         return Err("the local branch has commits that are not on origin; a rollback would lose them".into());
     }
@@ -447,9 +418,7 @@ pub fn rollback_to(dir: &Path, branch: &str, sha: &str) -> Result<PullOutcome, S
     }
 
     let mut opts = StatusOptions::new();
-    opts.include_untracked(false)
-        .include_ignored(false)
-        .exclude_submodules(true);
+    opts.include_untracked(false).include_ignored(false).exclude_submodules(true);
     let modified = repo.statuses(Some(&mut opts)).map_err(err)?.len();
     if modified > 0 {
         return Err(format!(
@@ -484,11 +453,7 @@ pub async fn refresh_target(
     branch: String,
     do_fetch: bool,
 ) -> GitInfo {
-    let previous = state
-        .git
-        .lock()
-        .ok()
-        .and_then(|g| g.get(&target_id).cloned());
+    let previous = state.git.lock().ok().and_then(|g| g.get(&target_id).cloned());
 
     let joined = tokio::task::spawn_blocking(move || {
         let path = Path::new(&dir);
@@ -502,10 +467,7 @@ pub async fn refresh_target(
 
     let (mut info, fetch_result) = match joined {
         Ok(v) => v,
-        Err(e) => (
-            GitInfo::not_repo("", Some(format!("git worker failed: {e}"))),
-            None,
-        ),
+        Err(e) => (GitInfo::not_repo("", Some(format!("git worker failed: {e}"))), None),
     };
 
     // Carry fetch bookkeeping across local-only inspections.
@@ -552,10 +514,7 @@ pub async fn refresh_target(
                     "{} new commit(s) available on origin/{}{}",
                     info.behind,
                     info.tracked_branch,
-                    info.remote_summary
-                        .as_deref()
-                        .map(|s| format!(": {s}"))
-                        .unwrap_or_default()
+                    info.remote_summary.as_deref().map(|s| format!(": {s}")).unwrap_or_default()
                 ),
             );
         } else if prev.status != info.status {
@@ -588,7 +547,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
         let ticks_per_fetch = (FETCH_INTERVAL.as_secs() / INSPECT_INTERVAL.as_secs()).max(1);
         let mut tick: u64 = 0;
         loop {
-            let do_fetch = tick % ticks_per_fetch == 0;
+            let do_fetch = tick.is_multiple_of(ticks_per_fetch);
             if let Ok(targets) = state.db.list_targets().await {
                 let ids: Vec<i64> = targets.iter().map(|t| t.id).collect();
                 for t in targets {
@@ -628,12 +587,8 @@ mod tests {
         index.write().unwrap();
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let sig = Signature::now("Tester", "tester@example.com").unwrap();
-        let parents: Vec<git2::Commit> = repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok())
-            .into_iter()
-            .collect();
+        let parents: Vec<git2::Commit> =
+            repo.head().ok().and_then(|h| h.peel_to_commit().ok()).into_iter().collect();
         let refs: Vec<&git2::Commit> = parents.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &refs).unwrap()
     }

@@ -28,11 +28,13 @@ SET.notifications = () => {
   return { el: c, update: paint };
 };
 
-SET.transfer = () =>
-        h("div", { class: "box rowf" }, h("div", { class: "muted small", style: "flex:1;min-width:240px" }, "Save every target's configuration (including environment variables, but not history, snapshots or webhook tokens) to a JSON file, or load one on another machine. On import, targets that are already registered are skipped and ones whose folder does not exist here are reported."),
+SET.transfer = () => {
+        const withValues = h("input", { type: "checkbox" });
+        return h("div", { class: "box rowf" }, h("div", { class: "muted small", style: "flex:1;min-width:240px" }, "Save every target's configuration (not history, snapshots or webhook tokens) to a JSON file, or load one on another machine. On import, targets that are already registered are skipped and ones whose folder does not exist here are reported.",
+            h("label", { class: "rowf", style: "gap:6px;margin-top:8px;color:var(--text)" }, withValues, "Include environment variable values (passwords, API keys). Off: only their names are saved.")),
           btn("Export", async () => {
             try {
-              const data = await api("GET", "/api/export");
+              const data = await api("GET", "/api/export" + (withValues.checked ? "?env_values=1" : ""));
               const a = h("a", { href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })), download: "portalcontrol-targets.json" });
               document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
             } catch (e) { toast(e.message, true); }
@@ -52,3 +54,4 @@ SET.transfer = () =>
             };
             document.body.append(pick); pick.click();
           }));
+};

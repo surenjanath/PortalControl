@@ -11,7 +11,8 @@ function targetCard(t) {
       t.auto_deploy ? h("span", { class: "tag acc" }, "auto-deploy") : null,
       t.autostart ? h("span", { class: "tag" }, "autostart") : null),
     h("div", { class: "card-foot" },
-      t.health_url ? [strip(t, 24), h("span", {}, t.health ? (t.health.status === "DOWN" ? "down" : t.health.latency_ms + " ms") : "checking")] : h("span", { class: "dim" }, "no health probe"),
+      t.health_url ? [strip(t, 24), h("span", {}, t.health ? (t.health.status === "DOWN" ? "down" : t.health.latency_ms + " ms") : "checking"),
+        t.uptime_pct !== null && t.uptime_pct !== undefined ? h("span", { class: t.uptime_pct < 90 ? "t-err" : t.uptime_pct < 99 ? "t-warn" : "dim", title: "Share of recent health probes that answered" }, t.uptime_pct + "% up") : null] : h("span", { class: "dim" }, "no health probe"),
       m ? h("span", {}, m.cpu.toFixed(1) + "% CPU \u00b7 " + fmtBytes(m.mem)) : null,
       h("span", { class: "right" }, t.running ? "up " + fmtUp(t.running.uptime_secs) : t.last_run ? ["last run ", when(parseUTC(t.last_run.executed_at))] : "never run")));
 }
@@ -30,6 +31,38 @@ function byProject(list) {
   list.forEach((t) => { if (!groups.has(t.project)) groups.set(t.project, []); groups.get(t.project).push(t); });
   return [...groups.entries()].sort((x, y) => x[0].localeCompare(y[0]));
 }
+// What needs a person, most urgent first: failures, findings, unhealthy
+// services, uncommitted changes, updates. The PDF report (report.rs) uses the
+// same rules.
+function attentionItems(list) {
+  const out = [];
+  list.forEach((t) => {
+    const st = tStatus(t), go = "#/target/" + t.id;
+    if (st.cls === "err") out.push({ rank: 0, cls: "err", t, text: st.text.toLowerCase(), href: go + "/logs", action: "Open logs" });
+    else if (st.text === "Running (unhealthy)") out.push({ rank: 1, cls: "warn", t, text: "running, but its health check does not answer", href: go + "/metrics", action: "Metrics" });
+    if (t.scan && t.scan.critical_issues_found + t.scan.vulnerable_packages_found > 0)
+      out.push({ rank: t.scan.critical_issues_found ? 0 : 2, cls: t.scan.critical_issues_found ? "err" : "warn", t,
+        text: t.scan.critical_issues_found + " critical issue(s), " + t.scan.vulnerable_packages_found + " vulnerable package(s)", href: go + "/security", action: "Security" });
+    if (t.git && t.git.status === "DIRTY") out.push({ rank: 2, cls: "warn", t, text: t.git.dirty_files + " uncommitted change(s) in the working tree", href: go + "/configuration/git", action: "Git" });
+    if (t.git && t.git.status === "UPDATES_AVAILABLE") out.push({ rank: 3, cls: "info", t, text: t.git.behind + " new commit(s) on origin, ready to pull", href: go + "/configuration/git", action: "Review & pull" });
+    if (t.uptime_pct !== null && t.uptime_pct !== undefined && t.uptime_pct < 90 && t.running) out.push({ rank: 2, cls: "warn", t, text: "answered only " + t.uptime_pct + "% of recent health probes", href: go + "/metrics", action: "Metrics" });
+  });
+  return out.sort((a, b) => a.rank - b.rank);
+}
+function attentionPanel(list) {
+  const items = attentionItems(list);
+  if (!list.length) return null;
+  if (!items.length) return h("div", { class: "attn clear" }, h("span", { class: "dot ok" }), h("b", {}, "All clear."), h("span", { class: "muted" }, " Everything is running, healthy, up to date and clean."));
+  const shown = items.slice(0, 6);
+  return h("div", { class: "attn box" },
+    h("div", { class: "attn-h" }, h("b", {}, "Needs attention"), h("span", { class: "dim small" }, " " + items.length + " item" + (items.length === 1 ? "" : "s"))),
+    shown.map((x) => h("div", { class: "attn-row" }, h("span", { class: "dot " + x.cls }),
+      h("span", { class: "grow" }, h("a", { href: "#/target/" + x.t.id, class: "nm" }, x.t.name), h("span", { class: "muted" }, " \u2014 " + x.text)),
+      h("a", { class: "btn sm ghost", href: x.href }, x.action))),
+    items.length > shown.length ? h("div", { class: "dim small", style: "padding:6px 2px 0" }, "+ " + (items.length - shown.length) + " more \u2014 see the PDF report for the full list") : null);
+}
+const reportLink = (href, label, cls) => h("a", { class: "btn " + (cls || ""), href, download: "", title: "Download a PDF report" }, icon("download"), label);
+
 function dashboardView() {
   let runs = [];
   const def = { key: "dashboard" };
@@ -41,25 +74,30 @@ function dashboardView() {
     const healthy = probed.filter((t) => t.health && t.health.status !== "DOWN").length;
     const updates = targets.filter((t) => t.git && t.git.is_repo && t.git.behind > 0).length;
     const failed = targets.filter((t) => tStatus(t).cls === "err").length;
-    const issues = targets.reduce((n, t) => n + (t.scan ? t.scan.critical_issues_found + t.scan.vulnerable_packages_found : 0), 0);
+    const critical = targets.reduce((n, t) => n + (t.scan ? t.scan.critical_issues_found : 0), 0);
+    const vulnerable = targets.reduce((n, t) => n + (t.scan ? t.scan.vulnerable_packages_found : 0), 0);
+    const scanned = targets.filter((t) => t.scan).length;
     const hl = sys && sys.host && sys.host.latest;
     const memPct = hl && sys.host.mem_total ? (hl.mem_used / sys.host.mem_total) * 100 : 0;
     c.replaceChildren(
       h("div", { class: "head" }, h("div", { class: "grow" }, h("h1", {}, "Dashboard"), h("p", { class: "sub" }, "Deployments, health and Git state of every registered project on this machine.")),
-        h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target")),
+        h("div", { class: "rowf" }, targets.length ? reportLink("/api/reports/overall.pdf", "PDF report") : null, h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target"))),
       h("div", { class: "grid g-tiles" },
         tile("Targets", [running, h("small", {}, " / " + targets.length + " running")], targets.filter((t) => t.run_mode === "SERVICE").length + " service(s), " + targets.filter((t) => t.run_mode !== "SERVICE").length + " task(s)"),
         tile("Health", probed.length ? [healthy, h("small", {}, " / " + probed.length + " reachable")] : "-", probed.length ? "probed every 15 s" : "no health URLs configured", probed.length && healthy < probed.length ? "err" : null),
         tile("Updates available", updates, updates ? "new commits on origin" : "all repositories current", updates ? "info" : null),
         tile("Failing", failed, failed ? "last run failed or service exited" : "nothing is failing", failed ? "err" : null),
-        tile("Security findings", issues, targets.some((t) => t.scan) ? "critical issues + vulnerable packages" : "no scans run yet", issues ? "warn" : null)),
+        tile("Critical issues", scanned ? [critical, h("small", {}, " + " + vulnerable + " pkg")] : "-", scanned ? vulnerable + " vulnerable package(s) \u00b7 " + scanned + " of " + targets.length + " scanned" : "no scans run yet", critical ? "err" : vulnerable ? "warn" : null)),
+      attentionPanel(targets),
       hl ? h("div", { class: "grid g-tiles", style: "margin-top:12px" },
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "Host CPU"), h("div", { class: "val" }, hl.cpu.toFixed(0), h("small", {}, " %")), h("div", { class: "bar" }, h("i", { style: "width:" + Math.min(100, hl.cpu) + "%" })), h("div", { class: "note" }, sys.host.cpus + " logical cores")),
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "Host memory"), h("div", { class: "val" }, fmtBytes(hl.mem_used), h("small", {}, " / " + fmtBytes(sys.host.mem_total))), h("div", { class: "bar" }, h("i", { style: "width:" + memPct + "%" })), h("div", { class: "note" }, memPct.toFixed(0) + "% in use")),
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "PortalControl"), h("div", { class: "val" }, fmtBytes(hl.manager_mem)), h("div", { class: "note" }, "manager memory \u00b7 up " + fmtUp(sys.uptime_secs)))) : null,
       targets.length ? byProject(targets).map(([name, list]) => [
-        h("h2", {}, h("a", { class: "plink", href: projHref(name) }, name), h("span", { class: "dim small", style: "font-weight:400" }, "  " + list.length + " process" + (list.length === 1 ? "" : "es")),
-          h("a", { class: "dim small", href: projHref(name), style: "font-weight:400;margin-left:10px" }, "terminals")),
+        h("h2", { class: "proj-h" }, h("a", { class: "plink", href: projHref(name) }, name), h("span", { class: "dim small", style: "font-weight:400" }, "  " + list.filter((t) => t.running).length + " of " + list.length + " running"),
+          list.some((t) => tStatus(t).cls === "err") ? h("span", { class: "tag err", style: "margin-left:8px" }, list.filter((t) => tStatus(t).cls === "err").length + " failing") : null,
+          h("a", { class: "dim small", href: projHref(name), style: "font-weight:400;margin-left:10px" }, "terminals"),
+          h("a", { class: "dim small", href: "/api/reports/project/" + encodeURIComponent(name), download: "", style: "font-weight:400;margin-left:10px", title: "Download this project's PDF report" }, "PDF report")),
         h("div", { class: "grid g-cards" }, list.map(targetCard))])
         : [h("h2", {}, "Projects"), empty("No targets yet", "Point PortalControl at a project folder and its deploy script to get started.", h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target"))],
       h("div", { class: "grid g2", style: "margin-top:8px" },

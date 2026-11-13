@@ -51,10 +51,7 @@ impl LogTail {
     pub fn joined(&self) -> String {
         let mut out = String::with_capacity(self.bytes + 64);
         if self.dropped > 0 {
-            out.push_str(&format!(
-                "[portalcontrol] ... {} earlier line(s) dropped ...\n",
-                self.dropped
-            ));
+            out.push_str(&format!("[portalcontrol] ... {} earlier line(s) dropped ...\n", self.dropped));
         }
         for l in &self.lines {
             out.push_str(l);
@@ -119,6 +116,9 @@ pub struct AppState {
     pub clients: Mutex<HashMap<std::net::IpAddr, crate::netcfg::ClientSeen>>,
     /// Set when the manager should start again after it has stopped.
     pub restart: std::sync::atomic::AtomicBool,
+    /// Held while the scanner tools are installed or repaired (`toolbox.rs`),
+    /// with the outcome of the last attempt.
+    pub tools: tokio::sync::Mutex<crate::toolbox::LastInstall>,
 }
 
 impl AppState {
@@ -151,6 +151,7 @@ impl AppState {
             net_limits: Mutex::new(crate::netcfg::Limits::default()),
             clients: Mutex::new(HashMap::new()),
             restart: std::sync::atomic::AtomicBool::new(false),
+            tools: tokio::sync::Mutex::new(crate::toolbox::LastInstall::default()),
         })
     }
 
@@ -161,13 +162,7 @@ impl AppState {
 
     /// Record a notable event in the activity feed and push it to dashboards.
     /// `level` is one of `info`, `ok`, `warn`, `error`.
-    pub fn activity(
-        &self,
-        level: &str,
-        kind: &str,
-        target_id: Option<i64>,
-        message: impl Into<String>,
-    ) {
+    pub fn activity(&self, level: &str, kind: &str, target_id: Option<i64>, message: impl Into<String>) {
         let event = json!({
             "type": "activity",
             "id": self.activity_seq.fetch_add(1, Ordering::Relaxed),
@@ -233,10 +228,7 @@ mod tests {
 
     #[test]
     fn activity_feed_is_bounded_and_ordered() {
-        let state = AppState::new(
-            crate::db::Db::open_in_memory().unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        );
+        let state = AppState::new(crate::db::Db::open_in_memory().unwrap(), "127.0.0.1:0".parse().unwrap());
         for i in 0..(ACTIVITY_MAX + 10) {
             state.activity("info", "test", Some(1), format!("event {i}"));
         }

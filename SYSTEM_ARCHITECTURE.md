@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.3.0 |
-| Application version | 0.8.0 (`Cargo.toml`) |
+| Document version | 1.4.0 |
+| Application version | 0.9.0 (`Cargo.toml`) |
 | Last updated | 2026-11-12 |
 
 ## 1. System Overview
@@ -55,7 +55,7 @@ files; it creates its data folder on first start.
  │  (dashboard, loopback/LAN/     │                 │ open / stop / status  │
  │   Tailscale only)              ▼                 ▼                       │
  │                    ┌─────────────────────────────────────┐               │
- │  portalcontrol     │  HTTP API + embedded dashboard      │  api.rs       │
+ │  portalcontrol     │  HTTP API + embedded dashboard      │  api/         │
  │  stop / CLI ─────► │  (axum, guards: host, origin, auth) │  auth.rs      │
  │                    ├─────────────────────────────────────┤  net.rs       │
  │                    │  Shared state (AppState)            │  state.rs     │
@@ -96,16 +96,20 @@ files; it creates its data folder on first start.
 | HTTPS | rustls (ring provider) with axum-server | Serves the dashboard's network address over TLS, HTTP/1.1 only. Not used on the local address |
 | Scheduling | Built-in cron parser, chrono for local time | `automation.rs` |
 | Password hashing | pbkdf2, sha2, getrandom | Salted PBKDF2-HMAC-SHA256 |
+| Webhook signatures | hmac (with sha2) | Verifies GitHub / Gitea `sha256=` signatures in constant time (`webhook.rs`) |
+| Encryption at rest | ring (ChaCha20-Poly1305) | Seals stored secrets (`secrets.rs`); ring is already linked in as the rustls provider |
 | Tray icon | tray-icon and tao | Windows and macOS only; Linux builds have none |
 | Windows resources | winresource (build dependency) | Icon, version details and a manifest (DPI awareness, common controls 6) in the exe. The build fails without it, because the About window needs those controls |
 | Windows system calls | windows-sys | Attaching to the parent terminal and the native About window (`TaskDialogIndirect`) |
 | Login autostart | Registry Run key (winreg), launchd agent, systemd user unit | `autostart.rs` |
-| External tools, optional | `bandit`, `pip-audit` | Only for security scans; found on PATH |
+| External tools, optional | `bandit`, `pip-audit` | Only for security scans. PortalControl installs them itself into `<data>/tools/venv` when a scan finds them missing or broken (`toolbox.rs`); a copy on PATH is used when it has none. Installing needs Python 3 and PyPI |
+| PDF | Built-in writer (`pdf.rs`) | Reports use the standard Helvetica fonts every PDF reader has, so nothing is embedded and no PDF library is linked |
 | Deployment | Copy the executable | Windows build links the C runtime statically (`.cargo/config.toml`). macOS: `scripts/make-macos-app.sh` builds `PortalControl.app` |
 | Supported systems | Windows x64, macOS, Linux | Built on the system it runs on |
 
-There are no third-party web APIs. The only outbound network traffic is Git fetches and
-health probes that the user configured.
+There are no third-party web APIs. Outbound network traffic is Git fetches and health
+probes that the user configured, and PyPI when the scanner tools are installed or
+updated (`toolbox.rs`), which happens only when a scan needs them or from Settings.
 
 ## 3. Core Services & Modules
 
@@ -119,9 +123,12 @@ health probes that the user configured.
 | `src/` | The program (see 3.2) |
 | `web/` | The dashboard (see 3.3) |
 | `assets/` | `icon.ico`, `icon.icns`, `tray.rgba`, `tray-mac.rgba`; all drawn by `scripts/make-icon.py` |
-| `.github/workflows/release.yml` | Builds Windows (x64) and macOS (universal app) on GitHub and publishes release `v<version>` when the version in `Cargo.toml` has no release yet |
+| `.github/workflows/release.yml` | Runs the tests, then builds Windows (x64) and macOS (universal app) on GitHub and publishes release `v<version>` when the version in `Cargo.toml` has no release yet |
+| `.github/workflows/ci.yml` | On every push and pull request: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on Windows and macOS |
+| `rustfmt.toml` | Formatting rules (`max_width = 110`) |
 | `scripts/` | `install-autostart.ps1` / `.sh` (build, install, register autostart), `make-icon.py`, `make-macos-app.sh` |
 | `README.md` | User guide |
+| `docs/screenshots/` | Dashboard screenshots and a PDF report preview used by the README, taken from a demo setup |
 | `prd.md` | Original product requirements |
 | `SYSTEM_ARCHITECTURE.md` | This file |
 
@@ -130,16 +137,34 @@ health probes that the user configured.
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | Command line (`serve`, `stop`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, shutdown, tray status text, author and build details |
-| `api.rs` | Every HTTP route, request guards, input validation, the embedded assets, project detection and generated start scripts, quick commands, export and import |
+| `api/mod.rs` | The router, the embedded dashboard assets and the helpers every handler shares |
+| `api/access.rs` | Sign-in, sessions and the request guards (allowed hosts, same-origin, network gate) |
+| `api/views.rs` | Validation of target settings and the JSON view of a target |
+| `api/targets.rs` | Target CRUD, run / stop / restart / deploy / rollback, project start and stop, logs and history |
+| `api/inspect.rs` | Per-target scans, Git state, health, metrics, processes and reachability |
+| `api/webhooks.rs` | Webhook tokens, signing secrets and the inbound endpoint |
+| `api/tools.rs` | Activity feed, cron preview, folder inspection |
+| `api/commands.rs` | Quick commands per project type |
+| `api/backups.rs` | Database snapshots: list, create, delete, restore |
+| `api/transfer.rs` | Export and import |
+| `api/detect.rs` | Project detection, generated start scripts, folder browsing, companion processes and launchers |
+| `api/manager.rs` | System info, the manager's log, start at login, shutdown / restart, network settings |
+| `api/ws.rs` | The event WebSocket |
+| `api/reports.rs` | Collects target views, runs, scans and 24-hour metrics into a report and returns the PDF |
 | `state.rs` | `AppState`: everything kept in memory and shared between modules |
 | `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool. That pool must not be capped low: on Windows every output pipe of a running process (two per service) holds one of its threads while waiting for output, so the limit is tokio's default of 512 (`MAX_BLOCKING_THREADS` in `main.rs`) |
 | `runner.rs` | Starts scripts and one-off commands, pumps their output, enforces timeouts, kills process trees, queues crashed services for restart |
 | `pyenv.rs` | Works out and activates a target's Python environment (see 3.6) |
 | `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files |
-| `health.rs` | Worker that probes each health URL (15 s) with a small built-in HTTP/1.1 client: `LIVE`, `SLOW`, `DOWN` |
+| `health.rs` | Worker that probes each health URL (15 s) with a small built-in HTTP/1.1 client: `LIVE`, `SLOW`, `DOWN`. A process in its first 30 s that is not answering yet is not recorded as DOWN (startup grace); the probe right after a planned stop or restart, and routine probes of a service that is stopped on purpose or not started yet, update the status without counting as an outage. A service whose last run failed has crashed, and that is recorded |
 | `metrics.rs` | Worker that samples the host and every process tree (5 s), keeps 15 minutes in memory and one row per target per minute in SQLite for 7 days |
 | `automation.rs` | Cron schedules, deploy (pull then run), auto-deploy on new commits, auto-restart with crash-loop detection, deploy webhooks |
-| `security.rs` | Runs `bandit` and `pip-audit`, reduces their JSON to counters, stores the report |
+| `secrets.rs` | Encryption at rest of environment variables and webhook signing secrets; the `secret.key` file |
+| `webhook.rs` | Checks an inbound deploy webhook: signing secret (HMAC or header), branch filter, ping |
+| `security.rs` | Runs `bandit` and `pip-audit`, reduces their JSON to counters, stores the report. A missing or broken tool triggers one install through `toolbox.rs` and a retry. A `requirements.txt` that pins every version is audited with `--no-deps --disable-pip`, so nothing is installed or built to resolve it |
+| `toolbox.rs` | Self-healing scanner tools: the managed virtualenv in `<data>/tools/venv`, finding a system Python (the `py` launcher first on Windows), install / repair (`--force-reinstall`) / upgrade, status for Settings |
+| `pdf.rs` | Minimal PDF 1.4 writer: pages, Helvetica text with exact widths, wrapping, rectangles, lines, circles |
+| `report.rs` | The overall and project reports: layout with page breaks and repeating table headers, the dashboard's status rules, the needs-attention rules |
 | `backup.rs` | Consistent SQLite snapshots of a target's database (`VACUUM INTO`), restore, pruning |
 | `auth.rs` | Optional dashboard password, sessions, sign-in lockout, the control token |
 | `net.rs` | Which addresses may be bound and which `Host` values are answered |
@@ -179,7 +204,7 @@ global functions. Routing is by URL hash (`#/target/3/logs`).
 | `js/login.js` | Sign-in form |
 
 A new script must be added in two places: a `<script>` tag in `index.html` and the
-`ASSETS` list in `src/api.rs`. A test fails if they disagree.
+`ASSETS` list in `src/api/mod.rs`. A test fails if they disagree.
 
 ### 3.4 How the pieces talk to each other
 
@@ -230,6 +255,9 @@ environment's program folder goes to the front of `PATH`, `VIRTUAL_ENV` is set a
 and can override this. A named folder with no Python in it stops the run with an error
 instead of silently using another Python. Quick commands use the same environment; with
 the setting empty they still prefer an environment found in the folder, as before.
+With no environment at all, quick commands, generated launchers and the static-site
+starter use `python3` from PATH on macOS and Linux (falling back to `python` when only
+that exists) and `python` on Windows (`pyenv::system_python`).
 
 ### 3.7 Network access
 
@@ -297,11 +325,12 @@ One SQLite file, `portalcontrol.db`, in the data folder
 | `timeout_secs` | INTEGER, default 300 | Tasks only |
 | `description` | TEXT | |
 | `project` | TEXT, default `Default` | Groups targets |
-| `env_vars` | TEXT | `.env` format, one `KEY=VALUE` per line |
+| `env_vars` | TEXT | `.env` format, one `KEY=VALUE` per line; stored sealed (`enc1:…`, see `secrets.rs`) |
 | `schedule` | TEXT, nullable | Cron expression |
 | `auto_deploy` | INTEGER | Deploy when `origin` has new commits |
 | `auto_restart` | INTEGER | Restart a crashed service |
 | `webhook_token` | TEXT, nullable | Secret in the deploy webhook URL |
+| `webhook_secret` | TEXT, nullable | Optional signing secret a webhook caller must prove (HMAC or header); stored sealed |
 | `db_file` | TEXT, nullable | SQLite file inside the folder to back up |
 | `backup_on_deploy` | INTEGER | Snapshot before each run |
 | `start_order` | INTEGER, default 0 | Position in the project's start sequence |
@@ -421,9 +450,29 @@ what a request can make it run.
   in the dashboard is executed. Generated start scripts contain only the detected
   command.
 - **Webhooks.** A deploy webhook needs no session; its unguessable per-target token in
-  the URL is its credential, and it can only trigger that target's deploy.
-- **Secrets.** Target environment variables are stored in plain text in the local
-  database and are masked in the dashboard until revealed. Exports include them. Git
+  the URL is its credential, and it can only trigger that target's deploy. It accepts
+  POST only (GET is refused, so link previews cannot deploy). An optional signing
+  secret makes the URL alone insufficient: GitHub/Gitea HMAC signatures are verified
+  in constant time, GitLab and script callers send the secret in a header. Push
+  payloads for other branches or tags are acknowledged without deploying
+  (`webhook.rs`).
+- **Installing scanner tools.** `toolbox.rs` runs `pip install bandit pip-audit` from
+  PyPI into PortalControl's own virtualenv, never into the system Python or a project.
+  It is triggered by a scan that finds a tool missing or broken, or from Settings, and
+  each install is written to Activity. Versions are not pinned: "Update to latest" and
+  first installs take the newest releases PyPI serves. Reports leave out environment
+  values, webhook tokens and secrets.
+- **Sign-in throttling.** Five wrong passwords in a minute lock out that client
+  address only; thirty from all addresses together lock out everyone, as a backstop.
+- **Secrets.** Target environment variables and webhook signing secrets are encrypted
+  in the database (ChaCha20-Poly1305, `secrets.rs`) with a random key in `secret.key`
+  next to it (mode 600 on macOS and Linux). A copied or backed-up database file alone
+  does not reveal them; someone who can read the whole data folder can. Plaintext from
+  older versions is sealed at start, and `secure_delete` zeroes what it replaces. A
+  value that cannot be decrypted reads as empty and is not overwritten by an empty
+  save; an unreadable webhook secret refuses every delivery. They are masked in the
+  dashboard until revealed, and exports contain only variable names unless values are
+  explicitly included. Git
   credentials are never stored; libgit2 uses the user's credential helper.
 - **Browser hardening.** A Content-Security-Policy allows scripts only from the program
   itself; there are no inline scripts.
@@ -432,13 +481,13 @@ what a request can make it run.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (81 at the time of writing).** Target registration and
+**Working and covered by tests (112 at the time of writing).** Target registration and
 validation, running and stopping scripts, services with auto-restart, timeouts, quick
 commands, live logs, history, Git state, pull, rollback, deploy, auto-deploy, cron
 schedules, webhooks, health probes and history, metrics and 7-day history, security
 scan parsing, SQLite backups and restore, projects with start order, project detection
 with generated start scripts and worker launchers (qcluster, Celery, Node), password
-protection, export and import, login autostart, Python environment selection, validation of network settings.
+protection with per-client sign-in lockout, export and import (variable values only on request), login autostart, Python environment selection, validation of network settings, webhook signatures and branch filter, encryption at rest of stored secrets, the health startup grace and the rule that a stopped service is not an outage, recognising pinned requirements, the PDF writer (structure, offsets, measuring, wrapping) and both reports (no secrets, page breaks), recognising broken tool installs.
 
 **Working, checked by hand only.** Network access end to end on Windows (HTTPS on a
 LAN address with a self-signed certificate, host names, restart from the dashboard,
@@ -449,6 +498,17 @@ terminal window. The tray menu entries were not clicked during development on Wi
 except through the `about` command, and printing into an interactive `cmd` or
 PowerShell window after `AttachConsole` was not observed directly (output through pipes
 and files was).
+
+**Checked by hand on macOS (0.9.0).** The server and dashboard (`--no-tray`): every
+page, quick commands with `python3`, webhook POST / GET / signatures / branch filter /
+ping against a running manager, export with and without values, upgrading a database
+with plaintext variables (sealed at start, still passed to runs), and the health
+startup grace with a service that takes 20 s to boot. Scanner tools: a scan with
+neither tool installed anywhere installed both and completed; a scan with the managed
+`bandit` deliberately broken reinstalled it and completed. Both PDF reports were
+downloaded from a running manager, opened with poppler (`pdfinfo`, `pdftoppm`) and
+checked page by page. The dashboard's Needs attention panel, report buttons and the
+Scanner Tools page were checked in Chrome.
 
 **Written but not yet run on the real system.** The macOS menu-bar icon, its About
 panel and `scripts/make-macos-app.sh`. They use the same code as Windows but have not been built
@@ -481,14 +541,11 @@ quick-command timeout 900 s, default port 7878.
 - The Windows executable is not code-signed (SmartScreen may warn) and the macOS app is
   only ad-hoc signed.
 - No Linux tray icon.
-- `api.rs` is about 2,600 lines and holds project detection and script generation as
-  well as the routes; these are candidates for their own modules.
 - The frontend uses global functions across script files; load order matters.
 - No automated browser tests.
 
 **Next steps under consideration.** Run the macOS build and fix what it shows; use the
-target's Python environment for security scans; split `api.rs`; encrypt stored
-environment variables.
+target's Python environment for security scans.
 
 ## 7. The Update Protocol
 
@@ -528,6 +585,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.4.0 | 0.9.0 | 2026-11-12 | Webhooks: POST only (GET is refused with 405 so link previews cannot deploy); optional signing secret (new column `portal_targets.webhook_secret`, `POST`/`DELETE /api/targets/{id}/webhook/secret`) checked as a GitHub/Gitea HMAC, GitLab token or `X-Webhook-Secret` header; pushes to other branches, tags and GitHub pings are acknowledged without deploying (`webhook.rs`). Environment variables and webhook secrets encrypted at rest (`secrets.rs`, `secret.key`, ChaCha20-Poly1305; plaintext sealed at start; `secure_delete` on). Export leaves out variable values unless asked (`?env_values=1`) and now includes start order and Python environment. Sign-in lockout per client address with a global backstop. Health: 30 s startup grace, planned stops and restarts not counted as outages. Fix: quick commands, launchers and the static-site starter used `python`, which macOS does not have; they now use `python3` there. Fix: the New Target page showed Windows examples on macOS until system info had loaded. `api.rs` split into `api/` with one file per area (code moved unchanged). CI workflow (clippy, tests on Windows and macOS); releases run the tests first. Clippy clean. New dependencies hmac and ring. Self-healing scanner tools (`toolbox.rs`, Settings > Scanner Tools, `GET /api/system/tools`, `POST /api/system/tools/install`): a scan installs or repairs bandit / pip-audit in `<data>/tools/venv` and retries; pinned `requirements.txt` audited without installing. PDF reports (`pdf.rs`, `report.rs`, `GET /api/reports/overall.pdf`, `GET /api/reports/project/{name}`). Dashboard: Needs attention panel, PDF report buttons, critical issues and vulnerable packages shown apart, uptime on cards, per-project running/failing summary. Health: routine probes of a stopped service no longer count as outages. README screenshots (`docs/screenshots/`). |
 | 1.3.0 | 0.8.0 | 2026-11-12 | Stricter network access: a guard on the network listener refuses every peer while no password is set, peers outside the bound address's network (default), and everyone after an optional time limit; both limits apply without a restart. Peers are listed in Settings and logged to Activity, sign-ins carry the peer address, two more response headers. New sign-in page. Fix: networks that use address space outside the private ranges internally could not be configured; such an address is now accepted in Settings when the machine has it and the user confirms the network is internal. Fix: on Windows the dashboard stopped answering ("Loading...", empty lists) once eight services were running, because their output pipes used all 16 threads of the blocking pool and database calls had none left; the cap is now 512. The target list also loads scans and last runs in one query each instead of one per target. |
 | 1.2.0 | 0.7.0 | 2026-11-12 | Network settings for the manager (`netcfg.rs`, Settings section, `GET`/`PUT /api/system/network`): address for other computers, port, host names, HTTPS with a user-supplied certificate; stored as JSON in `settings`. The manager now always listens on 127.0.0.1 and optionally on one network address; `--bind` adds the network address instead of replacing loopback, and `stop` always uses the local address. Restart from the dashboard (`POST /api/system/restart`). Password required for network access. Per-target Network page (`GET /api/targets/{id}/network`). New dependencies rustls and axum-server; sysinfo `network` feature. Dashboard scripts grouped into folders (`js/core`, `js/pages`, `js/target`, `js/settings`); the Settings page now has a side menu with one section per address (`#/settings/<section>`), each a `SET.<name>` function. Release workflow on GitHub Actions. |
 | 1.1.0 | 0.6.0 | 2026-11-12 | Windows build is a windowed program: no terminal window, attaches to the parent terminal for command output, opens the dashboard when started twice (3.5). Native About window from the tray menu and the new `about` command; macOS uses the system About panel. Author, homepage and tagline in `Cargo.toml`, `/api/system` (`author`, `homepage`, `tagline`) and the About page. New dependency windows-sys; the manifest now requests common controls 6 and is required at build time. |

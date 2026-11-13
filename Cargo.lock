@@ -1874,15 +1874,17 @@ dependencies = [
 
 [[package]]
 name = "portalcontrol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "axum-server",
  "chrono",
  "getrandom 0.2.17",
  "git2",
+ "hmac",
  "libc",
  "pbkdf2",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

@@ -4,8 +4,8 @@
 //! directory. Output is streamed line by line to WebSocket clients; nothing
 //! is buffered beyond a small bounded tail kept for history.
 
-use crate::pyenv::PyEnv;
 use crate::db::Target;
+use crate::pyenv::PyEnv;
 use crate::state::{AppState, LogTail, RunHandle, MAX_LINE_BYTES};
 use crate::util::log;
 use serde_json::json;
@@ -19,11 +19,8 @@ use tokio::sync::Notify;
 
 /// Compile-time shell routing, exactly as specified in the PRD.
 pub fn shell() -> (&'static str, &'static str) {
-    let (shell_binary, shell_switch) = if cfg!(target_os = "windows") {
-        ("cmd.exe", "/C")
-    } else {
-        ("/bin/sh", "-c")
-    };
+    let (shell_binary, shell_switch) =
+        if cfg!(target_os = "windows") { ("cmd.exe", "/C") } else { ("/bin/sh", "-c") };
     (shell_binary, shell_switch)
 }
 
@@ -55,8 +52,8 @@ pub fn validate_script_name(script: &str) -> Result<(), String> {
         return Err("script name is too long".into());
     }
     const FORBIDDEN: &[char] = &[
-        '"', '\'', '&', '|', '<', '>', '^', '%', '!', ';', '`', '$', '*', '?', '\n', '\r', '\0',
-        '(', ')', ',', '=',
+        '"', '\'', '&', '|', '<', '>', '^', '%', '!', ';', '`', '$', '*', '?', '\n', '\r', '\0', '(', ')',
+        ',', '=',
     ];
     if let Some(c) = s.chars().find(|c| FORBIDDEN.contains(c) || c.is_control()) {
         return Err(format!("script name contains a forbidden character: {c:?}"));
@@ -100,9 +97,8 @@ pub fn parse_env(text: &str) -> Result<Vec<(String, String)>, String> {
             continue;
         }
         let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {}: expected KEY=VALUE", n + 1))?;
+        let (key, value) =
+            line.split_once('=').ok_or_else(|| format!("line {}: expected KEY=VALUE", n + 1))?;
         let key = key.trim();
         let valid = !key.is_empty()
             && key.len() <= 128
@@ -218,10 +214,7 @@ async fn pump<R: AsyncRead + Unpin>(
         buf.clear();
         // `take` caps a single line, so a script that never prints a newline
         // cannot grow this buffer without bound.
-        let n = (&mut reader)
-            .take(MAX_LINE_BYTES as u64)
-            .read_until(b'\n', &mut buf)
-            .await;
+        let n = (&mut reader).take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf).await;
         match n {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
@@ -271,11 +264,7 @@ pub fn command_slot(target_id: i64) -> i64 {
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Start the target's script. Returns the execution-history row id.
-pub async fn start_run(
-    state: &Arc<AppState>,
-    target: &Target,
-    triggered_by: &str,
-) -> Result<i64, String> {
+pub async fn start_run(state: &Arc<AppState>, target: &Target, triggered_by: &str) -> Result<i64, String> {
     let dir = validate_target_paths(&target.working_directory, &target.script_name)?;
     let env = parse_env(&target.env_vars).map_err(|e| format!("environment variables: {e}"))?;
     let python = python_env(&dir, target)?;
@@ -289,11 +278,7 @@ pub async fn start_run(
         label: None,
         describe: format!("{} {} \"{}\"{}", shell().0, shell().1, target.script_name, python_note(&python)),
         env_names: env.into_iter().map(|(k, _)| k).collect(),
-        timeout: if is_service {
-            None
-        } else {
-            Some(Duration::from_secs(target.timeout_secs.max(1)))
-        },
+        timeout: if is_service { None } else { Some(Duration::from_secs(target.timeout_secs.max(1))) },
         is_service,
         auto_restart: is_service && target.auto_restart,
     };
@@ -317,11 +302,7 @@ pub async fn start_command(
     let env = parse_env(&target.env_vars).map_err(|e| format!("environment variables: {e}"))?;
     let python = python_env(&dir, target)?;
     // A relative program path (the project's virtualenv) is resolved against the directory.
-    let executable = if program.contains(['/', '\\']) {
-        dir.join(program)
-    } else {
-        PathBuf::from(program)
-    };
+    let executable = if program.contains(['/', '\\']) { dir.join(program) } else { PathBuf::from(program) };
     let mut cmd = Command::new(executable);
     cmd.args(args);
     #[cfg(not(windows))]
@@ -349,12 +330,7 @@ pub async fn start_command(
     launch(state, target, "COMMAND", job).await
 }
 
-async fn launch(
-    state: &Arc<AppState>,
-    target: &Target,
-    triggered_by: &str,
-    job: Job,
-) -> Result<i64, String> {
+async fn launch(state: &Arc<AppState>, target: &Target, triggered_by: &str, job: Job) -> Result<i64, String> {
     let Job { mut cmd, slot, label, describe, env_names, timeout, is_service, auto_restart } = job;
     let what: String = match &label {
         Some(l) => format!("Command \"{l}\""),
@@ -381,13 +357,7 @@ async fn launch(
 
     let run_id = state
         .db
-        .start_run_labeled(
-            target.id,
-            triggered_by.to_string(),
-            commit_sha,
-            commit_message,
-            label.clone(),
-        )
+        .start_run_labeled(target.id, triggered_by.to_string(), commit_sha, commit_message, label.clone())
         .await?;
     let started = Instant::now();
 
@@ -395,10 +365,7 @@ async fn launch(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("failed to start {describe}: {e}");
-            let _ = state
-                .db
-                .finish_run(run_id, "FAILED", None, 0, format!("[portalcontrol] {msg}\n"))
-                .await;
+            let _ = state.db.finish_run(run_id, "FAILED", None, 0, format!("[portalcontrol] {msg}\n")).await;
             return Err(msg);
         }
     };
@@ -457,29 +424,18 @@ async fn launch(
         ),
         Some(&tail),
     );
-    log(&format!(
-        "run {run_id} started for target {target_id} ({}) by {triggered_by}",
-        target.name
-    ));
+    log(&format!("run {run_id} started for target {target_id} ({}) by {triggered_by}", target.name));
 
     // Don't make the dashboard wait for the next periodic probe: check health
     // a few times while the process comes up, and once more when it ends.
-    let health_url = target
-        .health_url
-        .clone()
-        .filter(|u| !u.trim().is_empty() && label.is_none());
+    let health_url = target.health_url.clone().filter(|u| !u.trim().is_empty() && label.is_none());
     if let Some(url) = health_url.clone() {
         let st = state.clone();
         tokio::spawn(async move {
             for delay_secs in [1u64, 2, 3, 4, 5] {
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                let still_this_run = st
-                    .running
-                    .lock()
-                    .await
-                    .get(&slot)
-                    .map(|h| h.run_id == run_id)
-                    .unwrap_or(false);
+                let still_this_run =
+                    st.running.lock().await.get(&slot).map(|h| h.run_id == run_id).unwrap_or(false);
                 if !still_this_run {
                     break;
                 }
@@ -494,12 +450,10 @@ async fn launch(
     tokio::spawn(async move {
         let out = child.stdout.take();
         let err = child.stderr.take();
-        let t_out = out.map(|o| {
-            tokio::spawn(pump(o, "stdout", state.clone(), target_id, run_id, tail.clone()))
-        });
-        let t_err = err.map(|e| {
-            tokio::spawn(pump(e, "stderr", state.clone(), target_id, run_id, tail.clone()))
-        });
+        let t_out =
+            out.map(|o| tokio::spawn(pump(o, "stdout", state.clone(), target_id, run_id, tail.clone())));
+        let t_err =
+            err.map(|e| tokio::spawn(pump(e, "stderr", state.clone(), target_id, run_id, tail.clone())));
 
         let outcome = tokio::select! {
             r = child.wait() => match r {
@@ -519,11 +473,7 @@ async fn launch(
 
         // Let the readers drain what is left; a stray grandchild that still
         // holds the pipe must not keep this run open forever.
-        let aborts: Vec<_> = [&t_out, &t_err]
-            .into_iter()
-            .flatten()
-            .map(|t| t.abort_handle())
-            .collect();
+        let aborts: Vec<_> = [&t_out, &t_err].into_iter().flatten().map(|t| t.abort_handle()).collect();
         let drained = tokio::time::timeout(Duration::from_secs(3), async {
             if let Some(t) = t_out {
                 let _ = t.await;
@@ -539,6 +489,7 @@ async fn launch(
 
         // A service that ends on its own (it was not stopped) has crashed.
         let unexpected_exit = matches!(outcome, Outcome::Exited(_) | Outcome::WaitFailed(_));
+        let stopped_on_purpose = matches!(outcome, Outcome::Stopped);
         let (status, exit_code, note): (&'static str, Option<i64>, String) = match outcome {
             Outcome::Exited(code) => (
                 if code == Some(0) { "SUCCESS" } else { "FAILED" },
@@ -567,11 +518,7 @@ async fn launch(
 
         let duration_ms = started.elapsed().as_millis() as i64;
         let logs = tail.lock().map(|t| t.joined()).unwrap_or_default();
-        if let Err(e) = state
-            .db
-            .finish_run(run_id, status, exit_code, duration_ms, logs)
-            .await
-        {
+        if let Err(e) = state.db.finish_run(run_id, status, exit_code, duration_ms, logs).await {
             log(&format!("failed to persist run {run_id}: {e}"));
         }
         state.running.lock().await.remove(&slot);
@@ -600,7 +547,14 @@ async fn launch(
             queue_restart(&state, target_id);
         }
         if let Some(url) = health_url {
-            crate::health::probe_target(&state, target_id, &url).await;
+            // A stop or restart is planned: show the new state at once, but do
+            // not count it as an outage in the health history.
+            let planned = if stopped_on_purpose {
+                crate::health::Record::StatusOnly
+            } else {
+                crate::health::Record::All
+            };
+            crate::health::probe_target_with(&state, target_id, &url, planned).await;
         }
     });
 
@@ -671,11 +625,7 @@ fn queue_restart(state: &Arc<AppState>, target_id: i64) {
         );
         return;
     }
-    state
-        .restart_queue
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push((target_id, now + RESTART_DELAY));
+    state.restart_queue.lock().unwrap_or_else(|p| p.into_inner()).push((target_id, now + RESTART_DELAY));
     state.activity(
         "warn",
         "restart",
@@ -690,11 +640,7 @@ fn queue_restart(state: &Arc<AppState>, target_id: i64) {
 
 /// Stop the target if it is running, wait for the process tree to go away,
 /// then start it again.
-pub async fn restart(
-    state: &Arc<AppState>,
-    target: &Target,
-    triggered_by: &str,
-) -> Result<i64, String> {
+pub async fn restart(state: &Arc<AppState>, target: &Target, triggered_by: &str) -> Result<i64, String> {
     if stop_run(state, target.id).await {
         let mut gone = false;
         for _ in 0..150 {
@@ -760,8 +706,19 @@ mod tests {
             assert!(validate_script_name(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "", " deploy.bat", "../deploy.bat", "a/../b.bat", "/etc/passwd", "C:\\x.bat",
-            "a.bat & calc", "a.bat|b", "\"a.bat\"", "a%PATH%.bat", "a;b", "$(x).sh", "-rf",
+            "",
+            " deploy.bat",
+            "../deploy.bat",
+            "a/../b.bat",
+            "/etc/passwd",
+            "C:\\x.bat",
+            "a.bat & calc",
+            "a.bat|b",
+            "\"a.bat\"",
+            "a%PATH%.bat",
+            "a;b",
+            "$(x).sh",
+            "-rf",
             "a//b.sh",
         ] {
             assert!(validate_script_name(bad).is_err(), "{bad:?} should be rejected");
@@ -778,12 +735,7 @@ mod tests {
         file
     }
 
-    async fn setup(
-        dir: &Path,
-        script_name: &str,
-        mode: &str,
-        timeout: u64,
-    ) -> (Arc<AppState>, Target) {
+    async fn setup(dir: &Path, script_name: &str, mode: &str, timeout: u64) -> (Arc<AppState>, Target) {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .insert_target(TargetInput {
@@ -850,10 +802,9 @@ mod tests {
 
     #[test]
     fn env_block_parsing() {
-        let env = parse_env(
-            "# comment\n\nDEBUG=1\nexport  SECRET_KEY=\"a b=c\"\nEMPTY=\nNAME='x'\nDEBUG=2\n",
-        )
-        .unwrap();
+        let env =
+            parse_env("# comment\n\nDEBUG=1\nexport  SECRET_KEY=\"a b=c\"\nEMPTY=\nNAME='x'\nDEBUG=2\n")
+                .unwrap();
         assert_eq!(
             env,
             vec![
@@ -872,12 +823,7 @@ mod tests {
     #[tokio::test]
     async fn environment_variables_reach_the_script() {
         let dir = tempfile::tempdir().unwrap();
-        let name = script(
-            dir.path(),
-            "env",
-            "echo value=%PC_TEST_VALUE%",
-            "echo value=$PC_TEST_VALUE",
-        );
+        let name = script(dir.path(), "env", "echo value=%PC_TEST_VALUE%", "echo value=$PC_TEST_VALUE");
         let (state, mut target) = setup(dir.path(), &name, "TASK", 30).await;
         target.env_vars = "PC_TEST_VALUE=hello world".into();
         let run_id = start_run(&state, &target, "SCHEDULE").await.unwrap();
@@ -993,12 +939,8 @@ mod tests {
     #[tokio::test]
     async fn blocked_script_is_killed_at_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let name = script(
-            dir.path(),
-            "hang",
-            "echo waiting\r\nping -n 60 127.0.0.1 >nul",
-            "echo waiting\nsleep 60",
-        );
+        let name =
+            script(dir.path(), "hang", "echo waiting\r\nping -n 60 127.0.0.1 >nul", "echo waiting\nsleep 60");
         let (state, target) = setup(dir.path(), &name, "TASK", 2).await;
         let t0 = Instant::now();
         let run_id = start_run(&state, &target, "SYSTEM_AUTO").await.unwrap();

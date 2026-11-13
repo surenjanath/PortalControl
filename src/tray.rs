@@ -184,13 +184,13 @@ fn show_status(ui: &Ui, tip: &str, line: &str) {
 /// back when that fails.
 fn toggle_autostart(item: &CheckMenuItem, serve_args: &[String]) {
     let wanted = item.is_checked();
-    let outcome = if wanted {
-        crate::autostart::install(serve_args)
-    } else {
-        crate::autostart::uninstall()
-    };
+    let outcome = if wanted { crate::autostart::install(serve_args) } else { crate::autostart::uninstall() };
     match outcome {
-        Ok(_) => crate::util::log(if wanted { "start at login turned on from the tray" } else { "start at login turned off from the tray" }),
+        Ok(_) => crate::util::log(if wanted {
+            "start at login turned on from the tray"
+        } else {
+            "start at login turned off from the tray"
+        }),
         Err(e) => {
             crate::util::log(&format!("could not change start at login: {e}"));
             item.set_checked(!wanted);
@@ -301,7 +301,8 @@ mod about_window {
             return None;
         }
         let link = |address: &str| {
-            let shown = address.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+            let shown =
+                address.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
             format!("<A HREF=\"{address}\">{shown}</A>")
         };
         let title = wide("About PortalControl");
@@ -314,11 +315,17 @@ mod about_window {
             link(url),
             status
         ));
-        let footer = wide(&[crate::build_stamp(), format!("SQLite {}", rusqlite::version()), format!("libgit2 {}", crate::git::library_version())]
+        let footer = wide(
+            &[
+                crate::build_stamp(),
+                format!("SQLite {}", rusqlite::version()),
+                format!("libgit2 {}", crate::git::library_version()),
+            ]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
-            .join("  \u{00b7}  "));
+            .join("  \u{00b7}  "),
+        );
         let button = wide("More details in the dashboard");
         let details = format!("{url}#/about");
 
@@ -330,10 +337,19 @@ mod about_window {
             let pressed = unsafe {
                 let module = GetModuleHandleW(std::ptr::null());
                 // Resource 1 is the application icon embedded by build.rs.
-                let icon = LoadImageW(module, 1 as _, IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+                let icon = LoadImageW(
+                    module,
+                    1 as _,
+                    IMAGE_ICON,
+                    GetSystemMetrics(SM_CXICON),
+                    GetSystemMetrics(SM_CYICON),
+                    LR_DEFAULTCOLOR,
+                );
                 let mut config: TASKDIALOGCONFIG = std::mem::zeroed();
                 config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
-                config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS | if icon.is_null() { 0 } else { TDF_USE_HICON_MAIN };
+                config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION
+                    | TDF_ENABLE_HYPERLINKS
+                    | if icon.is_null() { 0 } else { TDF_USE_HICON_MAIN };
                 config.dwCommonButtons = TDCBF_CLOSE_BUTTON;
                 config.pszWindowTitle = title.as_ptr();
                 config.Anonymous1 = TASKDIALOGCONFIG_0 { hMainIcon: icon as _ };

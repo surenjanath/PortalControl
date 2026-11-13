@@ -132,6 +132,16 @@
   .errtxt { color: var(--err); font-size: 12.5px; }
   .note-box { border: 1px solid var(--line); border-left: 3px solid var(--hl); background: var(--panel); border-radius: 6px; padding: 10px 14px; font-size: 13px; color: var(--muted); margin-bottom: 14px; }
   .note-box.err { border-left-color: var(--err); } .note-box.ok { border-left-color: var(--ok); }
+  /* ---- dashboard: needs attention ---- */
+  .attn { margin-top: 12px; }
+  .attn-h { padding: 0 2px 8px; }
+  .attn-row { display: flex; align-items: center; gap: 10px; padding: 7px 2px; border-top: 1px solid var(--line); font-size: 13px; }
+  .attn-row .grow { flex: 1; min-width: 0; }
+  .attn-row .nm { font-weight: 600; }
+  .attn-row .nm:hover { color: var(--accent); }
+  .attn.clear { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--ok); border-radius: 6px; background: var(--panel); font-size: 13px; }
+  .proj-h { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px; }
+  .t-warn { color: var(--warn); } .t-err { color: var(--err); }
   .dangerzone { border: 1px solid var(--err); border-radius: 8px; }
   .dangerzone > div { padding: 14px 16px; display: flex; gap: 16px; align-items: center; }
   .dangerzone > div + div { border-top: 1px solid var(--line); }

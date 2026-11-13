@@ -11,11 +11,38 @@ Built from [`prd.md`](prd.md). The dashboard is laid out like a self-hosted depl
 panel: a sidebar, projects, and a page per target with Configuration, Deployments,
 Logs, Metrics and Security tabs.
 
+![The PortalControl dashboard: totals, a "Needs attention" list, host resources and a card per target](docs/screenshots/dashboard.png)
+
+## Screenshots
+
+*Taken from a demo setup: a Django shop with a web server, a migration task and a
+Django-Q worker, a Node API gateway, a nightly report job and a job that fails on
+purpose.*
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/project.png" alt="Project page: processes in start order, Start all / Restart all / Stop all, and their terminals merged"><br><b>Project page.</b> Every process of a project, started in order, with one merged terminal.</td>
+    <td width="50%"><img src="docs/screenshots/target.png" alt="Target page, Configuration tab: live status, last deployment, commit and health strip"><br><b>Target page.</b> Live status, last deployment, checked-out commit and health history.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/new-target.png" alt="New target page detecting a Django project and offering to write a start script"><br><b>New target.</b> Point it at a folder; it detects the framework, branch and a free port.</td>
+    <td><img src="docs/screenshots/security.png" alt="Security tab with bandit findings, pip-audit results and scan history"><br><b>Security scans.</b> bandit and pip-audit findings with scan history.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/metrics.png" alt="Metrics tab with CPU, memory and disk charts for the process tree"><br><b>Metrics.</b> CPU, memory, disk and response time of the whole process tree.</td>
+    <td><img src="docs/screenshots/scanner-tools.png" alt="Settings, Scanner Tools: bandit and pip-audit installed by PortalControl"><br><b>Scanner tools.</b> Installed and repaired by PortalControl itself.</td>
+  </tr>
+</table>
+
+![Two pages of PDF reports: the overall report with summary, needs-attention list and targets table, and a project report with a target's details, runs and security findings](docs/screenshots/pdf-report.png)
+
+*PDF reports: the overall report (left) and a page of a project report (right).*
+
 ## Dashboard at a glance
 
 | Page | What it shows |
 | --- | --- |
-| Dashboard | Totals (running, reachable, updates available, failing, security findings), host CPU and memory, target cards grouped by project, recent deployments and activity |
+| Dashboard | Totals (running, reachable, updates available, failing, critical issues and vulnerable packages), a **Needs attention** list with a link to fix each item, host CPU and memory, target cards grouped by project with health uptime, recent deployments and activity, and the overall **PDF report** |
 | Projects | Every target with status, Git state, health strip, last deployment and quick actions |
 | Target → Configuration | General, Environment Variables, Git Source, Health Check, Scheduled Task, Webhooks, Advanced, Danger Zone |
 | Target → Deployments | Every run with trigger, commit, duration and exit code; click one for its full log |
@@ -23,9 +50,9 @@ Logs, Metrics and Security tabs.
 | Target → Commands | One-click maintenance commands (migrate, collectstatic, pip install …) |
 | Target → Logs | Live output with filter, stream selector, follow, wrap, copy and download |
 | Target → Metrics | CPU and memory of the whole process tree, health response time, run durations |
-| Target → Security | bandit and pip-audit findings, with scan history |
+| Target → Security | bandit and pip-audit findings, with scan history; missing scanner tools are installed automatically |
 | Deployments / Security / Activity | The same information across all targets, plus an event feed |
-| Settings | Start at login, manager details, resource charts, the manager's own log, shutdown |
+| Settings | Start at login, manager details, resource charts, scanner tools, the manager's own log, shutdown |
 
 ## Projects with several processes
 
@@ -59,7 +86,8 @@ live stream all require signing in.
 - The password is stored only as a salted PBKDF2-HMAC-SHA256 hash.
 - Sessions last 7 days, are held in memory (so everyone signs in again after a
   restart), and all end when the password changes.
-- Five wrong passwords lock sign-in for a minute.
+- Five wrong passwords from one computer lock sign-in for that computer for a minute;
+  others can still sign in (thirty from everyone together lock it for all).
 - Deploy webhooks keep working: the token in their URL is their own credential.
 - `portalcontrol stop` keeps working on this machine through a control token the
   manager writes to its data directory.
@@ -126,6 +154,41 @@ Deployments like any other run, and it runs **next to a live service** without s
 it. Commands that change something ask first, and are stopped after 15 minutes. Only
 this fixed list can be run: the dashboard never executes text you type.
 
+## PDF reports
+
+**PDF report** on the dashboard downloads a report of everything PortalControl
+supervises; the button on a project page (or *PDF report* next to a project on the
+dashboard) downloads one for that project.
+
+- **Overall report:** summary figures, what needs attention, each project, every target
+  with status, Git state, health uptime, last run and security, and recent deployments.
+- **Project report:** the same for the project, then a section per process: status,
+  folder and script, branch and commit, health check and uptime, average and peak CPU
+  and memory over 24 hours, schedule, start order, Python environment, recent runs, and
+  the latest security findings with the fix version of each vulnerable package.
+- Reports never contain secrets: environment variables are counted, not listed, and
+  webhook tokens and secrets are left out.
+- They are generated by PortalControl itself (no browser printing, no extra program)
+  and open in any PDF reader. `GET /api/reports/overall.pdf` and
+  `GET /api/reports/project/{name}` return them for scripts.
+
+## Self-healing scanner tools
+
+Security scans need `bandit` and `pip-audit`, and you no longer have to install them.
+When a scan finds one missing, or installed but broken, PortalControl installs it into
+its own environment in the data folder (`tools/venv`) and runs the scan again; the
+activity feed records each step. Your system Python and your projects' environments
+are never changed. **Settings → Scanner Tools** shows where each tool comes from and
+can install, reinstall or update them.
+
+Installing needs Python 3 on the machine (on Windows from python.org; on Debian and
+Ubuntu also `python3-venv`) and access to PyPI. A tool already on `PATH` is still used
+when PortalControl has no copy of its own.
+
+When every line of `requirements.txt` pins an exact version (`name==1.2.3`), the audit
+reads the list as written instead of installing each package to resolve it, so old
+pinned releases are audited even where they would no longer build.
+
 ## Database backups
 
 Under *Configuration → Database Backups*, name the project's SQLite file (for example
@@ -149,8 +212,10 @@ deleted.
 - **Desktop notifications.** Opt in under Settings to be told when a run fails, a
   service goes down or crashes, or a run finishes while the tab is in the background.
 - **Export / import.** Settings can save every target's configuration to a JSON file
-  and load it on another machine. Already-registered targets are skipped; ones whose
-  folder does not exist there are reported.
+  and load it on another machine. Environment variables are exported by name only
+  unless you tick *Include environment variable values*, so a shared export does not
+  leak passwords. Already-registered targets are skipped; ones whose folder does not
+  exist there are reported.
 
 ## Automation features
 
@@ -165,9 +230,16 @@ deleted.
   Untracked files (databases, media) are left alone.
 - **Auto-deploy.** When the 5-minute fetch finds new commits, pull and run the script
   (a running service is restarted). A failure is reported once per commit.
-- **Deploy webhook.** A per-target URL with a random token; `POST` (or `GET`) to it to
-  pull and deploy. Add `?pull=0` to skip the pull. It is reachable only from this
+- **Deploy webhook.** A per-target URL with a random token; `POST` to it to pull and
+  deploy. `GET` is refused, so a link preview or URL scanner that fetches the address
+  cannot start a deployment. Add `?pull=0` to skip the pull. It is reachable only from this
   machine or the private network, like the rest of the server.
+  - **Signing secret (optional).** With one set, every call must also prove it or is
+    refused with 401: GitHub, Gitea and Forgejo sign the body (`X-Hub-Signature-256` /
+    `X-Gitea-Signature`), GitLab sends `X-Gitlab-Token`, and a script sends
+    `X-Webhook-Secret`. A leaked URL alone is then not enough to deploy.
+  - **Branch filter.** A push payload for another branch, or for a tag, is answered
+    with `200 {"deployed": false}` and not deployed; so is GitHub's `ping`.
 - **Restart on crash.** A service that exits on its own is started again after 5
   seconds; after 5 crashes in 10 minutes automatic restart is suspended.
 - **Start with PortalControl.** Launch the target whenever the manager starts.
@@ -375,7 +447,10 @@ about                 Show the version and who made it
 
 Data lives in `%LOCALAPPDATA%\PortalControl` (Windows),
 `~/Library/Application Support/PortalControl` (macOS) or
-`~/.local/share/portalcontrol` (Linux): `portalcontrol.db` and `portalcontrol.log`.
+`~/.local/share/portalcontrol` (Linux): `portalcontrol.db`, `portalcontrol.log` and
+`secret.key`. Environment variables and webhook signing secrets are encrypted in the
+database with that key, so **back up `secret.key` together with `portalcontrol.db`**:
+without it they cannot be read and have to be entered again.
 
 ## Registering a target
 
@@ -478,7 +553,8 @@ protection*).
 | GET | `/api/targets/{id}/health/history` | Last 240 probes |
 | GET | `/api/targets/{id}/metrics` | CPU / memory samples of the process tree |
 | POST / DELETE | `/api/targets/{id}/webhook` | Generate / disable the deploy webhook token |
-| GET / POST | `/api/webhooks/deploy/{token}` | Deploy via webhook |
+| POST / DELETE | `/api/targets/{id}/webhook/secret` | Set (or replace) / remove the webhook signing secret |
+| POST | `/api/webhooks/deploy/{token}` | Deploy via webhook (GET is refused with 405) |
 | GET | `/api/auth/status` | Whether a password is set and whether this client is signed in |
 | POST | `/api/auth/login`, `/api/auth/logout`, `/api/auth/password` | Sign in / out; set, change or remove the password |
 | POST | `/api/targets/{id}/rollback` | Move to an earlier commit (`{"sha": …}`) and deploy it |
@@ -488,13 +564,16 @@ protection*).
 | GET | `/api/fs/pyenv?dir=…&env=…` | Which Python environment a setting leads to |
 | GET | `/api/system` | Version, build, host and runtime details (the About page) |
 | GET / PUT | `/api/system/network` | Network settings: what is saved, what is running, this computer's addresses |
+| GET | `/api/system/tools` | Scanner tools: where each comes from, its version, the Python used to install, install state |
+| POST | `/api/system/tools/install` | Install, repair or update the scanner tools (`{"mode": "install" \| "repair" \| "upgrade"}`) |
+| GET | `/api/reports/overall.pdf`, `/api/reports/project/{name}` | PDF report of everything / of one project |
 | POST | `/api/system/restart` | Stop and start again with the same options |
 | GET | `/api/targets/{id}/network` | Which addresses a project's port answers on |
 | POST | `/api/targets/{id}/commands/{command}`, `/commands/stop` | Run a quick command / stop the running one |
 | GET / POST | `/api/targets/{id}/backups` | List database snapshots / take one now |
 | POST / DELETE | `/api/targets/{id}/backups/{file}/restore`, `/backups/{file}` | Restore / delete a snapshot |
 | POST | `/api/fs/launcher` | Create the launcher script of a detected worker |
-| GET / POST | `/api/export`, `/api/import` | Export / import target configuration |
+| GET / POST | `/api/export`, `/api/import` | Export (`?env_values=1` includes variable values) / import target configuration |
 | GET | `/api/runs`, `/api/runs/{id}` | Recent executions of all targets / one with its logs |
 | GET | `/api/activity` | Activity feed |
 | GET | `/api/cron?expr=` | Validate a schedule and preview its next runs |
@@ -512,15 +591,16 @@ cargo run -- --port 7979 --data-dir ./dev-data
 ```
 
 The source is in `src/` (`runner.rs`, `git.rs`, `health.rs`, `security.rs`,
-`automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api.rs`, `db.rs`,
-`autostart.rs`, `net.rs`, `netcfg.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
+`automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api/` (one file per area of
+the HTTP API), `db.rs`, `secrets.rs`, `webhook.rs`, `autostart.rs`, `net.rs`,
+`netcfg.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
 Windows executable and records the build commit and time.
 
 How the parts fit together, the database schema and the rules for keeping the
 documentation current are in [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
 
 The dashboard lives in `web/` and is compiled into the binary (`ASSETS` in
-`src/api.rs`), so the result is still one executable. It is plain HTML, CSS and
+`src/api/mod.rs`), so the result is still one executable. It is plain HTML, CSS and
 JavaScript with no build step and no dependencies:
 
 | File | What it holds |

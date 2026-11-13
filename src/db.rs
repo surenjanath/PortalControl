@@ -90,6 +90,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("portal_targets", "backup_on_deploy", "INTEGER NOT NULL DEFAULT 0"),
     ("portal_targets", "start_order", "INTEGER NOT NULL DEFAULT 0"),
     ("portal_targets", "python_env", "TEXT"),
+    ("portal_targets", "webhook_secret", "TEXT"),
 ];
 
 /// Execution-history rows kept per target; older ones are pruned.
@@ -123,6 +124,9 @@ pub struct Target {
     /// Python environment activated for runs: `None` for none, `auto`, or a
     /// folder. See `pyenv.rs`.
     pub python_env: Option<String>,
+    /// Optional secret a webhook caller must prove (an HMAC signature or a
+    /// header), on top of the token in the URL.
+    pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -213,10 +217,65 @@ pub struct Db {
 
 const TARGET_COLS: &str = "id, name, working_directory, script_name, git_branch, \
      current_git_status, created_at, health_url, run_mode, autostart, timeout_secs, \
-     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order, python_env";
+     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order, python_env, webhook_secret";
 
 const RUN_COLS: &str = "h.id, h.target_id, h.triggered_by, h.status, h.exit_code, h.duration_ms, \
      h.executed_at, h.commit_sha, h.commit_message, h.label";
+
+/// Column names double as the associated data of their sealed values.
+const ENV_AAD: &str = "env_vars";
+const WEBHOOK_SECRET_AAD: &str = "webhook_secret";
+
+static UNREADABLE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn log_unreadable() {
+    if !UNREADABLE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::util::log(&format!(
+            "some stored secrets cannot be decrypted: {} in the data folder is missing or is not the key they were \
+             saved with. Restore that file, or enter the environment variables and webhook secrets again.",
+            crate::secrets::KEY_FILE
+        ));
+    }
+}
+
+/// Environment variables as stored. If they cannot be decrypted they read as
+/// empty (and `update_target` will not overwrite them with that emptiness).
+fn unseal_env(stored: &str) -> String {
+    crate::secrets::open(stored, ENV_AAD).unwrap_or_else(|| {
+        log_unreadable();
+        String::new()
+    })
+}
+
+/// A webhook signing secret that cannot be decrypted fails closed: it becomes
+/// a random value nobody knows, so every delivery is refused rather than
+/// accepted without a secret.
+fn unseal_webhook_secret(stored: &str) -> String {
+    crate::secrets::open(stored, WEBHOOK_SECRET_AAD).unwrap_or_else(|| {
+        log_unreadable();
+        crate::auth::random_hex(32)
+    })
+}
+
+/// Seal every secret still stored in plaintext (from before encryption).
+fn seal_plaintext_secrets(conn: &Connection) -> rusqlite::Result<()> {
+    for (column, aad) in [("env_vars", ENV_AAD), ("webhook_secret", WEBHOOK_SECRET_AAD)] {
+        let rows: Vec<(i64, String)> = conn
+            .prepare(&format!(
+                "SELECT id, {column} FROM portal_targets WHERE {column} IS NOT NULL AND {column} != '' \
+                 AND {column} NOT LIKE 'enc1:%'"
+            ))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, plain) in rows {
+            conn.execute(
+                &format!("UPDATE portal_targets SET {column}=?1 WHERE id=?2"),
+                params![crate::secrets::seal(&plain, aad), id],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
     Ok(Target {
@@ -225,9 +284,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         working_directory: r.get(2)?,
         script_name: r.get(3)?,
         git_branch: r.get(4)?,
-        current_git_status: r
-            .get::<_, Option<String>>(5)?
-            .unwrap_or_else(|| "UP_TO_DATE".into()),
+        current_git_status: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "UP_TO_DATE".into()),
         created_at: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
         health_url: r.get(7)?,
         run_mode: r.get(8)?,
@@ -238,7 +295,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
             .get::<_, Option<String>>(12)?
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| "Default".into()),
-        env_vars: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        env_vars: unseal_env(&r.get::<_, Option<String>>(13)?.unwrap_or_default()),
         schedule: r.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty()),
         auto_deploy: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
         auto_restart: r.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
@@ -247,6 +304,10 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
         backup_on_deploy: r.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
         start_order: r.get::<_, Option<i64>>(20)?.unwrap_or(0),
         python_env: r.get::<_, Option<String>>(21)?.filter(|s| !s.is_empty()),
+        webhook_secret: r
+            .get::<_, Option<String>>(22)?
+            .filter(|s| !s.is_empty())
+            .map(|s| unseal_webhook_secret(&s)),
     })
 }
 
@@ -275,20 +336,11 @@ fn row_to_run(r: &Row, extra: RunExtra) -> rusqlite::Result<RunRecord> {
         commit_message: r.get(8)?,
         label: r.get(9)?,
         target_name: if extra == RunExtra::TargetName { tail.clone() } else { None },
-        captured_logs: if extra == RunExtra::Logs {
-            Some(tail.unwrap_or_default())
-        } else {
-            None
-        },
+        captured_logs: if extra == RunExtra::Logs { Some(tail.unwrap_or_default()) } else { None },
     })
 }
 
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> rusqlite::Result<()> {
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
     let exists = {
         let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let names = st.query_map([], |r| r.get::<_, String>(1))?;
@@ -307,18 +359,25 @@ fn add_column_if_missing(
 }
 
 impl Db {
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        Self::init(conn)
+    /// Open the database at `path`. The encryption key for stored secrets
+    /// lives next to it and is created on first use.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        crate::secrets::load_or_create(path.parent().unwrap_or(Path::new(".")))?;
+        let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        Self::init(conn).map_err(|e| e.to_string())
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> rusqlite::Result<Self> {
+        crate::secrets::ensure_test_key();
         Self::init(Connection::open_in_memory()?)
     }
 
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // Overwritten and deleted content is zeroed on disk, so plaintext
+        // replaced by its sealed form does not linger in free pages.
+        let _ = conn.pragma_update(None, "secure_delete", "ON");
         conn.execute_batch(SCHEMA)?;
         for (table, column, decl) in MIGRATIONS {
             add_column_if_missing(&conn, table, column, decl)?;
@@ -327,6 +386,7 @@ impl Db {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_webhook \
              ON portal_targets(webhook_token) WHERE webhook_token IS NOT NULL;",
         )?;
+        seal_plaintext_secrets(&conn)?;
         // Anything still RUNNING belongs to a previous manager process.
         conn.execute(
             "UPDATE process_execution_history SET status='FAILED', \
@@ -334,9 +394,7 @@ impl Db {
              WHERE status='RUNNING'",
             [],
         )?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Run a closure against the connection on the blocking thread pool.
@@ -357,8 +415,7 @@ impl Db {
 
     pub async fn list_targets(&self) -> Result<Vec<Target>, String> {
         self.call(|c| {
-            let mut st =
-                c.prepare(&format!("SELECT {TARGET_COLS} FROM portal_targets ORDER BY id"))?;
+            let mut st = c.prepare(&format!("SELECT {TARGET_COLS} FROM portal_targets ORDER BY id"))?;
             let rows = st.query_map([], row_to_target)?;
             rows.collect()
         })
@@ -367,12 +424,8 @@ impl Db {
 
     pub async fn get_target(&self, id: i64) -> Result<Option<Target>, String> {
         self.call(move |c| {
-            c.query_row(
-                &format!("SELECT {TARGET_COLS} FROM portal_targets WHERE id=?1"),
-                [id],
-                row_to_target,
-            )
-            .optional()
+            c.query_row(&format!("SELECT {TARGET_COLS} FROM portal_targets WHERE id=?1"), [id], row_to_target)
+                .optional()
         })
         .await
     }
@@ -407,7 +460,7 @@ impl Db {
                     t.timeout_secs.unwrap_or(300) as i64,
                     t.description.unwrap_or_default(),
                     t.project.unwrap_or_else(|| "Default".into()),
-                    t.env_vars.unwrap_or_default(),
+                    crate::secrets::seal(&t.env_vars.unwrap_or_default(), ENV_AAD),
                     t.schedule,
                     t.auto_deploy.unwrap_or(false) as i64,
                     t.auto_restart.unwrap_or(false) as i64,
@@ -424,6 +477,16 @@ impl Db {
 
     pub async fn update_target(&self, id: i64, t: TargetInput) -> Result<bool, String> {
         self.call(move |c| {
+            let new_env = t.env_vars.clone().unwrap_or_default();
+            let stored_env: Option<String> = c
+                .query_row("SELECT env_vars FROM portal_targets WHERE id=?1", [id], |r| r.get(0))
+                .optional()?;
+            // Variables that cannot be decrypted show as empty; saving other
+            // settings must not replace them with that emptiness.
+            let env_to_store = match stored_env {
+                Some(old) if new_env.is_empty() && crate::secrets::is_sealed(&old) && crate::secrets::open(&old, ENV_AAD).is_none() => old,
+                _ => crate::secrets::seal(&new_env, ENV_AAD),
+            };
             let n = c.execute(
                 "UPDATE portal_targets SET name=?1, working_directory=?2, script_name=?3, \
                  git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8, \
@@ -440,7 +503,7 @@ impl Db {
                     t.timeout_secs.unwrap_or(300) as i64,
                     t.description.unwrap_or_default(),
                     t.project.unwrap_or_else(|| "Default".into()),
-                    t.env_vars.unwrap_or_default(),
+                    env_to_store,
                     t.schedule,
                     t.auto_deploy.unwrap_or(false) as i64,
                     t.auto_restart.unwrap_or(false) as i64,
@@ -457,16 +520,12 @@ impl Db {
     }
 
     pub async fn delete_target(&self, id: i64) -> Result<bool, String> {
-        self.call(move |c| Ok(c.execute("DELETE FROM portal_targets WHERE id=?1", [id])? > 0))
-            .await
+        self.call(move |c| Ok(c.execute("DELETE FROM portal_targets WHERE id=?1", [id])? > 0)).await
     }
 
     pub async fn set_git_status(&self, id: i64, status: &'static str) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET current_git_status=?1 WHERE id=?2",
-                params![status, id],
-            )?;
+            c.execute("UPDATE portal_targets SET current_git_status=?1 WHERE id=?2", params![status, id])?;
             Ok(())
         })
         .await
@@ -483,7 +542,15 @@ impl Db {
             let mut stored = 0;
             for p in &points {
                 let row = params![
-                    p.target_id, p.t, p.cpu, p.mem, p.mem_max, p.procs, p.latency, p.probes, p.probes_up
+                    p.target_id,
+                    p.t,
+                    p.cpu,
+                    p.mem,
+                    p.mem_max,
+                    p.procs,
+                    p.latency,
+                    p.probes,
+                    p.probes_up
                 ];
                 if st.execute(row).is_ok() {
                     stored += 1;
@@ -520,14 +587,12 @@ impl Db {
     }
 
     pub async fn prune_metric_points(&self, before: i64) -> Result<usize, String> {
-        self.call(move |c| c.execute("DELETE FROM metric_points WHERE t < ?1", [before]))
-            .await
+        self.call(move |c| c.execute("DELETE FROM metric_points WHERE t < ?1", [before])).await
     }
 
     pub async fn get_setting(&self, key: &'static str) -> Result<Option<String>, String> {
         self.call(move |c| {
-            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0))
-                .optional()
+            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()
         })
         .await
     }
@@ -550,10 +615,16 @@ impl Db {
 
     pub async fn set_auto_deploy(&self, id: i64, on: bool) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET auto_deploy=?1 WHERE id=?2",
-                params![on as i64, id],
-            )?;
+            c.execute("UPDATE portal_targets SET auto_deploy=?1 WHERE id=?2", params![on as i64, id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_webhook_secret(&self, id: i64, secret: Option<String>) -> Result<(), String> {
+        self.call(move |c| {
+            let sealed = secret.map(|s| crate::secrets::seal(&s, WEBHOOK_SECRET_AAD));
+            c.execute("UPDATE portal_targets SET webhook_secret=?1 WHERE id=?2", params![sealed, id])?;
             Ok(())
         })
         .await
@@ -561,10 +632,7 @@ impl Db {
 
     pub async fn set_webhook_token(&self, id: i64, token: Option<String>) -> Result<(), String> {
         self.call(move |c| {
-            c.execute(
-                "UPDATE portal_targets SET webhook_token=?1 WHERE id=?2",
-                params![token, id],
-            )?;
+            c.execute("UPDATE portal_targets SET webhook_token=?1 WHERE id=?2", params![token, id])?;
             Ok(())
         })
         .await
@@ -578,8 +646,7 @@ impl Db {
         commit_sha: Option<String>,
         commit_message: Option<String>,
     ) -> Result<i64, String> {
-        self.start_run_labeled(target_id, triggered_by, commit_sha, commit_message, None)
-            .await
+        self.start_run_labeled(target_id, triggered_by, commit_sha, commit_message, None).await
     }
 
     pub async fn start_run_labeled(
@@ -843,6 +910,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secrets_are_encrypted_at_rest() {
+        let db = Db::open_in_memory().unwrap();
+        let mut t = input("a");
+        t.env_vars = Some("DB_PASSWORD=hunter2".into());
+        let id = db.insert_target(t).await.unwrap();
+        db.set_webhook_secret(id, Some("whsec".into())).await.unwrap();
+
+        let raw: (String, String) = db
+            .call(move |c| {
+                c.query_row("SELECT env_vars, webhook_secret FROM portal_targets WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert!(raw.0.starts_with("enc1:") && !raw.0.contains("hunter2"), "env stored sealed: {}", raw.0);
+        assert!(raw.1.starts_with("enc1:") && !raw.1.contains("whsec"));
+
+        let back = db.get_target(id).await.unwrap().unwrap();
+        assert_eq!(back.env_vars, "DB_PASSWORD=hunter2");
+        assert_eq!(back.webhook_secret.as_deref(), Some("whsec"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_from_before_is_sealed_at_start() {
+        crate::secrets::ensure_test_key();
+        let conn = Connection::open_in_memory().unwrap();
+        let db = Db::init(conn).unwrap();
+        let id = db.insert_target(input("a")).await.unwrap();
+        db.call(move |c| c.execute("UPDATE portal_targets SET env_vars='OLD=1' WHERE id=?1", [id]))
+            .await
+            .unwrap();
+        db.call(seal_plaintext_secrets).await.unwrap();
+        let raw: String = db
+            .call(move |c| c.query_row("SELECT env_vars FROM portal_targets WHERE id=?1", [id], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert!(crate::secrets::is_sealed(&raw));
+        assert_eq!(db.get_target(id).await.unwrap().unwrap().env_vars, "OLD=1");
+    }
+
+    #[tokio::test]
+    async fn unreadable_env_survives_a_save() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_target(input("a")).await.unwrap();
+        // A value sealed under some other key: it cannot be opened here.
+        let foreign = format!("enc1:{}", "ab".repeat(40));
+        let stored = foreign.clone();
+        db.call(move |c| c.execute("UPDATE portal_targets SET env_vars=?1 WHERE id=?2", params![stored, id]))
+            .await
+            .unwrap();
+        assert_eq!(db.get_target(id).await.unwrap().unwrap().env_vars, "", "reads as empty");
+
+        db.update_target(id, input("a")).await.unwrap(); // a save with empty variables
+        let raw: String = db
+            .call(move |c| c.query_row("SELECT env_vars FROM portal_targets WHERE id=?1", [id], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(raw, foreign, "the undecryptable value is kept for when the key comes back");
+
+        let mut set = input("a");
+        set.env_vars = Some("NEW=1".into());
+        db.update_target(id, set).await.unwrap(); // entering new values replaces it
+        assert_eq!(db.get_target(id).await.unwrap().unwrap().env_vars, "NEW=1");
+    }
+
+    #[tokio::test]
     async fn webhook_token_lookup() {
         let db = Db::open_in_memory().unwrap();
         let id = db.insert_target(input("a")).await.unwrap();
@@ -857,13 +991,8 @@ mod tests {
     async fn history_cascades_on_target_delete() {
         let db = Db::open_in_memory().unwrap();
         let id = db.insert_target(input("a")).await.unwrap();
-        let run = db
-            .start_run(id, "MANUAL".into(), Some("abc123".into()), Some("fix".into()))
-            .await
-            .unwrap();
-        db.finish_run(run, "SUCCESS", Some(0), 12, "hello".into())
-            .await
-            .unwrap();
+        let run = db.start_run(id, "MANUAL".into(), Some("abc123".into()), Some("fix".into())).await.unwrap();
+        db.finish_run(run, "SUCCESS", Some(0), 12, "hello".into()).await.unwrap();
         db.insert_scan(id, 1, 2, "{}".into()).await.unwrap();
         let r = db.get_run(run).await.unwrap().unwrap();
         assert_eq!(r.status, "SUCCESS");

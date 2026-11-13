@@ -71,14 +71,30 @@ pub fn resolve(dir: &Path, setting: Option<&str>) -> Result<Option<PyEnv>, Strin
 }
 
 /// The Python that the built-in commands run: the target's environment, else
-/// an environment in the folder, else `python` from PATH.
+/// an environment in the folder, else the system Python from PATH.
 pub fn command_python(dir: &Path, setting: Option<&str>) -> String {
     resolve(dir, setting)
         .ok()
         .flatten()
         .or_else(|| detect(dir))
         .map(|e| e.python.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "python".to_string())
+        .unwrap_or_else(|| system_python(std::env::var_os("PATH")).to_string())
+}
+
+/// The name of the Python on PATH. Windows installs `python`; macOS and many
+/// Linux systems ship only `python3`, so prefer that one there and fall back
+/// to `python` when only that exists (or neither is found).
+pub fn system_python(path: Option<OsString>) -> &'static str {
+    if cfg!(windows) {
+        return "python";
+    }
+    let dirs: Vec<PathBuf> = path.map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let found = |name: &str| dirs.iter().any(|d| d.join(name).is_file());
+    if !found("python3") && found("python") {
+        "python"
+    } else {
+        "python3"
+    }
 }
 
 impl PyEnv {
@@ -153,13 +169,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn system_python_prefers_python3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (both, only_py, none) =
+            (tmp.path().join("both"), tmp.path().join("only"), tmp.path().join("none"));
+        for d in [&both, &only_py, &none] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(both.join("python3"), "").unwrap();
+        std::fs::write(both.join("python"), "").unwrap();
+        std::fs::write(only_py.join("python"), "").unwrap();
+        assert_eq!(system_python(Some(both.into_os_string())), "python3");
+        assert_eq!(system_python(Some(only_py.into_os_string())), "python");
+        assert_eq!(system_python(Some(none.into_os_string())), "python3");
+        assert_eq!(system_python(None), "python3");
+    }
+
+    #[test]
     fn off_auto_and_a_named_folder() {
         let project = tempfile::tempdir().unwrap();
         let dir = project.path();
         assert_eq!(resolve(dir, None), Ok(None));
         assert_eq!(resolve(dir, Some("  ")), Ok(None));
         assert_eq!(resolve(dir, Some(AUTO)), Ok(None), "auto with no environment is not an error");
-        assert_eq!(command_python(dir, Some(AUTO)), "python");
+        let system = system_python(std::env::var_os("PATH"));
+        assert_eq!(command_python(dir, Some(AUTO)), system, "no environment: the system Python");
 
         // `venv` is found, and `.venv` wins once it exists.
         make_env(&dir.join("venv"));

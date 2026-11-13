@@ -156,11 +156,7 @@ pub fn tree_rows(root: u32, table: &[ProcRow]) -> Vec<&ProcRow> {
 #[cfg(test)]
 pub fn tree_usage(root: u32, table: &[ProcRow]) -> (f32, u64, u32) {
     let rows = tree_rows(root, table);
-    (
-        rows.iter().map(|r| r.cpu).sum(),
-        rows.iter().map(|r| r.mem).sum(),
-        rows.len() as u32,
-    )
+    (rows.iter().map(|r| r.cpu).sum(), rows.iter().map(|r| r.mem).sum(), rows.len() as u32)
 }
 
 /// Condense one target's minute into a database row. `health` holds the
@@ -241,10 +237,8 @@ fn sample(sys: &mut System, own: Pid, want_table: bool) -> Snapshot {
     } else {
         Vec::new()
     };
-    let (manager_cpu, manager_mem) = sys
-        .process(own)
-        .map(|p| (p.cpu_usage(), p.memory()))
-        .unwrap_or((0.0, 0));
+    let (manager_cpu, manager_mem) =
+        sys.process(own).map(|p| (p.cpu_usage(), p.memory())).unwrap_or((0.0, 0));
     Snapshot {
         table,
         host_cpu: sys.global_cpu_usage(),
@@ -273,20 +267,15 @@ fn read_disks() -> Vec<DiskInfo> {
 
 /// Write the finished minute to the database and start a new one.
 async fn flush_minute(state: &Arc<AppState>, minute_start: i64) {
-    let accs: HashMap<i64, MinuteAcc> = state
-        .metrics
-        .lock()
-        .map(|mut m| std::mem::take(&mut m.minute))
-        .unwrap_or_default();
+    let accs: HashMap<i64, MinuteAcc> =
+        state.metrics.lock().map(|mut m| std::mem::take(&mut m.minute)).unwrap_or_default();
     let (from, to) = (minute_start as u64, minute_start as u64 + 60);
     let probes: HashMap<i64, Vec<HealthSample>> = state
         .health_history
         .lock()
         .map(|h| {
             h.iter()
-                .map(|(id, ring)| {
-                    (*id, ring.iter().filter(|s| s.t >= from && s.t < to).cloned().collect())
-                })
+                .map(|(id, ring)| (*id, ring.iter().filter(|s| s.t >= from && s.t < to).cloned().collect()))
                 .collect()
         })
         .unwrap_or_default();
@@ -327,10 +316,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
             store.os_version = System::long_os_version();
             store.disks = disks;
         }
-        let _ = state
-            .db
-            .prune_metric_points(now_secs() as i64 - RETENTION_SECS)
-            .await;
+        let _ = state.db.prune_metric_points(now_secs() as i64 - RETENTION_SECS).await;
 
         let mut current_minute = now_secs() as i64 / 60;
         loop {
@@ -399,15 +385,13 @@ pub fn spawn_worker(state: Arc<AppState>) {
                             mem: r.mem,
                         })
                         .collect();
-                    list.sort_by(|a, b| b.mem.cmp(&a.mem));
+                    list.sort_by_key(|p| std::cmp::Reverse(p.mem));
                     list.truncate(50);
                     store.processes.insert(*target_id, list);
                 }
                 // Forget series of targets that have been idle for a while.
                 let horizon = t.saturating_sub(SAMPLE_INTERVAL.as_secs() * SAMPLES_KEPT as u64);
-                store
-                    .targets
-                    .retain(|_, ring| ring.back().map(|s| s.t >= horizon).unwrap_or(false));
+                store.targets.retain(|_, ring| ring.back().map(|s| s.t >= horizon).unwrap_or(false));
             }
 
             let minute = t as i64 / 60;
@@ -498,12 +482,12 @@ mod tests {
     #[test]
     fn usage_is_summed_over_the_process_tree() {
         let table = vec![
-            row(10, Some(1), 100, 1.0, 1_000),  // cmd.exe (root)
+            row(10, Some(1), 100, 1.0, 1_000),   // cmd.exe (root)
             row(11, Some(10), 101, 20.0, 5_000), // python
             row(12, Some(11), 102, 5.0, 2_000),  // worker
             row(13, Some(11), 102, 0.5, 500),
-            row(20, Some(1), 90, 50.0, 9_000),   // unrelated
-            row(30, Some(10), 50, 9.0, 9_999),   // older than its "parent": recycled pid
+            row(20, Some(1), 90, 50.0, 9_000), // unrelated
+            row(30, Some(10), 50, 9.0, 9_999), // older than its "parent": recycled pid
         ];
         let (cpu, mem, procs) = tree_usage(10, &table);
         assert!((cpu - 26.5).abs() < 0.001);
@@ -551,7 +535,12 @@ mod tests {
         for (cpu, mem) in [(2.0f32, 100u64), (4.0, 300)] {
             acc.add(&ProcSample { t: 0, cpu, mem, procs: 3, read_bps: 0, write_bps: 0 });
         }
-        let health = [probe(60, "LIVE", Some(10)), probe(75, "SLOW", Some(30)), probe(90, "DOWN", None), probe(105, "LIVE", Some(20))];
+        let health = [
+            probe(60, "LIVE", Some(10)),
+            probe(75, "SLOW", Some(30)),
+            probe(90, "DOWN", None),
+            probe(105, "LIVE", Some(20)),
+        ];
         let p = minute_point(7, 60, Some(&acc), &health).unwrap();
         assert_eq!((p.target_id, p.t), (7, 60));
         assert_eq!(p.cpu, Some(3.0));
@@ -567,19 +556,29 @@ mod tests {
     }
 
     fn pt(t: i64, probes: i64, up: i64, cpu: Option<f64>) -> MetricPoint {
-        MetricPoint { target_id: 1, t, cpu, mem: cpu.map(|c| c as i64 * 10), mem_max: cpu.map(|c| c as i64 * 20), procs: Some(1), latency: None, probes, probes_up: up }
+        MetricPoint {
+            target_id: 1,
+            t,
+            cpu,
+            mem: cpu.map(|c| c as i64 * 10),
+            mem_max: cpu.map(|c| c as i64 * 20),
+            procs: Some(1),
+            latency: None,
+            probes,
+            probes_up: up,
+        }
     }
 
     #[test]
     fn outages_are_found_and_points_bucketed() {
         let points = vec![
             pt(0, 4, 4, Some(1.0)),
-            pt(60, 4, 0, Some(3.0)),   // down ...
+            pt(60, 4, 0, Some(3.0)), // down ...
             pt(120, 4, 0, None),
-            pt(180, 0, 0, None),       // no probes this minute: ignored
-            pt(240, 4, 0, None),       // ... still the same outage (gap of 2 minutes)
-            pt(300, 4, 2, Some(5.0)),  // partly up: outage over
-            pt(900, 4, 0, None),       // a second, still open, outage
+            pt(180, 0, 0, None),      // no probes this minute: ignored
+            pt(240, 4, 0, None),      // ... still the same outage (gap of 2 minutes)
+            pt(300, 4, 2, Some(5.0)), // partly up: outage over
+            pt(900, 4, 0, None),      // a second, still open, outage
         ];
         assert_eq!(
             outages(&points),

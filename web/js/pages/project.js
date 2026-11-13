@@ -35,7 +35,8 @@ function projectView(name) {
             // Start and stop go through the server so the start order is honoured.
             btn("Start all", () => act(async () => { const r = await api("POST", "/api/projects/" + encodeURIComponent(name) + "/start"); toast("Starting in order: " + r.starting.join(" → ")); }), "hl", "play"),
             btn("Restart all", () => each((t) => t.running, "restart", "Restarting"), "warnc", "restart"),
-            btn("Stop all", () => act(() => api("POST", "/api/projects/" + encodeURIComponent(name) + "/stop"), "Stopping…"), "danger", "stop"))));
+            btn("Stop all", () => act(() => api("POST", "/api/projects/" + encodeURIComponent(name) + "/stop"), "Stopping…"), "danger", "stop"),
+            reportLink("/api/reports/project/" + encodeURIComponent(name), "PDF report"))));
       rows.replaceChildren(table(["Process", "Status", "Runs", "Resources", "Git", ""], now.map((t) => [
         h("div", {}, h("span", { class: "c" + (color.get(t.id) % 6), style: "font-weight:700" }, "● "), h("a", { href: "#/target/" + t.id, style: "font-weight:600" }, t.name), " ", h("span", { class: "tag" }, t.run_mode === "SERVICE" ? "Service" : "Task"),
           h("div", { class: "dim mono", style: "font-size:11.5px;margin-top:2px" }, t.script_name),
