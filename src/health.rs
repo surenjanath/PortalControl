@@ -244,19 +244,38 @@ fn still_starting(uptime: Option<Duration>, status: &str) -> bool {
     status == "DOWN" && uptime.is_some_and(|u| u < STARTUP_GRACE)
 }
 
+/// Whether a routine probe counts towards a target's health history. A
+/// service that is stopped on purpose, or not started yet (for example just
+/// after the manager started), is not having an outage: only its current
+/// status is updated. One whose last run failed has crashed, and that counts.
+fn record_mode(service: bool, running: bool, last_status: Option<&str>) -> Record {
+    if service && !running && last_status != Some("FAILED") {
+        Record::StatusOnly
+    } else {
+        Record::All
+    }
+}
+
 pub fn spawn_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             if let Ok(targets) = state.db.list_targets().await {
+                let last_runs = state.db.last_runs().await.unwrap_or_default();
+                let running: Vec<i64> = state.running.lock().await.keys().copied().collect();
                 let mut probed = Vec::new();
                 for t in targets {
                     let Some(url) = t.health_url.filter(|u| !u.trim().is_empty()) else {
                         continue;
                     };
                     probed.push(t.id);
+                    let record = record_mode(
+                        t.run_mode == "SERVICE",
+                        running.contains(&t.id),
+                        last_runs.get(&t.id).map(|r| r.status.as_str()),
+                    );
                     let st = state.clone();
                     tokio::spawn(async move {
-                        probe_target(&st, t.id, &url).await;
+                        probe_target_with(&st, t.id, &url, record).await;
                     });
                 }
                 if let Ok(mut map) = state.health.lock() {
@@ -275,6 +294,15 @@ pub fn spawn_worker(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn stopped_services_are_not_outages() {
+        assert!(record_mode(true, false, None) == Record::StatusOnly, "never started");
+        assert!(record_mode(true, false, Some("SUCCESS")) == Record::StatusOnly, "stopped on purpose");
+        assert!(record_mode(true, false, Some("FAILED")) == Record::All, "crashed: an outage");
+        assert!(record_mode(true, true, None) == Record::All, "running");
+        assert!(record_mode(false, false, None) == Record::All, "a task's URL is someone else's service");
+    }
 
     #[test]
     fn startup_grace() {

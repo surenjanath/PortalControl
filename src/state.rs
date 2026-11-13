@@ -116,6 +116,9 @@ pub struct AppState {
     pub clients: Mutex<HashMap<std::net::IpAddr, crate::netcfg::ClientSeen>>,
     /// Set when the manager should start again after it has stopped.
     pub restart: std::sync::atomic::AtomicBool,
+    /// Held while the scanner tools are installed or repaired (`toolbox.rs`),
+    /// with the outcome of the last attempt.
+    pub tools: tokio::sync::Mutex<crate::toolbox::LastInstall>,
 }
 
 impl AppState {
@@ -148,6 +151,7 @@ impl AppState {
             net_limits: Mutex::new(crate::netcfg::Limits::default()),
             clients: Mutex::new(HashMap::new()),
             restart: std::sync::atomic::AtomicBool::new(false),
+            tools: tokio::sync::Mutex::new(crate::toolbox::LastInstall::default()),
         })
     }
 

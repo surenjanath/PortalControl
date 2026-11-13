@@ -239,3 +239,31 @@ pub(super) async fn network_put(
     state.activity("info", "system", None, "Network settings changed");
     Ok(ok(network_view(&state).await))
 }
+
+// ---------------------------------------------------------- scanner tools --
+
+pub(super) async fn tools_status(State(state): State<Arc<AppState>>) -> AppResult {
+    Ok(ok(crate::toolbox::status(&state).await))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct ToolsInstallRequest {
+    pub(super) mode: crate::toolbox::Mode,
+}
+
+/// Install, repair or update the scanner tools in the background; progress
+/// arrives as `tools_changed` events and in Activity.
+pub(super) async fn tools_install(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<ToolsInstallRequest>>,
+) -> AppResult {
+    let mode = body.map(|Json(b)| b.mode).unwrap_or(crate::toolbox::Mode::Install);
+    if state.tools.try_lock().is_err() {
+        return Err(fail(StatusCode::CONFLICT, "the scanner tools are already being installed"));
+    }
+    let st = state.clone();
+    tokio::spawn(async move {
+        let _ = crate::toolbox::ensure(&st, mode, "requested from Settings").await;
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({"installing": true}))).into_response())
+}

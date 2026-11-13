@@ -11,11 +11,38 @@ Built from [`prd.md`](prd.md). The dashboard is laid out like a self-hosted depl
 panel: a sidebar, projects, and a page per target with Configuration, Deployments,
 Logs, Metrics and Security tabs.
 
+![The PortalControl dashboard: totals, a "Needs attention" list, host resources and a card per target](docs/screenshots/dashboard.png)
+
+## Screenshots
+
+*Taken from a demo setup: a Django shop with a web server, a migration task and a
+Django-Q worker, a Node API gateway, a nightly report job and a job that fails on
+purpose.*
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/project.png" alt="Project page: processes in start order, Start all / Restart all / Stop all, and their terminals merged"><br><b>Project page.</b> Every process of a project, started in order, with one merged terminal.</td>
+    <td width="50%"><img src="docs/screenshots/target.png" alt="Target page, Configuration tab: live status, last deployment, commit and health strip"><br><b>Target page.</b> Live status, last deployment, checked-out commit and health history.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/new-target.png" alt="New target page detecting a Django project and offering to write a start script"><br><b>New target.</b> Point it at a folder; it detects the framework, branch and a free port.</td>
+    <td><img src="docs/screenshots/security.png" alt="Security tab with bandit findings, pip-audit results and scan history"><br><b>Security scans.</b> bandit and pip-audit findings with scan history.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/metrics.png" alt="Metrics tab with CPU, memory and disk charts for the process tree"><br><b>Metrics.</b> CPU, memory, disk and response time of the whole process tree.</td>
+    <td><img src="docs/screenshots/scanner-tools.png" alt="Settings, Scanner Tools: bandit and pip-audit installed by PortalControl"><br><b>Scanner tools.</b> Installed and repaired by PortalControl itself.</td>
+  </tr>
+</table>
+
+![Two pages of PDF reports: the overall report with summary, needs-attention list and targets table, and a project report with a target's details, runs and security findings](docs/screenshots/pdf-report.png)
+
+*PDF reports: the overall report (left) and a page of a project report (right).*
+
 ## Dashboard at a glance
 
 | Page | What it shows |
 | --- | --- |
-| Dashboard | Totals (running, reachable, updates available, failing, security findings), host CPU and memory, target cards grouped by project, recent deployments and activity |
+| Dashboard | Totals (running, reachable, updates available, failing, critical issues and vulnerable packages), a **Needs attention** list with a link to fix each item, host CPU and memory, target cards grouped by project with health uptime, recent deployments and activity, and the overall **PDF report** |
 | Projects | Every target with status, Git state, health strip, last deployment and quick actions |
 | Target → Configuration | General, Environment Variables, Git Source, Health Check, Scheduled Task, Webhooks, Advanced, Danger Zone |
 | Target → Deployments | Every run with trigger, commit, duration and exit code; click one for its full log |
@@ -23,9 +50,9 @@ Logs, Metrics and Security tabs.
 | Target → Commands | One-click maintenance commands (migrate, collectstatic, pip install …) |
 | Target → Logs | Live output with filter, stream selector, follow, wrap, copy and download |
 | Target → Metrics | CPU and memory of the whole process tree, health response time, run durations |
-| Target → Security | bandit and pip-audit findings, with scan history |
+| Target → Security | bandit and pip-audit findings, with scan history; missing scanner tools are installed automatically |
 | Deployments / Security / Activity | The same information across all targets, plus an event feed |
-| Settings | Start at login, manager details, resource charts, the manager's own log, shutdown |
+| Settings | Start at login, manager details, resource charts, scanner tools, the manager's own log, shutdown |
 
 ## Projects with several processes
 
@@ -126,6 +153,41 @@ the project's virtualenv when it has one. It streams to the log and is recorded 
 Deployments like any other run, and it runs **next to a live service** without stopping
 it. Commands that change something ask first, and are stopped after 15 minutes. Only
 this fixed list can be run: the dashboard never executes text you type.
+
+## PDF reports
+
+**PDF report** on the dashboard downloads a report of everything PortalControl
+supervises; the button on a project page (or *PDF report* next to a project on the
+dashboard) downloads one for that project.
+
+- **Overall report:** summary figures, what needs attention, each project, every target
+  with status, Git state, health uptime, last run and security, and recent deployments.
+- **Project report:** the same for the project, then a section per process: status,
+  folder and script, branch and commit, health check and uptime, average and peak CPU
+  and memory over 24 hours, schedule, start order, Python environment, recent runs, and
+  the latest security findings with the fix version of each vulnerable package.
+- Reports never contain secrets: environment variables are counted, not listed, and
+  webhook tokens and secrets are left out.
+- They are generated by PortalControl itself (no browser printing, no extra program)
+  and open in any PDF reader. `GET /api/reports/overall.pdf` and
+  `GET /api/reports/project/{name}` return them for scripts.
+
+## Self-healing scanner tools
+
+Security scans need `bandit` and `pip-audit`, and you no longer have to install them.
+When a scan finds one missing, or installed but broken, PortalControl installs it into
+its own environment in the data folder (`tools/venv`) and runs the scan again; the
+activity feed records each step. Your system Python and your projects' environments
+are never changed. **Settings → Scanner Tools** shows where each tool comes from and
+can install, reinstall or update them.
+
+Installing needs Python 3 on the machine (on Windows from python.org; on Debian and
+Ubuntu also `python3-venv`) and access to PyPI. A tool already on `PATH` is still used
+when PortalControl has no copy of its own.
+
+When every line of `requirements.txt` pins an exact version (`name==1.2.3`), the audit
+reads the list as written instead of installing each package to resolve it, so old
+pinned releases are audited even where they would no longer build.
 
 ## Database backups
 
@@ -502,6 +564,9 @@ protection*).
 | GET | `/api/fs/pyenv?dir=…&env=…` | Which Python environment a setting leads to |
 | GET | `/api/system` | Version, build, host and runtime details (the About page) |
 | GET / PUT | `/api/system/network` | Network settings: what is saved, what is running, this computer's addresses |
+| GET | `/api/system/tools` | Scanner tools: where each comes from, its version, the Python used to install, install state |
+| POST | `/api/system/tools/install` | Install, repair or update the scanner tools (`{"mode": "install" \| "repair" \| "upgrade"}`) |
+| GET | `/api/reports/overall.pdf`, `/api/reports/project/{name}` | PDF report of everything / of one project |
 | POST | `/api/system/restart` | Stop and start again with the same options |
 | GET | `/api/targets/{id}/network` | Which addresses a project's port answers on |
 | POST | `/api/targets/{id}/commands/{command}`, `/commands/stop` | Run a quick command / stop the running one |

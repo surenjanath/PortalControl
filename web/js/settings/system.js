@@ -38,6 +38,39 @@ SET.resources = () => {
   return { el: [h("p", { class: "muted small", style: "margin-top:-6px" }, "The last 15 minutes, refreshed every 5 seconds."), charts], cleanup: () => clearInterval(timer) };
 };
 
+// Scanner tools (bandit, pip-audit) kept in PortalControl's own environment; see toolbox.rs.
+SET.tools = () => {
+  const c = h("div", { class: "muted" }, "Checking\u2026");
+  let timer = null, busy = false;
+  const label = { managed: ["ok", "Installed by PortalControl"], system: ["info", "Found on this computer"], broken: ["err", "Broken \u2014 repair it"], missing: ["warn", "Not installed"] };
+  const load = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const s = await api("GET", "/api/system/tools");
+      const allOk = s.tools.every((t) => t.source === "managed" || t.source === "system");
+      const install = (mode) => act(() => api("POST", "/api/system/tools/install", { mode }), { install: "Installing", repair: "Reinstalling", upgrade: "Updating" }[mode] + " scanner tools\u2026").then(() => setTimeout(load, 500));
+      c.className = "";
+      c.replaceChildren(
+        h("div", { class: "note-box" }, "Security scans use bandit and pip-audit. If one is missing or broken when a scan starts, PortalControl installs it by itself into its own environment in the data folder and runs the scan again. Your system Python and your projects are never changed. Installing needs Python 3 and an internet connection to PyPI."),
+        h("div", { class: "box" },
+          h("table", { class: "tbl" }, h("thead", {}, h("tr", {}, h("th", {}, "Tool"), h("th", {}, "State"), h("th", {}, "Version"))),
+            h("tbody", {}, s.tools.map((t) => { const [cls, text] = label[t.source] || ["", t.source]; return h("tr", {}, h("td", { class: "mono" }, t.name), h("td", {}, h("span", { class: "pill " + cls }, h("span", { class: "dot " + cls }), text)), h("td", { class: "mono small" }, t.version || "\u2013")); }))),
+          facts([["Python for installing", s.python ? h("span", { class: "mono" }, s.python.command + " (" + s.python.version + ")") : h("span", { class: "t-err" }, "No Python 3 found \u2014 install it from python.org first")],
+            ["Tool environment", h("span", { class: "mono small" }, s.dir || "\u2013")],
+            ["Last install", s.installing ? h("span", {}, h("span", { class: "dot info pulse" }), " Installing now\u2026") : s.last && s.last.at ? h("span", { class: s.last.ok ? "" : "t-err" }, s.last.at.replace("T", " ").replace("Z", " UTC") + " \u00b7 " + s.last.message) : "Never"]]),
+          h("div", { class: "rowf", style: "margin-top:12px" },
+            btn(allOk ? "Reinstall" : "Install now", () => install(allOk || s.tools.some((t) => t.source === "broken") ? "repair" : "install"), allOk ? "" : "hl", "download", { disabled: s.installing || !s.python }),
+            btn("Update to latest", () => install("upgrade"), "", "restart", { disabled: s.installing || !s.python }))));
+      clearTimeout(timer);
+      if (s.installing) timer = setTimeout(load, 2500);
+    } catch (e) { c.replaceChildren(h("div", { class: "note-box err" }, e.message)); }
+    busy = false;
+  };
+  load();
+  return { el: c, update: () => {}, cleanup: () => clearTimeout(timer) };
+};
+
 SET.log = () => {
   const logPre = h("pre", { class: "log", style: "height:460px" }), logPath = h("span", { class: "dim small mono" });
   const load = () => {

@@ -39,6 +39,7 @@ mod commands;
 mod detect;
 mod inspect;
 mod manager;
+mod reports;
 mod targets;
 mod tools;
 mod transfer;
@@ -53,6 +54,7 @@ use commands::*;
 use detect::*;
 use inspect::*;
 use manager::*;
+use reports::*;
 use targets::*;
 use tools::*;
 use transfer::*;
@@ -154,6 +156,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/system/shutdown", post(shutdown))
         .route("/api/system/restart", post(restart))
         .route("/api/system/network", get(network_get).put(network_put))
+        .route("/api/system/tools", get(tools_status))
+        .route("/api/reports/overall.pdf", get(report_overall))
+        .route("/api/reports/project/{name}", get(report_project))
+        .route("/api/system/tools/install", post(tools_install))
         .route("/ws", get(ws_upgrade))
         .route("/assets/{*path}", get(asset))
         .route("/api/auth/status", get(auth_status))

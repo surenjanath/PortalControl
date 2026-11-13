@@ -21,11 +21,14 @@ mod health;
 mod metrics;
 mod net;
 mod netcfg;
+mod pdf;
 mod pyenv;
+mod report;
 mod runner;
 mod secrets;
 mod security;
 mod state;
+mod toolbox;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
 mod util;

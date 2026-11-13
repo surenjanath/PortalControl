@@ -66,9 +66,25 @@ async fn capture(program: &str, args: &[String], dir: &Path) -> Result<ToolOutpu
     }
 }
 
-/// Run a Python CLI tool: first the console script on PATH, then
-/// `python -m <module>` so a `pip install --user` without PATH also works.
-async fn run_tool(exe: &str, module: &str, args: &[String], dir: &Path) -> Result<ToolOutput, ToolError> {
+/// Run a Python CLI tool: PortalControl's own copy (`toolbox.rs`) when it is
+/// installed, then the console script on PATH, then `python -m <module>` so a
+/// `pip install --user` without PATH also works.
+async fn run_tool(
+    state: &AppState,
+    exe: &str,
+    module: &str,
+    args: &[String],
+    dir: &Path,
+) -> Result<ToolOutput, ToolError> {
+    if let Some(managed) = crate::toolbox::managed_program(state, exe) {
+        match capture(&managed.to_string_lossy(), args, dir).await {
+            Ok(out) if !crate::toolbox::looks_broken(&out.stderr) || !out.stdout.trim().is_empty() => {
+                return Ok(out)
+            }
+            // A damaged managed copy: fall through to other installations.
+            _ => {}
+        }
+    }
     match capture(exe, args, dir).await {
         Ok(out) => return Ok(out),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -161,6 +177,37 @@ fn find_site_packages(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Does every requirement name one exact version (`name==1.2.3`)? Comments,
+/// blank lines and option lines are ignored; includes (`-r`), editables,
+/// URLs and ranges mean the list has to be resolved.
+pub fn all_pinned(requirements: &str) -> bool {
+    let mut any = false;
+    for line in requirements.lines() {
+        let line = line.split(" #").next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('-') {
+            // Includes, constraints and editables need resolving; other
+            // options (--index-url, --hash ...) do not change versions.
+            let resolving = ["-r", "-c", "-e", "--requirement", "--constraint", "--editable"];
+            if resolving.iter().any(|o| line.starts_with(o)) {
+                return false;
+            }
+            continue;
+        }
+        if line.contains("://") || line.contains(" @ ") {
+            return false;
+        }
+        let spec = line.split(';').next().unwrap_or("");
+        if !spec.contains("==") || spec.contains('*') || spec.matches(['<', '>', '~', '!', ',']).count() > 0 {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// Decide what pip-audit should look at for this target:
 /// the declared requirements, else the project's virtualenv, else the
 /// ambient Python environment.
@@ -169,7 +216,17 @@ pub fn pip_audit_plan(dir: &Path) -> (String, Vec<String>) {
         ["--format", "json", "--progress-spinner", "off"].iter().map(|s| s.to_string()).collect();
     if dir.join("requirements.txt").is_file() {
         args.extend(["-r".to_string(), "requirements.txt".to_string()]);
-        ("requirements.txt".into(), args)
+        let text = std::fs::read_to_string(dir.join("requirements.txt")).unwrap_or_default();
+        if all_pinned(&text) {
+            // Every version is fixed, so nothing has to be resolved: audit the
+            // list as written. Without this pip-audit installs (and may have
+            // to build) every package, which fails for old releases on a new
+            // Python and is slow.
+            args.extend(["--no-deps".to_string(), "--disable-pip".to_string()]);
+            ("requirements.txt (pinned versions)".into(), args)
+        } else {
+            ("requirements.txt".into(), args)
+        }
     } else if let Some(sp) = find_site_packages(dir) {
         args.extend(["--path".to_string(), sp.to_string_lossy().into_owned()]);
         (format!("virtualenv ({})", sp.display()), args)
@@ -178,7 +235,47 @@ pub fn pip_audit_plan(dir: &Path) -> (String, Vec<String>) {
     }
 }
 
-async fn run_bandit(dir: &Path) -> Result<Value, String> {
+/// Run a scanner and parse its JSON report. When the tool is missing, or
+/// broken in a way a reinstall fixes, install it into PortalControl's own
+/// environment and try once more.
+async fn run_scanner(
+    state: &Arc<AppState>,
+    target_id: i64,
+    exe: &str,
+    module: &str,
+    args: &[String],
+    dir: &Path,
+) -> Result<Value, String> {
+    let say = |msg: String| state.log_line(target_id, 0, "system", &format!("[scan] {msg}"), None);
+    let mut healed = false;
+    loop {
+        let (problem, mode) = match run_tool(state, exe, module, args, dir).await {
+            Ok(out) => match parse_json_output(&out.stdout) {
+                Some(v) => return Ok(v),
+                None if crate::toolbox::looks_broken(&out.stderr) => (
+                    format!("{exe} is installed but broken: {}", snippet(&out.stderr)),
+                    crate::toolbox::Mode::Repair,
+                ),
+                None => return Err(format!("{exe} produced no JSON report: {}", snippet(&out.stderr))),
+            },
+            Err(ToolError::NotInstalled) => {
+                (format!("{exe} is not installed"), crate::toolbox::Mode::Install)
+            }
+            Err(ToolError::Failed(e)) => return Err(e),
+        };
+        if healed {
+            return Err(problem);
+        }
+        say(format!("{problem}; installing it into PortalControl's own tool environment"));
+        crate::toolbox::ensure(state, mode, &format!("{exe} was needed for a scan"))
+            .await
+            .map_err(|e| format!("{problem}, and installing it failed: {e}"))?;
+        say(format!("{exe} installed; running the scan again"));
+        healed = true;
+    }
+}
+
+async fn run_bandit(state: &Arc<AppState>, target_id: i64, dir: &Path) -> Result<Value, String> {
     let args: Vec<String> = vec![
         "-r".into(),
         dir.to_string_lossy().into_owned(),
@@ -188,21 +285,16 @@ async fn run_bandit(dir: &Path) -> Result<Value, String> {
         "-x".into(),
         BANDIT_EXCLUDES.into(),
     ];
-    match run_tool("bandit", "bandit", &args, dir).await {
-        Ok(out) => parse_json_output(&out.stdout)
-            .ok_or_else(|| format!("bandit produced no JSON report: {}", snippet(&out.stderr))),
-        Err(ToolError::NotInstalled) => Err("bandit is not installed (run: pip install bandit)".into()),
-        Err(ToolError::Failed(e)) => Err(e),
-    }
+    run_scanner(state, target_id, "bandit", "bandit", &args, dir).await
 }
 
-async fn run_pip_audit(dir: &Path, args: &[String]) -> Result<Value, String> {
-    match run_tool("pip-audit", "pip_audit", args, dir).await {
-        Ok(out) => parse_json_output(&out.stdout)
-            .ok_or_else(|| format!("pip-audit produced no JSON report: {}", snippet(&out.stderr))),
-        Err(ToolError::NotInstalled) => Err("pip-audit is not installed (run: pip install pip-audit)".into()),
-        Err(ToolError::Failed(e)) => Err(e),
-    }
+async fn run_pip_audit(
+    state: &Arc<AppState>,
+    target_id: i64,
+    dir: &Path,
+    args: &[String],
+) -> Result<Value, String> {
+    run_scanner(state, target_id, "pip-audit", "pip_audit", args, dir).await
 }
 
 /// Mark the target as being scanned and run both scanners in the background.
@@ -228,7 +320,8 @@ pub fn start_scan(state: &Arc<AppState>, target: Target) -> Result<(), String> {
         say(format!("bandit -r \"{}\" -f json", dir.display()));
         say(format!("pip-audit --format json  (auditing {mode})"));
 
-        let (bandit, audit) = tokio::join!(run_bandit(&dir), run_pip_audit(&dir, &audit_args));
+        let (bandit, audit) =
+            tokio::join!(run_bandit(&state, id, &dir), run_pip_audit(&state, id, &dir, &audit_args));
 
         let (high, medium, low) = bandit.as_ref().map(bandit_counts).unwrap_or((0, 0, 0));
         let vulnerable = audit.as_ref().map(pip_audit_vulnerable).unwrap_or(0);
@@ -318,6 +411,19 @@ mod tests {
         assert!(parse_json_output("[main] INFO running\n{\"results\": []}").is_some());
         assert!(parse_json_output("no json here").is_none());
         assert!(parse_json_output("").is_none());
+    }
+
+    #[test]
+    fn pinned_requirements_are_recognised() {
+        assert!(all_pinned("Django==4.2.0\nrequests==2.25.1  # http\n\n# comment\n--index-url https://x\n"));
+        assert!(all_pinned("pywin32==306; sys_platform == 'win32'"));
+        assert!(!all_pinned("Django>=4.2"));
+        assert!(!all_pinned("Django==4.2.0\nrequests"));
+        assert!(!all_pinned("-r base.txt\nDjango==4.2.0"));
+        assert!(!all_pinned("-e ."));
+        assert!(!all_pinned("pkg @ https://example.com/pkg.whl"));
+        assert!(!all_pinned("Django==4.*"), "a wildcard is a range");
+        assert!(!all_pinned(""), "nothing to audit is not 'pinned'");
     }
 
     #[test]
