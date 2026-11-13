@@ -142,11 +142,11 @@ pub(super) async fn ai_test(Json(req): Json<AiTestRequest>) -> AppResult {
         monitor::Choice { id: "restart".into(), label: "Restart shop-web".into() },
         monitor::Choice { id: "command:migrate".into(), label: "Run \"Apply migrations\"".into() },
     ];
-    let trigger = monitor::Trigger {
-        target_id: 0,
-        kind: monitor::TriggerKind::ErrorBurst,
-        what: "14 error lines in the last minute (usually about 0.2 per minute)".into(),
-    };
+    let trigger = monitor::Trigger::new(
+        0,
+        monitor::TriggerKind::ErrorBurst,
+        "14 error lines in the last minute (usually about 0.2 per minute)".into(),
+    );
     let lines: Vec<String> = [
         "[2026-11-12 10:41:07] INFO GET /products 200 41ms",
         "[2026-11-12 10:41:09] ERROR Internal Server Error: /checkout",
@@ -231,6 +231,20 @@ pub(super) async fn trace_get(State(state): State<Arc<AppState>>, Path(trace_id)
     Ok(ok(json!({"trace": trace, "incident": incident, "target": target})))
 }
 
+/// The request-log middleware for Django projects (`threat.rs`), as a file
+/// to save next to `manage.py`.
+pub(super) async fn django_middleware() -> axum::response::Response {
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+    (
+        [
+            (CONTENT_TYPE, "text/x-python; charset=utf-8"),
+            (CONTENT_DISPOSITION, "attachment; filename=\"portalcontrol_requestlog.py\""),
+        ],
+        crate::threat::DJANGO_MIDDLEWARE,
+    )
+        .into_response()
+}
+
 /// Counters and settings for the live pipeline view.
 pub(super) async fn monitor_stats(State(state): State<Arc<AppState>>) -> AppResult {
     let settings = monitor::load(&state).await;
@@ -249,6 +263,8 @@ pub(super) async fn monitor_stats(State(state): State<Arc<AppState>>) -> AppResu
         "lines": stats.lines,
         "error_lines": stats.error_lines,
         "flagged": stats.flagged,
+        "requests": stats.requests,
+        "threats": stats.threats,
         "ai_calls": stats.ai_calls,
         "ai_failed": stats.ai_failed,
         "ai_avg_ms": if stats.ai_calls > stats.ai_failed { Some(stats.ai_ms_total / (stats.ai_calls - stats.ai_failed)) } else { None },

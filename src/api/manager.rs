@@ -45,6 +45,11 @@ pub(super) async fn system(State(state): State<Arc<AppState>>) -> AppResult {
         "host": host,
         "data_dir": state.data_dir.get().map(|p| p.display().to_string()),
         "executable": std::env::current_exe().ok().map(|p| p.display().to_string()),
+        "installed": crate::install::is_installed(),
+        "install_path": crate::install::running()
+            .and_then(|me| crate::install::destination(&me))
+            .ok()
+            .map(|d| d.root.display().to_string()),
         "autostart": autostart::status().ok().flatten(),
         "utc_offset_minutes": now.offset().local_minus_utc() / 60,
         "intervals": {
@@ -136,7 +141,7 @@ pub(super) async fn restart(State(state): State<Arc<AppState>>) -> AppResult {
 /// whether the two differ, and what this machine could offer.
 pub(super) async fn network_view(state: &Arc<AppState>) -> Value {
     let saved = netcfg::NetSettings::load(&state.db).await;
-    let active = state.net.get().cloned().unwrap_or_else(|| netcfg::Active::local_only(state.bind.port()));
+    let active = state.net().unwrap_or_else(|| netcfg::Active::local_only(state.bind.port()));
     let (cli_bind, cli_port) = state.cli_net.get().copied().unwrap_or((None, None));
     let next = netcfg::effective(&saved, cli_bind, cli_port, crate::DEFAULT_PORT);
     let addresses = tokio::task::spawn_blocking(netcfg::local_addresses).await.unwrap_or_default();
@@ -157,12 +162,12 @@ pub(super) async fn network_view(state: &Arc<AppState>) -> Value {
     let mut warnings: Vec<String> = Vec::new();
     if let Some(e) = &active.error {
         warnings.push(format!(
-            "Other computers cannot connect right now, because the network address could not be opened: {e}"
+            "Other computers cannot connect right now, because the network address could not be opened: {e}. PortalControl tries again every few seconds and opens it by itself as soon as it can."
         ));
     }
     if !saved.address.is_empty() && !addresses.iter().any(|a| a.ip == saved.address) {
         warnings.push(format!(
-            "This computer does not have the address {} at the moment (is the network or Tailscale connected?). Network access stays off until it does and PortalControl is restarted.",
+            "This computer does not have the address {} at the moment (is the network or Tailscale connected?). Network access stays off until it does.",
             saved.address
         ));
     }

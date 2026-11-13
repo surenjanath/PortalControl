@@ -12,7 +12,7 @@ const RUN_VALUE: &str = "PortalControl";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LAUNCHD_LABEL: &str = "com.portalcontrol.core";
 
-fn current_exe() -> Result<PathBuf, String> {
+pub(crate) fn current_exe() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
     Ok(exe.canonicalize().map(strip_verbatim).unwrap_or(exe))
 }
@@ -64,10 +64,54 @@ fn windows_command_line(exe: &str, serve_args: &[String]) -> String {
     parts.join(" ")
 }
 
+/// The program a login entry starts: the first, quoted part of its command
+/// line (`"C:\x\portalcontrol.exe" serve --detach`).
+#[cfg(any(not(target_os = "macos"), test))]
+fn quoted_exe(command: &str) -> Option<&str> {
+    command.trim_start().strip_prefix('"')?.split_once('"').map(|(exe, _)| exe)
+}
+
+/// The same command line starting another program; the options stay.
+#[cfg(any(not(target_os = "macos"), test))]
+fn with_quoted_exe(command: &str, exe: &str) -> Option<String> {
+    let (_, rest) = command.trim_start().strip_prefix('"')?.split_once('"')?;
+    Some(format!("\"{exe}\"{rest}"))
+}
+
 #[cfg(any(unix, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(any(unix, test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// Where the program's path sits in a launchd plist: the first string of
+/// `ProgramArguments`.
+#[cfg(any(unix, test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plist_exe_span(plist: &str) -> Option<std::ops::Range<usize>> {
+    let args = plist.find("<key>ProgramArguments</key>")?;
+    let open = args + plist[args..].find("<string>")? + "<string>".len();
+    let close = open + plist[open..].find("</string>")?;
+    Some(open..close)
+}
+
+#[cfg(any(unix, test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plist_exe(plist: &str) -> Option<String> {
+    plist_exe_span(plist).map(|span| xml_unescape(&plist[span]))
+}
+
+#[cfg(any(unix, test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plist_with_exe(plist: &str, exe: &str) -> Option<String> {
+    let span = plist_exe_span(plist)?;
+    Some(format!("{}{}{}", &plist[..span.start], xml_escape(exe), &plist[span.end..]))
 }
 
 #[cfg(any(unix, test))]
@@ -92,7 +136,7 @@ fn launchd_plist(exe: &str, serve_args: &[String], log_path: &str) -> String {
     <key>KeepAlive</key>
     <false/>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -160,6 +204,20 @@ mod platform {
             Err(_) => return Ok(None),
         };
         Ok(key.get_value::<String, _>(RUN_VALUE).ok())
+    }
+
+    pub fn registered_exe() -> Option<PathBuf> {
+        status().ok().flatten().and_then(|command| quoted_exe(&command).map(PathBuf::from))
+    }
+
+    pub fn repoint(exe: &std::path::Path) -> Result<(), String> {
+        let command = status()?.ok_or("start at login is not turned on")?;
+        let command = with_quoted_exe(&command, &exe.to_string_lossy())
+            .ok_or("the login entry was not written by PortalControl")?;
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(RUN_KEY)
+            .map_err(|e| format!("cannot open the Run registry key: {e}"))?;
+        key.set_value(RUN_VALUE, &command).map_err(|e| format!("cannot write the Run registry value: {e}"))
     }
 }
 
@@ -229,6 +287,21 @@ mod launchd {
         let path = plist_path(home);
         path.exists().then(|| path.to_string_lossy().into_owned())
     }
+
+    pub fn registered_exe_at(home: &Path) -> Option<PathBuf> {
+        plist_exe(&std::fs::read_to_string(plist_path(home)).ok()?).map(PathBuf::from)
+    }
+
+    /// Only the file is rewritten. launchd reads it at the next login;
+    /// reloading the agent now would start a second manager.
+    pub fn repoint_at(home: &Path, exe: &Path) -> Result<(), String> {
+        let path = plist_path(home);
+        let plist =
+            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let plist = plist_with_exe(&plist, &exe.to_string_lossy())
+            .ok_or("the login agent was not written by PortalControl")?;
+        std::fs::write(&path, plist).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -240,8 +313,24 @@ mod platform {
     }
 
     pub fn install(serve_args: &[String]) -> Result<String, String> {
+        let exe = current_exe()?;
+        if crate::install::is_temporary(&exe) {
+            return Err("PortalControl was opened straight from the download, so macOS runs it from a \
+                        temporary place that is gone after a restart. Install it first (open it again and \
+                        choose Install, or move it to Applications and open it from there), then turn on \
+                        start at login."
+                .into());
+        }
         let log = crate::default_data_dir().join("portalcontrol.launchd.log");
-        launchd::install_at(&home()?, &current_exe()?, serve_args, &log, "launchctl")
+        launchd::install_at(&home()?, &exe, serve_args, &log, "launchctl")
+    }
+
+    pub fn registered_exe() -> Option<PathBuf> {
+        launchd::registered_exe_at(&home().ok()?)
+    }
+
+    pub fn repoint(exe: &std::path::Path) -> Result<(), String> {
+        launchd::repoint_at(&home()?, exe)
     }
 
     pub fn uninstall() -> Result<String, String> {
@@ -309,9 +398,31 @@ mod platform {
         let path = unit_path()?;
         Ok(path.exists().then(|| path.to_string_lossy().into_owned()))
     }
+
+    fn exec_line(unit: &str) -> Option<&str> {
+        unit.lines().find_map(|l| l.strip_prefix("ExecStart="))
+    }
+
+    pub fn registered_exe() -> Option<PathBuf> {
+        let unit = std::fs::read_to_string(unit_path().ok()?).ok()?;
+        quoted_exe(exec_line(&unit)?).map(PathBuf::from)
+    }
+
+    pub fn repoint(exe: &std::path::Path) -> Result<(), String> {
+        let path = unit_path()?;
+        let unit =
+            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let old = exec_line(&unit).ok_or("the unit has no ExecStart line")?;
+        let new = with_quoted_exe(old, &exe.to_string_lossy())
+            .ok_or("the login unit was not written by PortalControl")?;
+        std::fs::write(&path, unit.replacen(old, &new, 1))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+        Ok(())
+    }
 }
 
-pub use platform::{install, status, uninstall};
+pub use platform::{install, registered_exe, repoint, status, uninstall};
 
 #[cfg(test)]
 mod tests {
@@ -387,6 +498,13 @@ mod tests {
         assert!(lines[1].starts_with("unload ") && lines[2].starts_with("load -w "));
         assert!(!std::fs::read_to_string(&plist_path).unwrap().contains("9000"));
 
+        // Pointing the agent at another copy rewrites the file and leaves launchd alone.
+        assert_eq!(launchd::registered_exe_at(&home), Some(exe.clone()));
+        let installed = PathBuf::from("/Applications/PortalControl.app/Contents/MacOS/portalcontrol");
+        launchd::repoint_at(&home, &installed).unwrap();
+        assert_eq!(launchd::registered_exe_at(&home), Some(installed));
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
+
         assert_eq!(launchd::uninstall_at(&home, &fake).unwrap(), "Autostart removed.");
         assert!(!plist_path.exists());
         assert!(std::fs::read_to_string(&calls).unwrap().lines().last().unwrap().starts_with("unload -w "));
@@ -395,6 +513,47 @@ mod tests {
         // A missing launchctl must not fail the install; it reports "next login".
         let msg = launchd::install_at(&home, &exe, &[], &log, "/nonexistent/launchctl").unwrap();
         assert!(msg.contains("next login"), "{msg}");
+    }
+
+    #[test]
+    fn a_login_entry_can_be_pointed_at_another_program_keeping_its_options() {
+        let old = windows_command_line(
+            r"C:\Users\a b\Downloads\PortalControl-0.8.0-windows-x64\portalcontrol.exe",
+            &["--port".into(), "9000".into(), "--data-dir".into(), r"C:\My Data\pc".into()],
+        );
+        assert_eq!(
+            quoted_exe(&old),
+            Some(r"C:\Users\a b\Downloads\PortalControl-0.8.0-windows-x64\portalcontrol.exe")
+        );
+        let new = with_quoted_exe(&old, r"C:\Users\a b\AppData\Local\PortalControl\bin\portalcontrol.exe");
+        assert_eq!(
+            new.as_deref(),
+            Some(
+                r#""C:\Users\a b\AppData\Local\PortalControl\bin\portalcontrol.exe" serve --detach --port 9000 --data-dir "C:\My Data\pc""#
+            )
+        );
+        // Something a person typed by hand is left alone.
+        assert_eq!(quoted_exe("portalcontrol.exe serve"), None);
+        assert_eq!(with_quoted_exe("portalcontrol.exe serve", "x"), None);
+
+        let unit = systemd_unit("/old dir/portalcontrol", &["--port".into(), "9000".into()]);
+        let line = unit.lines().find_map(|l| l.strip_prefix("ExecStart=")).unwrap();
+        assert_eq!(quoted_exe(line), Some("/old dir/portalcontrol"));
+        assert_eq!(
+            with_quoted_exe(line, "/new/portalcontrol").as_deref(),
+            Some("\"/new/portalcontrol\" serve \"--port\" \"9000\"")
+        );
+
+        let plist = launchd_plist("/old/A & B.app/Contents/MacOS/portalcontrol", &["--no-tray".into()], "/l");
+        assert_eq!(plist_exe(&plist).as_deref(), Some("/old/A & B.app/Contents/MacOS/portalcontrol"));
+        let moved = plist_with_exe(&plist, "/Applications/P<1>.app/Contents/MacOS/portalcontrol").unwrap();
+        assert_eq!(plist_exe(&moved).as_deref(), Some("/Applications/P<1>.app/Contents/MacOS/portalcontrol"));
+        assert!(moved.contains("<string>serve</string>\n        <string>--no-tray</string>"));
+        assert_eq!(
+            moved.len() - "/Applications/P&lt;1&gt;.app".len(),
+            plist.len() - "/old/A &amp; B.app".len()
+        );
+        assert_eq!(plist_exe("<plist></plist>"), None);
     }
 
     #[test]

@@ -168,6 +168,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ai/test", post(ai_test))
         .route("/api/traces/{trace_id}", get(trace_get))
         .route("/api/monitor/stats", get(monitor_stats))
+        .route("/api/monitor/django-middleware", get(django_middleware))
         .route("/api/git/tokens", get(tokens_list).put(tokens_put))
         .route("/api/fs/launcher", post(fs_launcher))
         .route("/api/system", get(system))

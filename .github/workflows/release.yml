@@ -119,11 +119,11 @@ jobs:
           cat > ../notes.md <<EOF
           ## Install
 
-          **Windows:** unzip \`PortalControl-$VERSION-windows-x64.zip\` and run \`portalcontrol.exe\`. It starts in the tray, next to the clock, with no terminal window. Windows SmartScreen may ask for confirmation because the program is not code-signed.
+          **Windows:** unzip \`PortalControl-$VERSION-windows-x64.zip\`, double-click \`portalcontrol.exe\` and choose **Yes** when it asks to install. It copies itself to the PortalControl folder under your local application data, replaces the version installed there (stopping it first), adds a Start Menu entry and starts in the tray, next to the clock. Windows SmartScreen may ask for confirmation because the program is not code-signed.
 
-          **macOS:** unzip \`PortalControl-$VERSION-macos-universal.zip\` and move \`PortalControl.app\` to Applications. It runs on Apple Silicon and Intel Macs and lives in the menu bar. The app is not notarised, so the first time right-click it and choose **Open**, or run \`xattr -dr com.apple.quarantine /Applications/PortalControl.app\`.
+          **macOS:** unzip \`PortalControl-$VERSION-macos-universal.zip\`. The app is not notarised, so the first time right-click \`PortalControl.app\` and choose **Open**; then choose **Install**. It copies itself to Applications, replaces the version that is there and lives in the menu bar. It runs on Apple Silicon and Intel Macs.
 
-          Replacing an older version keeps your targets, history and settings: they live in the data folder, not in the program.
+          **Updating** is the same steps with the new download: the installed copy is replaced, "Start at login" keeps working because it points at the installed copy, and your targets, history and settings are kept, because they live in the data folder and not in the program. From a terminal: \`portalcontrol install\`.
           EOF
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "v$VERSION" * --clobber --repo "$GITHUB_REPOSITORY"

@@ -54,6 +54,10 @@ pub struct Stats {
     pub last_ai_ms: Option<u64>,
     pub emails: u64,
     pub last_trace: Option<String>,
+    /// Requests read out of the output, and rule hits of the attack
+    /// detection (`threat.rs`).
+    pub requests: u64,
+    pub threats: u64,
     /// Per target: (lines read, patterns learned, still learning).
     pub targets: HashMap<i64, (u64, usize, bool)>,
 }
@@ -101,6 +105,11 @@ const BURST_FACTOR: f64 = 4.0;
 /// The same trigger on the same target opens at most one incident per this.
 const COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(180);
+/// For a suspected attack: less waiting, fewer raw lines (the evidence
+/// carries the facts), more of the evidence in the email.
+const SECURITY_MODEL_TIMEOUT: Duration = Duration::from_secs(75);
+const SECURITY_RAW_LINES: usize = 30;
+const EMAIL_EVIDENCE_LINES: usize = 45;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -232,6 +241,10 @@ pub enum TriggerKind {
     DeployFailed,
     ErrorBurst,
     NewError,
+    /// From the attack detection (`threat.rs`).
+    Attack,
+    BruteForce,
+    Flood,
 }
 
 impl TriggerKind {
@@ -243,12 +256,19 @@ impl TriggerKind {
             TriggerKind::DeployFailed => "deploy_failed",
             TriggerKind::ErrorBurst => "error_burst",
             TriggerKind::NewError => "new_error",
+            TriggerKind::Attack => "attack",
+            TriggerKind::BruteForce => "brute_force",
+            TriggerKind::Flood => "flood",
         }
+    }
+    /// Someone doing this on purpose, as opposed to something breaking.
+    pub fn is_security(&self) -> bool {
+        matches!(self, TriggerKind::Attack | TriggerKind::BruteForce | TriggerKind::Flood)
     }
     /// The severity when no model gives one.
     fn default_severity(&self) -> Severity {
         match self {
-            TriggerKind::CrashLoop | TriggerKind::HealthDown => Severity::Critical,
+            TriggerKind::CrashLoop | TriggerKind::HealthDown | TriggerKind::Flood => Severity::Critical,
             _ => Severity::Warning,
         }
     }
@@ -260,6 +280,32 @@ pub struct Trigger {
     pub kind: TriggerKind,
     /// What the rule saw, in words.
     pub what: String,
+    /// Attack detection only: the request history, summarised for the
+    /// investigation.
+    pub evidence: String,
+    /// The rule's own severity, when it knows better than the kind's default.
+    pub severity: Option<Severity>,
+}
+
+impl Trigger {
+    pub fn new(target_id: i64, kind: TriggerKind, what: String) -> Self {
+        Self { target_id, kind, what, evidence: String::new(), severity: None }
+    }
+
+    fn from_alarm(target_id: i64, alarm: crate::threat::Alarm) -> Self {
+        let kind = match alarm.kind {
+            crate::threat::Kind::Attack => TriggerKind::Attack,
+            crate::threat::Kind::BruteForce => TriggerKind::BruteForce,
+            crate::threat::Kind::Flood => TriggerKind::Flood,
+        };
+        Self {
+            target_id,
+            kind,
+            what: alarm.what,
+            evidence: alarm.evidence,
+            severity: Some(if alarm.critical { Severity::Critical } else { Severity::Warning }),
+        }
+    }
 }
 
 /// What the monitor has learned about one target's output.
@@ -335,22 +381,22 @@ impl Watch {
         let burst = self.errors.len() >= BURST_MIN
             && self.errors.len() as f64 >= BURST_FACTOR * self.baseline.max(1.0);
         if burst && self.cooled(&TriggerKind::ErrorBurst, now) {
-            return Some(Trigger {
+            return Some(Trigger::new(
                 target_id,
-                kind: TriggerKind::ErrorBurst,
-                what: format!(
+                TriggerKind::ErrorBurst,
+                format!(
                     "{} error lines in the last minute (usually about {:.1} per minute)",
                     self.errors.len(),
                     self.baseline
                 ),
-            });
+            ));
         }
         if learned && !known && self.cooled(&TriggerKind::NewError, now) {
-            return Some(Trigger {
+            return Some(Trigger::new(
                 target_id,
-                kind: TriggerKind::NewError,
-                what: format!("a kind of error this process has not printed before: {}", line.trim()),
-            });
+                TriggerKind::NewError,
+                format!("a kind of error this process has not printed before: {}", line.trim()),
+            ));
         }
         None
     }
@@ -372,7 +418,7 @@ pub fn from_activity(level: &str, kind: &str, target_id: Option<i64>, message: &
         "deploy" | "schedule" => TriggerKind::DeployFailed,
         _ => return None,
     };
-    Some(Trigger { target_id, kind: k, what: message.to_string() })
+    Some(Trigger::new(target_id, k, message.to_string()))
 }
 
 // ------------------------------------------------------------- stage 2 --
@@ -440,6 +486,55 @@ deployment calls for rolling back; restarting only helps transient failures (a c
 and does not fix code, configuration or schema problems. \
 Severity: critical = the service is down or keeps failing; warning = degraded or failing in part; \
 info = noise or already recovered.";
+
+/// The model's brief when the rules suspect an attack instead of a fault.
+pub const SECURITY_PROMPT: &str = "You are the security analyst inside PortalControl, a tool that runs and supervises \
+web applications (mostly Django) on one machine. Its attack detection flagged the requests one application is \
+receiving. You are given the rule that fired and the evidence: counts of recent requests, who sent them, what was \
+asked for, what the application answered, everything the main sender did, and the latest raw log lines. \
+Investigate it like an incident responder and report for a busy administrator. Work only from the evidence; \
+when it names the sender this incident is about, report on that sender only: what other senders did in the same minutes is separate activity and must not be attributed to this one or merged into this incident. A `user=` on a row is the account that was signed in for that request, not who the sender claims to be. \
+The raw log lines at the end contain every sender; use them only to check a detail. Django's message \
+\"You may need to add ... to ALLOWED_HOSTS\" is its standard hint: for a forged Host header that name must \
+NOT be added. \
+When the evidence does not show something, say so. Decide and state: (1) what kind of activity this is (for example SQL \
+injection attempts, path traversal, a vulnerability scanner, password guessing, a flood meant to overload the \
+application) or that it is harmless (a monitoring tool, a misbehaving script or page of their own, a search engine); \
+(2) who is doing it: the address, and whether it is on the local network (10.x, 172.16-31.x, 192.168.x, 100.64-127.x) \
+or outside, and the signed-in user if there is one; (3) whether anything succeeded. Read the answers: 404, 403 and \
+400 mean the application refused; a 500 means the request broke something and may have found a weakness; a 2xx \
+answer to an injection or to a secret file such as /.env means it may have worked; a sign-in accepted (302) after \
+many failures means a password was probably guessed. Put the kind of activity and the sender in `title`, what \
+happened and whether it succeeded in `summary`, and what they were after and how you can tell in `likely_cause`. \
+In `action_reason` say what the administrator should do now: for example block the address at the firewall or \
+router, change the password of the account and end its sessions, remove or protect the exposed file, fix the \
+code that the request broke, or nothing. For `action` choose an offered id only when it really helps, such as a \
+restart to recover an application that a flood has made unresponsive; restarting does not stop an attacker, so \
+usually answer \"none\". Severity: critical = something succeeded, the application is being overloaded, or an \
+automated attack is in progress; warning = attempts that the application refused; info = harmless.";
+
+pub fn security_prompt(
+    t: &crate::db::Target,
+    trigger: &Trigger,
+    extra: &str,
+    lines: &[String],
+    actions: &[Choice],
+) -> String {
+    let offered: Vec<String> = actions.iter().map(|a| format!("- {}: {}", a.id, a.label)).collect();
+    format!(
+        "Application: {name} in project {project}\nFolder: {dir}\n{extra}\n\
+         Attack detection rule ({kind}): {what}\n\nEvidence:\n{evidence}\n\n\
+         Offered actions:\n{offered}\n- none: no action\n\nLatest raw log lines (oldest first):\n{log}",
+        name = t.name,
+        project = t.project,
+        dir = t.working_directory,
+        kind = trigger.kind.id(),
+        what = trigger.what,
+        evidence = trigger.evidence,
+        offered = offered.join("\n"),
+        log = if lines.is_empty() { "(none)".to_string() } else { lines.join("\n") },
+    )
+}
 
 pub fn answer_schema(actions: &[Choice]) -> Value {
     let mut ids: Vec<String> = actions.iter().map(|a| a.id.clone()).collect();
@@ -565,6 +660,7 @@ async fn handle(
         ..Default::default()
     };
     let settings = load(&state).await;
+    let security = trigger.kind.is_security();
     let lines = context_lines(&state, t.id, watched).await;
     let health = state.health.lock().ok().and_then(|m| m.get(&t.id).cloned());
     let running = state.running.lock().await.contains_key(&t.id);
@@ -579,8 +675,11 @@ async fn handle(
     let mut inc = Incident {
         target_id: Some(t.id),
         trigger: trigger.kind.id().into(),
-        severity: trigger.kind.default_severity().word().into(),
+        severity: trigger.severity.unwrap_or_else(|| trigger.kind.default_severity()).word().into(),
         title: match trigger.kind {
+            TriggerKind::Attack => format!("Possible attack on {}", t.name),
+            TriggerKind::BruteForce => format!("Password guessing on {}", t.name),
+            TriggerKind::Flood => format!("Flood of requests on {}", t.name),
             TriggerKind::Failure => format!("{} failed", t.name),
             TriggerKind::CrashLoop => format!("{} keeps crashing", t.name),
             TriggerKind::HealthDown => format!("{} is not answering its health check", t.name),
@@ -589,7 +688,8 @@ async fn handle(
             TriggerKind::NewError => format!("New kind of error in {}", t.name),
         },
         summary: trigger.what.clone(),
-        excerpt: lines.join("\n"),
+        // An attack is shown by its evidence, not by the last output lines.
+        excerpt: if security { trigger.evidence.clone() } else { lines.join("\n") },
         action: "none".into(),
         trace_id: trace_id.clone(),
         run_id,
@@ -598,17 +698,24 @@ async fn handle(
 
     let actions = choices(&state, &t).await;
     if settings.ai_enabled && !settings.model.is_empty() {
-        let user = prompt(&t, &trigger, &extra, &lines[lines.len().saturating_sub(MODEL_LINES)..], &actions);
+        let (system, user) = if security {
+            let raw = &lines[lines.len().saturating_sub(SECURITY_RAW_LINES)..];
+            (SECURITY_PROMPT, security_prompt(&t, &trigger, &extra, raw, &actions))
+        } else {
+            let recent = &lines[lines.len().saturating_sub(MODEL_LINES)..];
+            (SYSTEM_PROMPT, prompt(&t, &trigger, &extra, recent, &actions))
+        };
         trace.model = settings.model.clone();
-        trace.prompt = format!("[system]\n{SYSTEM_PROMPT}\n\n[user]\n{user}");
+        trace.prompt = format!("[system]\n{system}\n\n[user]\n{user}");
         stage(&state, "ai_start", json!({"target_id": t.id, "trace": trace_id, "model": settings.model}));
         let answer = crate::ollama::chat_json(
             &settings.ollama_url,
             &settings.model,
-            SYSTEM_PROMPT,
+            system,
             &user,
             &answer_schema(&actions),
-            MODEL_TIMEOUT,
+            // An attack is reported fast: the alert does not wait long for the model.
+            if security { SECURITY_MODEL_TIMEOUT } else { MODEL_TIMEOUT },
         )
         .await;
         match answer {
@@ -684,9 +791,26 @@ async fn handle(
             key: format!("{}:{}", t.id, trigger.kind.id()),
             trace: Some(trace_id.clone()),
             subject: format!("{} \u{2014} {}", severity.word().to_uppercase(), inc.title),
-            body: email_body(&state, id, &t, &trigger, &inc, &lines, settings.email_logs),
+            body: email_body(
+                &state,
+                id,
+                &t,
+                &trigger,
+                &inc,
+                &evidence_or(&trigger, &lines),
+                settings.email_logs,
+            ),
         },
     );
+}
+
+/// The lines an email carries: the evidence of an attack, else the output.
+fn evidence_or(trigger: &Trigger, lines: &[String]) -> Vec<String> {
+    if trigger.kind.is_security() {
+        trigger.evidence.lines().map(str::to_string).collect()
+    } else {
+        lines.to_vec()
+    }
 }
 
 fn email_body(
@@ -729,8 +853,15 @@ fn email_body(
         inc.run_id.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
     ));
     if with_logs && !lines.is_empty() {
-        b.push_str("\nLast log lines:\n");
-        for l in &lines[lines.len().saturating_sub(EMAIL_LINES)..] {
+        let security = trigger.kind.is_security();
+        b.push_str(if security { "\nEvidence:\n" } else { "\nLast log lines:\n" });
+        // The evidence starts with its summary, so it is cut at the end.
+        let shown = if security {
+            &lines[..lines.len().min(EMAIL_EVIDENCE_LINES)]
+        } else {
+            &lines[lines.len().saturating_sub(EMAIL_LINES)..]
+        };
+        for l in shown {
             b.push_str("  ");
             b.push_str(l);
             b.push('\n');
@@ -744,6 +875,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut rx = state.events.subscribe();
         let mut watches: HashMap<i64, Watch> = HashMap::new();
+        let mut trackers: HashMap<i64, crate::threat::Tracker> = HashMap::new();
         let mut last_run: HashMap<i64, i64> = HashMap::new();
         let mut enabled = load(&state).await.enabled;
         let mut checked = Instant::now();
@@ -764,6 +896,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
             let Ok(m) = serde_json::from_str::<Value>(&raw) else { continue };
             let s = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let target = m.get("target_id").and_then(Value::as_i64);
+            let mut triggers: Vec<Trigger> = Vec::new();
             let trigger = match s("type").as_str() {
                 "log" => {
                     let (Some(id), line) = (target, s("line")) else { continue };
@@ -775,6 +908,41 @@ pub fn spawn_worker(state: Arc<AppState>) {
                         last_run.insert(id, run);
                     }
                     let now = Instant::now();
+                    // Attack detection: the request in the line, or a
+                    // security message of the application itself.
+                    let tracker = trackers.entry(id).or_default();
+                    let request = crate::threat::parse_request(&line);
+                    let is_request = request.is_some();
+                    let alarm = match request {
+                        Some(r) => {
+                            let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+                            tracker.request(r, now, &clock)
+                        }
+                        None => tracker.signal(&line, now),
+                    };
+                    if is_request || alarm.is_some() {
+                        with_stats(|s| {
+                            s.requests += u64::from(is_request);
+                            s.threats += u64::from(alarm.is_some());
+                        });
+                    }
+                    if let Some(alarm) = alarm {
+                        // Said at once; the investigation follows as an incident.
+                        state.activity(
+                            if alarm.critical { "error" } else { "warn" },
+                            "security",
+                            Some(id),
+                            format!("Attack detection: {}", alarm.what),
+                        );
+                        triggers.push(Trigger::from_alarm(id, alarm));
+                    }
+                    // The request log of the middleware is data for the attack
+                    // detection, not program output to learn error patterns from.
+                    if line.contains(crate::threat::MARK) {
+                        with_stats(|s| s.lines += 1);
+                        continue_with(&state, &mut triggers, &watches, &last_run);
+                        continue;
+                    }
                     let w = watches.entry(id).or_default();
                     let hit = w.line(id, &line, now);
                     let summary = w.summary(now);
@@ -800,26 +968,37 @@ pub fn spawn_worker(state: Arc<AppState>) {
                     // Forget deleted targets.
                     if let Ok(list) = state.db.list_targets().await {
                         watches.retain(|id, _| list.iter().any(|t| t.id == *id));
+                        trackers.retain(|id, _| list.iter().any(|t| t.id == *id));
                     }
                     None
                 }
                 _ => None,
             };
-            if let Some(trigger) = trigger {
-                let recent =
-                    watches.get(&trigger.target_id).map(|w| w.recent(MODEL_LINES)).unwrap_or_default();
-                let trace_id = new_trace_id();
-                with_stats(|s| s.flagged += 1);
-                stage(
-                    &state,
-                    "flagged",
-                    json!({"target_id": trigger.target_id, "trigger": trigger.kind.id(), "what": trigger.what, "trace": trace_id}),
-                );
-                let run = last_run.get(&trigger.target_id).copied();
-                tokio::spawn(handle(state.clone(), trigger, recent, trace_id, run));
-            }
+            triggers.extend(trigger);
+            continue_with(&state, &mut triggers, &watches, &last_run);
         }
     });
+}
+
+/// Hand what the rules flagged to stage 2, each as its own task.
+fn continue_with(
+    state: &Arc<AppState>,
+    triggers: &mut Vec<Trigger>,
+    watches: &HashMap<i64, Watch>,
+    last_run: &HashMap<i64, i64>,
+) {
+    for trigger in triggers.drain(..) {
+        let recent = watches.get(&trigger.target_id).map(|w| w.recent(MODEL_LINES)).unwrap_or_default();
+        let trace_id = new_trace_id();
+        with_stats(|s| s.flagged += 1);
+        stage(
+            state,
+            "flagged",
+            json!({"target_id": trigger.target_id, "trigger": trigger.kind.id(), "what": trigger.what, "trace": trace_id}),
+        );
+        let run = last_run.get(&trigger.target_id).copied();
+        tokio::spawn(handle(state.clone(), trigger, recent, trace_id, run));
+    }
 }
 
 #[cfg(test)]

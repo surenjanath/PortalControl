@@ -19,6 +19,7 @@ mod backup;
 mod db;
 mod git;
 mod health;
+mod install;
 mod mail;
 mod metrics;
 mod monitor;
@@ -32,6 +33,7 @@ mod runner;
 mod secrets;
 mod security;
 mod state;
+mod threat;
 mod toolbox;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
@@ -82,6 +84,8 @@ USAGE:
 COMMANDS:
     serve                 Run the manager and web dashboard (default)
     stop                  Stop a running manager (same --port and --data-dir)
+    install               Install this copy on this computer: it replaces the
+                          installed version, keeps the data and starts
     install-autostart     Start PortalControl automatically at login
     uninstall-autostart   Remove the login autostart entry
     autostart-status      Show whether autostart is installed
@@ -177,6 +181,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "--no-tray" => opts.no_tray = true,
             "serve"
             | "stop"
+            | "install"
             | "install-autostart"
             | "uninstall-autostart"
             | "autostart-status"
@@ -245,6 +250,7 @@ fn main() -> ExitCode {
             println!("portalcontrol {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "install" => install_command(&opts).map(|m| println!("{m}")),
         "install-autostart" => check_bind(&opts)
             .and_then(|_| autostart::install(&opts.passthrough_args()))
             .map(|m| println!("{m}")),
@@ -265,6 +271,23 @@ fn main() -> ExitCode {
         }
         "reset-password" => reset_password(&opts),
         _ => {
+            // Started by a double click, and this is not the installed copy:
+            // offer to install it in place of the previous version.
+            if args.is_empty() {
+                match install::offer() {
+                    install::Offer::Install => {
+                        return match install_command(&opts) {
+                            Ok(_) => ExitCode::SUCCESS,
+                            Err(e) => {
+                                install::tell(&format!("PortalControl could not be installed.\n\n{e}"), true);
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    install::Offer::Quit => return ExitCode::SUCCESS,
+                    install::Offer::RunHere => {}
+                }
+            }
             if opts.detach {
                 detach(&args)
             } else {
@@ -306,8 +329,33 @@ fn detach(args: &[String]) -> Result<(), String> {
 /// may still be letting go of the port.
 const RESTARTED_ENV: &str = "PORTALCONTROL_RESTARTED";
 
+/// Windows hands every inheritable handle to a process it starts. A background
+/// manager would so keep open the pipe this command's output goes to, and
+/// whoever reads that pipe (a script, `portalcontrol install | more`) would
+/// wait until the manager stops. Mark the output handles as not inherited.
+fn keep_output_handles() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain system calls on this process's own handles; a
+            // missing or invalid handle makes the second call fail harmlessly.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Start this executable again as a background process with `args`.
 fn spawn_background(args: &[String], restarted: bool) -> Result<u32, String> {
+    keep_output_handles();
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     if restarted {
@@ -402,6 +450,131 @@ fn stop_remote(opts: &Opts) -> Result<(), String> {
         }
         Ok(code) => Err(format!("unexpected response from {addr}: {code:?}")),
         Err(e) => Err(format!("no manager reachable at {addr}: {e}")),
+    }
+}
+
+/// `portalcontrol install`, and "Install" after a double click: put this copy
+/// in the fixed install place (see `install.rs`), replacing the version that
+/// is there, and start it from there.
+fn install_command(opts: &Opts) -> Result<String, String> {
+    let from = install::running()?;
+    let to = install::destination(&from)?;
+    let version = env!("CARGO_PKG_VERSION");
+    if install::same_path(&from.exe, &to.exe) {
+        return Ok(format!("PortalControl {version} is already installed at {}.", to.root.display()));
+    }
+
+    // The manager that is running has to stop first: it holds the port, its
+    // services, and on Windows its own program file.
+    let addr = control_addr(opts);
+    let answering = || std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok();
+    let was_running = answering();
+    if was_running {
+        stop_remote(opts).map_err(|e| {
+            format!(
+                "the PortalControl that is running could not be stopped ({e}). Quit it from its tray icon, then install again."
+            )
+        })?;
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while answering() {
+            if std::time::Instant::now() >= end {
+                return Err(format!(
+                    "the PortalControl at {addr} did not stop. Quit it from its tray icon, then install again."
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    install::replace(&from.root, &to.root)?;
+    if was_running {
+        // It closes the port first and stops its services after that. Give it
+        // time, so the new copy does not start them while they still run.
+        install::wait_until_released(&to.root, Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let mut notes = vec![format!("PortalControl {version} is installed at {}.", to.root.display())];
+    match autostart::registered_exe() {
+        Some(old) if install::same_path(&old, &to.exe) => {}
+        Some(old) => match autostart::repoint(&to.exe) {
+            Ok(()) => notes.push("Start at login now starts this copy.".into()),
+            Err(e) => notes.push(format!("Start at login still points at {}: {e}", old.display())),
+        },
+        None => notes.push("Start at login is off. Turn it on in the tray menu or under Settings.".into()),
+    }
+    install::add_shortcut(&to.exe);
+
+    keep_output_handles();
+    let mut cmd = std::process::Command::new(&to.exe);
+    cmd.args(["serve", "--detach"])
+        .args(opts.passthrough_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn()
+        .map_err(|e| format!("it is installed, but {} could not be started: {e}", to.exe.display()))?;
+    // Show the dashboard once the new copy answers.
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while !answering() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if answering() {
+        open_browser(&format!("http://{addr}/"));
+        notes.push(format!("It is running: http://{addr}/"));
+    } else {
+        notes
+            .push("It was started but does not answer yet; see portalcontrol.log in the data folder.".into());
+    }
+    Ok(notes.join("\n"))
+}
+
+/// A login entry that starts a copy which is gone, or another copy than the
+/// installed one that is running now, is pointed at this copy. This is what
+/// keeps "start at login" from starting an old version.
+fn heal_autostart() {
+    let Ok(me) = install::running() else { return };
+    let Some(registered) = autostart::registered_exe() else { return };
+    if install::same_path(&registered, &me.exe) || install::is_temporary(&me.exe) {
+        return;
+    }
+    if !registered.exists() || install::is_installed() {
+        match autostart::repoint(&me.exe) {
+            Ok(()) => {
+                log(&format!("start at login pointed at {}; it now starts this copy", registered.display()))
+            }
+            Err(e) => log(&format!("start at login points at {}: {e}", registered.display())),
+        }
+    }
+}
+
+/// The listener for other computers and its TLS setup, when HTTPS is on.
+type NetworkDoor = (std::net::TcpListener, Option<Arc<rustls::ServerConfig>>);
+
+/// How often a network address that could not be opened is tried again.
+const NETWORK_RETRY: Duration = Duration::from_secs(5);
+
+fn open_network_door(plan: &netcfg::Effective, ip: IpAddr) -> Result<NetworkDoor, String> {
+    let net_addr = SocketAddr::new(ip, plan.port);
+    let tls = if plan.https { Some(netcfg::load_tls(&plan.cert_file, &plan.key_file)?) } else { None };
+    let listener =
+        std::net::TcpListener::bind(net_addr).map_err(|e| format!("cannot listen on {net_addr}: {e}"))?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    Ok((listener, tls))
+}
+
+/// Record that the network address is being served.
+fn mark_network_open(active: &mut netcfg::Active, ip: IpAddr) {
+    active.network = Some(SocketAddr::new(ip, active.effective.port));
+    active.error = None;
+    if let IpAddr::V4(v4) = ip {
+        let prefix = netcfg::local_addresses().iter().find(|a| a.ip == v4.to_string()).map(|a| a.prefix);
+        active.subnet = Some((v4, prefix.unwrap_or(24)));
     }
 }
 
@@ -589,39 +762,25 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         // be opened the manager still runs, reachable locally, and says why.
         let mut active =
             netcfg::Active { effective: plan.clone(), local: addr, network: None, error: None, subnet: None };
-        let mut network_listener = None;
-        let mut tls = None;
+        let mut door = None;
         if let Some(ip) = plan.network {
-            let net_addr = SocketAddr::new(ip, plan.port);
-            let opened = (|| {
-                let tls =
-                    if plan.https { Some(netcfg::load_tls(&plan.cert_file, &plan.key_file)?) } else { None };
-                let listener = std::net::TcpListener::bind(net_addr)
-                    .map_err(|e| format!("cannot listen on {net_addr}: {e}"))?;
-                listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-                Ok::<_, String>((listener, tls))
-            })();
-            match opened {
-                Ok((listener, config)) => {
-                    active.network = Some(net_addr);
-                    if let IpAddr::V4(v4) = ip {
-                        let prefix = netcfg::local_addresses()
-                            .iter()
-                            .find(|a| a.ip == v4.to_string())
-                            .map(|a| a.prefix);
-                        active.subnet = Some((v4, prefix.unwrap_or(24)));
-                    }
-                    network_listener = Some(listener);
-                    tls = config;
+            match open_network_door(&plan, ip) {
+                Ok(opened) => {
+                    mark_network_open(&mut active, ip);
+                    door = Some(opened);
                 }
-                // Asked for on the command line: failing loudly is expected.
-                Err(e) if plan.bind_from_cli => return Err(e),
+                // Asked for with --bind in a terminal: failing loudly is
+                // expected. Started at login there is nobody to read it, and
+                // the network is often not up yet, so it is tried again below.
+                Err(e) if plan.bind_from_cli && std::io::IsTerminal::is_terminal(&std::io::stderr()) => {
+                    return Err(e)
+                }
                 Err(e) => active.error = Some(e),
             }
         }
 
         let state = AppState::new(db, addr);
-        let _ = state.net.set(active.clone());
+        state.set_net(active.clone());
         *state.net_limits.lock().unwrap_or_else(|p| p.into_inner()) = netcfg::Limits::from(&saved);
         let _ = state.cli_net.set((opts.bind, opts.port));
         let _ = state.data_dir.set(data_dir.clone());
@@ -648,9 +807,16 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         ));
         match (active.network_url(), &active.error) {
             (Some(url), _) => log(&format!("open to other computers at {url}")),
-            (None, Some(e)) => log(&format!("network access is off: {e}")),
+            (None, Some(e)) => log(&format!(
+                "other computers cannot connect yet: {e}; trying again every {} seconds",
+                NETWORK_RETRY.as_secs()
+            )),
             (None, None) => {}
         }
+        if let Ok(me) = install::running() {
+            log(&format!("program: {}", me.exe.display()));
+        }
+        heal_autostart();
 
         // Supervisor behaviour: bring up every target flagged for autostart.
         for target in state.db.list_targets().await.unwrap_or_default() {
@@ -684,9 +850,54 @@ fn run_manager(opts: Opts, hooks: Hooks) -> Result<(), String> {
         // Everything from other computers passes the network guard first.
         let network_app =
             app.clone().layer(axum::middleware::from_fn_with_state(state.clone(), api::network_guard));
+        let (door_state, door_plan) = (state.clone(), plan.clone());
         let network_server = async move {
-            let Some(listener) = network_listener else {
-                return std::future::pending::<Result<(), String>>().await;
+            let (listener, tls) = match (door, door_plan.network) {
+                (Some(opened), _) => opened,
+                (None, None) => return std::future::pending::<Result<(), String>>().await,
+                // The address was not there at start, which is usual right
+                // after a restart of the computer: Wi-Fi, a VPN or Tailscale
+                // come up after login. Keep trying instead of staying shut
+                // until someone restarts PortalControl by hand.
+                (None, Some(ip)) => loop {
+                    tokio::time::sleep(NETWORK_RETRY).await;
+                    let plan = door_plan.clone();
+                    let tried = tokio::task::spawn_blocking(move || {
+                        open_network_door(&plan, ip).map(|opened| {
+                            let mut active = netcfg::Active::local_only(plan.port);
+                            mark_network_open(&mut active, ip);
+                            (opened, active.subnet)
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    let Some(mut active) = door_state.net() else { continue };
+                    match tried {
+                        Ok((opened, subnet)) => {
+                            active.network = Some(SocketAddr::new(ip, door_plan.port));
+                            active.error = None;
+                            active.subnet = subnet;
+                            let url = active.network_url().unwrap_or_default();
+                            door_state.set_net(active);
+                            log(&format!(
+                                "the network address is available now; open to other computers at {url}"
+                            ));
+                            door_state.activity(
+                                "info",
+                                "system",
+                                None,
+                                format!("Other computers can connect now, at {url}"),
+                            );
+                            break opened;
+                        }
+                        Err(e) => {
+                            if active.error.as_deref() != Some(e.as_str()) {
+                                active.error = Some(e);
+                                door_state.set_net(active);
+                            }
+                        }
+                    }
+                },
             };
             match tls {
                 Some(config) => {

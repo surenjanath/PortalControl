@@ -191,7 +191,7 @@ pub(super) async fn guard(state: State<Arc<AppState>>, req: Request, next: Next)
 
 pub(super) async fn checked(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let host = req.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let named = state.net.get().is_some_and(|n| n.host_allowed(&host));
+    let named = state.net().is_some_and(|n| n.host_allowed(&host));
     if !net::host_header_allowed(&host) && !named {
         return fail(StatusCode::FORBIDDEN, "forbidden host");
     }
@@ -228,7 +228,7 @@ pub async fn network_guard(
     let ip = remote.ip();
     let now = chrono::Utc::now().timestamp();
     let limits = *state.net_limits.lock().unwrap_or_else(|p| p.into_inner());
-    let refused = state.net.get().and_then(|n| n.refuse(limits, ip, now, state.auth.password_set()));
+    let refused = state.net().and_then(|n| n.refuse(limits, ip, now, state.auth.password_set()));
 
     // Remember who came by, and note it when that is news.
     let news = {
