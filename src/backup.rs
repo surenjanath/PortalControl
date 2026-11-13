@@ -213,6 +213,7 @@ mod tests {
             backup_on_deploy: true,
             start_order: 0,
             python_env: None,
+            webhook_secret: None,
         }
     }
 

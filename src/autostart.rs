@@ -38,13 +38,13 @@ fn win_quote(arg: &str) -> String {
         match c {
             '\\' => backslashes += 1,
             '"' => {
-                out.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 backslashes = 0;
                 out.push('"');
                 continue;
             }
             _ => {
-                out.extend(std::iter::repeat('\\').take(backslashes));
+                out.extend(std::iter::repeat_n('\\', backslashes));
                 backslashes = 0;
             }
         }
@@ -52,7 +52,7 @@ fn win_quote(arg: &str) -> String {
             out.push(c);
         }
     }
-    out.extend(std::iter::repeat('\\').take(backslashes * 2));
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
     out.push('"');
     out
 }

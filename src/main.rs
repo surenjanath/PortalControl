@@ -23,11 +23,13 @@ mod net;
 mod netcfg;
 mod pyenv;
 mod runner;
+mod secrets;
 mod security;
 mod state;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
 mod util;
+mod webhook;
 
 use state::AppState;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

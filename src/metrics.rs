@@ -385,7 +385,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
                             mem: r.mem,
                         })
                         .collect();
-                    list.sort_by(|a, b| b.mem.cmp(&a.mem));
+                    list.sort_by_key(|p| std::cmp::Reverse(p.mem));
                     list.truncate(50);
                     store.processes.insert(*target_id, list);
                 }

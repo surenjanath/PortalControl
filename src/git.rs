@@ -547,7 +547,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
         let ticks_per_fetch = (FETCH_INTERVAL.as_secs() / INSPECT_INTERVAL.as_secs()).max(1);
         let mut tick: u64 = 0;
         loop {
-            let do_fetch = tick % ticks_per_fetch == 0;
+            let do_fetch = tick.is_multiple_of(ticks_per_fetch);
             if let Ok(targets) = state.db.list_targets().await {
                 let ids: Vec<i64> = targets.iter().map(|t| t.id).collect();
                 for t in targets {

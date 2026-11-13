@@ -251,8 +251,20 @@ CFG.webhooks = (ctx) => {
             btn("Regenerate", async () => { if (await confirmDlg("Regenerate webhook URL?", "The current URL stops working immediately.", "Regenerate")) act(() => api("POST", "/api/targets/" + id + "/webhook"), "New webhook URL generated"); }, "sm"),
             btn("Disable", () => act(() => api("DELETE", "/api/targets/" + id + "/webhook"), "Webhook disabled"), "sm danger")),
           h("div", { class: "hint" }, "Example:"), h("pre", { class: "mono", style: "white-space:pre-wrap;word-break:break-all;margin:4px 0 0;color:var(--muted)" }, "curl -X POST " + url),
-          h("div", { class: "hint", style: "margin-top:8px" }, "Add ?pull=0 to run the script without pulling. Responds 202 with the run id, or 409 if a task is already running or the pull is not a clean fast-forward."))
+          h("div", { class: "hint", style: "margin-top:8px" }, "Add ?pull=0 to run the script without pulling. Responds 202 with the run id, or 409 if a task is already running or the pull is not a clean fast-forward. A push payload for another branch or a tag is acknowledged without deploying."))
           : h("div", { class: "box rowf" }, h("span", { class: "muted" }, "No webhook URL exists for this target."), btn("Generate webhook URL", () => act(() => api("POST", "/api/targets/" + id + "/webhook"), "Webhook URL generated"), "hl right")),
+        url ? h("div", { class: "box", style: "margin-top:14px" },
+          h("h3", { style: "margin-top:0" }, "Signing secret"),
+          x.webhook_secret
+            ? [h("p", { class: "muted small", style: "margin-top:0" }, "Every call must now prove this secret, or it is refused with 401. GitHub, Gitea and Forgejo: paste it as the webhook Secret (content type application/json). GitLab: paste it as the Secret token. A script: send it in an X-Webhook-Secret header."),
+              field("Secret", h("input", { type: "text", readonly: true, value: x.webhook_secret, class: "mono", onfocus: (e) => e.target.select() })),
+              h("div", { class: "rowf", style: "margin-bottom:10px" }, btn("Copy secret", () => copyText(x.webhook_secret), "sm", "copy"),
+                btn("Replace", async () => { if (await confirmDlg("Replace the signing secret?", "Senders using the current secret are refused until they are given the new one.", "Replace")) act(() => api("POST", "/api/targets/" + id + "/webhook/secret"), "New signing secret set"); }, "sm"),
+                btn("Remove", async () => { if (await confirmDlg("Remove the signing secret?", "The URL alone will be enough to trigger a deploy again.", "Remove", true)) act(() => api("DELETE", "/api/targets/" + id + "/webhook/secret"), "Signing secret removed"); }, "sm danger")),
+              h("div", { class: "hint" }, "Example:"), h("pre", { class: "mono", style: "white-space:pre-wrap;word-break:break-all;margin:4px 0 0;color:var(--muted)" }, "curl -X POST -H \"X-Webhook-Secret: " + x.webhook_secret + "\" " + url)]
+            : h("div", { class: "rowf" }, h("span", { class: "muted small", style: "flex:1" }, "Optional. With a secret, a leaked URL is not enough to deploy: callers must also sign the request (GitHub, Gitea) or send the secret (GitLab, scripts)."),
+                btn("Add signing secret", () => act(() => api("POST", "/api/targets/" + id + "/webhook/secret"), "Signing secret set"), "sm hl")))
+          : null,
       ];
     })];
 };

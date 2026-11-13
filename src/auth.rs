@@ -7,13 +7,15 @@
 //! * The password is stored only as a salted PBKDF2-HMAC-SHA256 hash.
 //! * Sessions are random 256-bit tokens kept in memory; they end when the
 //!   manager restarts, on sign-out, and whenever the password changes.
-//! * Repeated wrong passwords lock sign-in for a short while.
+//! * Repeated wrong passwords lock sign-in for a short while, per client
+//!   address, so one computer guessing cannot lock everyone else out.
 //! * The CLI on this machine authenticates with a control token written to
 //!   the data directory at startup, so `portalcontrol stop` keeps working.
 
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -26,15 +28,24 @@ pub const PASSWORD_KEY: &str = "password_hash";
 
 /// Tests use a low work factor so the suite stays fast.
 const ROUNDS: u32 = if cfg!(test) { 1_000 } else { 150_000 };
+/// Wrong passwords one client may try within the window before it is locked.
 const MAX_FAILURES: usize = 5;
+/// Wrong passwords from all clients together before everyone is locked: a
+/// backstop against guesses spread over many addresses.
+const MAX_FAILURES_TOTAL: usize = 30;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Clients tracked at once; the stalest are forgotten beyond this.
+const MAX_TRACKED_CLIENTS: usize = 1_000;
 
-fn hex(bytes: &[u8]) -> String {
+/// Who is signing in: a network address, or `None` for this computer.
+pub type Client = Option<IpAddr>;
+
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+pub fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
@@ -98,7 +109,7 @@ pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
 pub struct Auth {
     password_hash: RwLock<Option<String>>,
     sessions: Mutex<HashMap<String, Instant>>,
-    failures: Mutex<Vec<Instant>>,
+    failures: Mutex<HashMap<Client, Vec<Instant>>>,
     /// Lets the CLI on this machine call the API without a browser session.
     pub control_token: String,
 }
@@ -108,7 +119,7 @@ impl Default for Auth {
         Self {
             password_hash: RwLock::new(None),
             sessions: Mutex::new(HashMap::new()),
-            failures: Mutex::new(Vec::new()),
+            failures: Mutex::new(HashMap::new()),
             control_token: random_hex(32),
         }
     }
@@ -161,27 +172,43 @@ impl Auth {
             && presented.bytes().zip(self.control_token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 
-    /// Seconds until sign-in is allowed again, if it is currently locked.
-    pub fn locked_for(&self) -> Option<u64> {
+    /// Seconds until `client` may try a password again, if it is locked out.
+    pub fn locked_for(&self, client: Client) -> Option<u64> {
         let now = Instant::now();
-        let mut f = self.failures.lock().ok()?;
-        f.retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
-        if f.len() < MAX_FAILURES {
-            return None;
+        let mut map = self.failures.lock().ok()?;
+        map.retain(|_, times| {
+            times.retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
+            !times.is_empty()
+        });
+        let wait = |times: &[Instant]| {
+            let oldest = times.iter().min().copied()?;
+            Some(FAILURE_WINDOW.saturating_sub(now.duration_since(oldest)).as_secs().max(1))
+        };
+        if let Some(times) = map.get(&client).filter(|t| t.len() >= MAX_FAILURES) {
+            return wait(times);
         }
-        let oldest = f.first().copied()?;
-        Some(FAILURE_WINDOW.saturating_sub(now.duration_since(oldest)).as_secs().max(1))
+        let all: Vec<Instant> = map.values().flatten().copied().collect();
+        if all.len() >= MAX_FAILURES_TOTAL {
+            return wait(&all);
+        }
+        None
     }
 
-    pub fn note_failure(&self) {
-        if let Ok(mut f) = self.failures.lock() {
-            f.push(Instant::now());
+    pub fn note_failure(&self, client: Client) {
+        if let Ok(mut map) = self.failures.lock() {
+            if map.len() >= MAX_TRACKED_CLIENTS && !map.contains_key(&client) {
+                let stalest = map.iter().min_by_key(|(_, t)| t.last().copied()).map(|(k, _)| *k);
+                if let Some(k) = stalest {
+                    map.remove(&k);
+                }
+            }
+            map.entry(client).or_default().push(Instant::now());
         }
     }
 
-    pub fn clear_failures(&self) {
-        if let Ok(mut f) = self.failures.lock() {
-            f.clear();
+    pub fn clear_failures(&self, client: Client) {
+        if let Ok(mut map) = self.failures.lock() {
+            map.remove(&client);
         }
     }
 }
@@ -234,14 +261,36 @@ mod tests {
     #[test]
     fn repeated_failures_lock_sign_in() {
         let auth = Auth::default();
+        let me: Client = None;
         for _ in 0..(MAX_FAILURES - 1) {
-            auth.note_failure();
+            auth.note_failure(me);
         }
-        assert!(auth.locked_for().is_none());
-        auth.note_failure();
-        assert!(auth.locked_for().unwrap() >= 1);
-        auth.clear_failures();
-        assert!(auth.locked_for().is_none());
+        assert!(auth.locked_for(me).is_none());
+        auth.note_failure(me);
+        assert!(auth.locked_for(me).unwrap() >= 1);
+        auth.clear_failures(me);
+        assert!(auth.locked_for(me).is_none());
+    }
+
+    #[test]
+    fn one_client_cannot_lock_out_another() {
+        let auth = Auth::default();
+        let guesser: Client = Some("192.168.1.50".parse().unwrap());
+        let owner: Client = None;
+        for _ in 0..MAX_FAILURES {
+            auth.note_failure(guesser);
+        }
+        assert!(auth.locked_for(guesser).is_some());
+        assert!(auth.locked_for(owner).is_none(), "the owner can still sign in");
+    }
+
+    #[test]
+    fn many_clients_together_hit_the_global_limit() {
+        let auth = Auth::default();
+        for i in 0..MAX_FAILURES_TOTAL {
+            auth.note_failure(Some(IpAddr::from([10, 0, 0, (i % 250) as u8 + 1])));
+        }
+        assert!(auth.locked_for(Some("10.9.9.9".parse().unwrap())).is_some());
     }
 
     #[test]

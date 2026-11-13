@@ -39,21 +39,25 @@ function pickFolder(startAt, onPick) {
 
 function newView(cloneId) {
   const def = { key: "new/" + (cloneId || "") };
-  // The form must survive background data refreshes, so there is nothing to repaint.
-  def.update = () => {};
+  // The server's OS decides path and script examples. Until /api/system has
+  // answered, guess from the browser, then correct the placeholders once it does.
+  const isWin = () => (sys ? sys.os === "windows" : (/^win/i.test(navigator.platform || "") || /windows/i.test(navigator.userAgent || "")));
+  const examples = () => (isWin() ? { dir: "C:\\Projects\\my_app", script: "deploy.bat" } : { dir: "/Users/me/projects/my_app", script: "deploy.sh" });
+  // The form must survive background data refreshes, so only the placeholders are touched.
+  let placeholders = null;
+  def.update = () => { if (placeholders) placeholders(); };
   def.build = () => {
     const src = cloneId ? T(cloneId) : null;
-    const win = !sys || sys.os === "windows";
     const text = (attrs) => h("input", Object.assign({ type: "text", spellcheck: "false", autocomplete: "off" }, attrs));
     const f = {
-      dir: text({ value: src ? src.working_directory : "", placeholder: win ? "C:\\Users\\ICT\\Projects\\claims_portal" : "/Users/ict/projects/claims_portal" }),
+      dir: text({ value: src ? src.working_directory : "", placeholder: examples().dir }),
       name: text({ maxlength: "100", value: src ? src.name + " (copy)" : "", placeholder: "Claims Portal", spellcheck: "true" }),
       project: text({ maxlength: "60", value: src ? src.project : "Default", list: "projlist" }),
       branch: text({ value: src ? src.git_branch : "main" }),
       mode: h("select", {}, h("option", { value: "TASK" }, "Task \u2014 runs to completion (a deployment script)"), h("option", { value: "SERVICE" }, "Service \u2014 long-running process (a server)")),
       health: text({ value: src && src.health_url ? src.health_url : "", placeholder: "http://127.0.0.1:8000/" }),
       desc: text({ maxlength: "500", value: src ? src.description : "", placeholder: "Optional", spellcheck: "true" }),
-      custom: text({ placeholder: win ? "deploy.bat" : "deploy.sh", value: src ? src.script_name : "" }),
+      custom: text({ placeholder: examples().script, value: src ? src.script_name : "" }),
       port: h("input", { type: "number", min: "1", max: "65535", style: "max-width:140px" }),
       lan: h("input", { type: "checkbox" }),
       backup: h("input", { type: "checkbox", checked: true }),
@@ -61,6 +65,7 @@ function newView(cloneId) {
       restart: h("input", { type: "checkbox", checked: src ? src.auto_restart : true }),
     };
     if (src) f.mode.value = src.run_mode;
+    placeholders = () => { const ex = examples(); f.dir.placeholder = ex.dir; f.custom.placeholder = ex.script; };
     const touched = { name: !!src, branch: !!src, health: !!src, mode: !!src };
     f.name.oninput = () => (touched.name = true);
     f.branch.oninput = () => (touched.branch = true);
@@ -140,7 +145,7 @@ function newView(cloneId) {
         helperScripts.length ? [h("div", { class: "optlabel" }, "Launchers written earlier"),
           helperScripts.map((s) => option({ type: "script", script: s }, choice && choice.type === "script" && choice.script === s, s, null, null))] : null,
         h("div", { class: "optlabel" }, "Something else"),
-        option({ type: "custom" }, choice && choice.type === "custom", "Another script", null, "Type the name of a " + (win ? ".bat or .cmd" : ".sh") + " file inside the folder."),
+        option({ type: "custom" }, choice && choice.type === "custom", "Another script", null, "Type the name of a " + (isWin() ? ".bat or .cmd" : ".sh") + " file inside the folder."),
         choice && choice.type === "custom" ? h("div", { style: "margin:4px 0 12px 30px;max-width:360px" }, f.custom) : null);
       paintPort();
     }

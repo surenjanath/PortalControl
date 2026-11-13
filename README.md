@@ -59,7 +59,8 @@ live stream all require signing in.
 - The password is stored only as a salted PBKDF2-HMAC-SHA256 hash.
 - Sessions last 7 days, are held in memory (so everyone signs in again after a
   restart), and all end when the password changes.
-- Five wrong passwords lock sign-in for a minute.
+- Five wrong passwords from one computer lock sign-in for that computer for a minute;
+  others can still sign in (thirty from everyone together lock it for all).
 - Deploy webhooks keep working: the token in their URL is their own credential.
 - `portalcontrol stop` keeps working on this machine through a control token the
   manager writes to its data directory.
@@ -149,8 +150,10 @@ deleted.
 - **Desktop notifications.** Opt in under Settings to be told when a run fails, a
   service goes down or crashes, or a run finishes while the tab is in the background.
 - **Export / import.** Settings can save every target's configuration to a JSON file
-  and load it on another machine. Already-registered targets are skipped; ones whose
-  folder does not exist there are reported.
+  and load it on another machine. Environment variables are exported by name only
+  unless you tick *Include environment variable values*, so a shared export does not
+  leak passwords. Already-registered targets are skipped; ones whose folder does not
+  exist there are reported.
 
 ## Automation features
 
@@ -165,9 +168,16 @@ deleted.
   Untracked files (databases, media) are left alone.
 - **Auto-deploy.** When the 5-minute fetch finds new commits, pull and run the script
   (a running service is restarted). A failure is reported once per commit.
-- **Deploy webhook.** A per-target URL with a random token; `POST` (or `GET`) to it to
-  pull and deploy. Add `?pull=0` to skip the pull. It is reachable only from this
+- **Deploy webhook.** A per-target URL with a random token; `POST` to it to pull and
+  deploy. `GET` is refused, so a link preview or URL scanner that fetches the address
+  cannot start a deployment. Add `?pull=0` to skip the pull. It is reachable only from this
   machine or the private network, like the rest of the server.
+  - **Signing secret (optional).** With one set, every call must also prove it or is
+    refused with 401: GitHub, Gitea and Forgejo sign the body (`X-Hub-Signature-256` /
+    `X-Gitea-Signature`), GitLab sends `X-Gitlab-Token`, and a script sends
+    `X-Webhook-Secret`. A leaked URL alone is then not enough to deploy.
+  - **Branch filter.** A push payload for another branch, or for a tag, is answered
+    with `200 {"deployed": false}` and not deployed; so is GitHub's `ping`.
 - **Restart on crash.** A service that exits on its own is started again after 5
   seconds; after 5 crashes in 10 minutes automatic restart is suspended.
 - **Start with PortalControl.** Launch the target whenever the manager starts.
@@ -375,7 +385,10 @@ about                 Show the version and who made it
 
 Data lives in `%LOCALAPPDATA%\PortalControl` (Windows),
 `~/Library/Application Support/PortalControl` (macOS) or
-`~/.local/share/portalcontrol` (Linux): `portalcontrol.db` and `portalcontrol.log`.
+`~/.local/share/portalcontrol` (Linux): `portalcontrol.db`, `portalcontrol.log` and
+`secret.key`. Environment variables and webhook signing secrets are encrypted in the
+database with that key, so **back up `secret.key` together with `portalcontrol.db`**:
+without it they cannot be read and have to be entered again.
 
 ## Registering a target
 
@@ -478,7 +491,8 @@ protection*).
 | GET | `/api/targets/{id}/health/history` | Last 240 probes |
 | GET | `/api/targets/{id}/metrics` | CPU / memory samples of the process tree |
 | POST / DELETE | `/api/targets/{id}/webhook` | Generate / disable the deploy webhook token |
-| GET / POST | `/api/webhooks/deploy/{token}` | Deploy via webhook |
+| POST / DELETE | `/api/targets/{id}/webhook/secret` | Set (or replace) / remove the webhook signing secret |
+| POST | `/api/webhooks/deploy/{token}` | Deploy via webhook (GET is refused with 405) |
 | GET | `/api/auth/status` | Whether a password is set and whether this client is signed in |
 | POST | `/api/auth/login`, `/api/auth/logout`, `/api/auth/password` | Sign in / out; set, change or remove the password |
 | POST | `/api/targets/{id}/rollback` | Move to an earlier commit (`{"sha": …}`) and deploy it |
@@ -494,7 +508,7 @@ protection*).
 | GET / POST | `/api/targets/{id}/backups` | List database snapshots / take one now |
 | POST / DELETE | `/api/targets/{id}/backups/{file}/restore`, `/backups/{file}` | Restore / delete a snapshot |
 | POST | `/api/fs/launcher` | Create the launcher script of a detected worker |
-| GET / POST | `/api/export`, `/api/import` | Export / import target configuration |
+| GET / POST | `/api/export`, `/api/import` | Export (`?env_values=1` includes variable values) / import target configuration |
 | GET | `/api/runs`, `/api/runs/{id}` | Recent executions of all targets / one with its logs |
 | GET | `/api/activity` | Activity feed |
 | GET | `/api/cron?expr=` | Validate a schedule and preview its next runs |
@@ -512,15 +526,16 @@ cargo run -- --port 7979 --data-dir ./dev-data
 ```
 
 The source is in `src/` (`runner.rs`, `git.rs`, `health.rs`, `security.rs`,
-`automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api.rs`, `db.rs`,
-`autostart.rs`, `net.rs`, `netcfg.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
+`automation.rs`, `metrics.rs`, `backup.rs`, `auth.rs`, `api/` (one file per area of
+the HTTP API), `db.rs`, `secrets.rs`, `webhook.rs`, `autostart.rs`, `net.rs`,
+`netcfg.rs`, `tray.rs`, `pyenv.rs`). `build.rs` embeds the icon in the
 Windows executable and records the build commit and time.
 
 How the parts fit together, the database schema and the rules for keeping the
 documentation current are in [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md).
 
 The dashboard lives in `web/` and is compiled into the binary (`ASSETS` in
-`src/api.rs`), so the result is still one executable. It is plain HTML, CSS and
+`src/api/mod.rs`), so the result is still one executable. It is plain HTML, CSS and
 JavaScript with no build step and no dependencies:
 
 | File | What it holds |

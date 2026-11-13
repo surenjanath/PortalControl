@@ -15,6 +15,9 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Responses slower than this are reported as SLOW.
 const SLOW_THRESHOLD_MS: u64 = 1_000;
+/// A freshly started process gets this long to open its port: DOWN probes in
+/// this window are not recorded, so startup does not count as an outage.
+const STARTUP_GRACE: Duration = Duration::from_secs(30);
 /// Upper bound on how much of a response body a probe will read and discard.
 const DRAIN_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -168,7 +171,30 @@ pub async fn probe(url: &str) -> HealthInfo {
 
 /// Probe one target now, cache the result and notify dashboards on change.
 pub async fn probe_target(state: &Arc<AppState>, target_id: i64, url: &str) -> HealthInfo {
+    probe_target_with(state, target_id, url, Record::All).await
+}
+
+/// How much of a probe result to keep.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Record {
+    /// Status, history sample and a "health changed" event.
+    All,
+    /// Only the current status: for the moment right after a planned stop or
+    /// restart, which is not an outage.
+    StatusOnly,
+}
+
+pub async fn probe_target_with(
+    state: &Arc<AppState>,
+    target_id: i64,
+    url: &str,
+    record: Record,
+) -> HealthInfo {
     let info = probe(url).await;
+    let uptime = state.running.lock().await.get(&target_id).map(|r| r.started.elapsed());
+    if still_starting(uptime, info.status) {
+        return info;
+    }
     let previous = {
         let mut map = match state.health.lock() {
             Ok(m) => m,
@@ -176,6 +202,12 @@ pub async fn probe_target(state: &Arc<AppState>, target_id: i64, url: &str) -> H
         };
         map.insert(target_id, info.clone()).map(|old| old.status)
     };
+    if record == Record::StatusOnly {
+        if previous != Some(info.status) {
+            state.emit(json!({"type": "health", "target_id": target_id, "health": info}));
+        }
+        return info;
+    }
     if let Ok(mut history) = state.health_history.lock() {
         let ring = history.entry(target_id).or_default();
         ring.push_back(HealthSample { t: now_secs(), status: info.status, latency_ms: info.latency_ms });
@@ -204,6 +236,12 @@ pub async fn probe_target(state: &Arc<AppState>, target_id: i64, url: &str) -> H
         }
     }
     info
+}
+
+/// A DOWN result from a process that started moments ago is the app still
+/// booting, not an outage. `uptime` is `None` when nothing is running.
+fn still_starting(uptime: Option<Duration>, status: &str) -> bool {
+    status == "DOWN" && uptime.is_some_and(|u| u < STARTUP_GRACE)
 }
 
 pub fn spawn_worker(state: Arc<AppState>) {
@@ -237,6 +275,16 @@ pub fn spawn_worker(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn startup_grace() {
+        let fresh = Some(Duration::from_secs(3));
+        let settled = Some(STARTUP_GRACE + Duration::from_secs(1));
+        assert!(still_starting(fresh, "DOWN"));
+        assert!(!still_starting(fresh, "LIVE"), "a fast start counts at once");
+        assert!(!still_starting(settled, "DOWN"), "after the grace period DOWN is real");
+        assert!(!still_starting(None, "DOWN"), "a stopped target is really down");
+    }
 
     #[test]
     fn url_parsing() {

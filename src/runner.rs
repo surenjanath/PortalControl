@@ -489,6 +489,7 @@ async fn launch(state: &Arc<AppState>, target: &Target, triggered_by: &str, job:
 
         // A service that ends on its own (it was not stopped) has crashed.
         let unexpected_exit = matches!(outcome, Outcome::Exited(_) | Outcome::WaitFailed(_));
+        let stopped_on_purpose = matches!(outcome, Outcome::Stopped);
         let (status, exit_code, note): (&'static str, Option<i64>, String) = match outcome {
             Outcome::Exited(code) => (
                 if code == Some(0) { "SUCCESS" } else { "FAILED" },
@@ -546,7 +547,14 @@ async fn launch(state: &Arc<AppState>, target: &Target, triggered_by: &str, job:
             queue_restart(&state, target_id);
         }
         if let Some(url) = health_url {
-            crate::health::probe_target(&state, target_id, &url).await;
+            // A stop or restart is planned: show the new state at once, but do
+            // not count it as an outage in the health history.
+            let planned = if stopped_on_purpose {
+                crate::health::Record::StatusOnly
+            } else {
+                crate::health::Record::All
+            };
+            crate::health::probe_target_with(&state, target_id, &url, planned).await;
         }
     });
 

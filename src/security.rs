@@ -3,6 +3,7 @@
 //! One click runs two scanners against a target and stores the result:
 //!   * static analysis:      `bandit -r <target_path> -f json`
 //!   * dependency analysis:  `pip-audit --format json`
+//!
 //! The JSON payloads are consumed here and reduced to the counters shown on
 //! the dashboard cards; the raw payload is kept for the detail view.
 
