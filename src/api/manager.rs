@@ -39,6 +39,7 @@ pub(super) async fn system(State(state): State<Arc<AppState>>) -> AppResult {
         "targets": targets,
         "active_runs": active_runs,
         "active_scans": state.scans_running.lock().map(|s| s.len()).unwrap_or(0),
+        "open_incidents": state.db.open_incident_count().await.unwrap_or(0),
         "ws_clients": state.ws_clients.load(Ordering::Relaxed),
         "worker_threads": crate::worker_threads(),
         "host": host,

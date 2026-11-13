@@ -37,9 +37,11 @@ mod access;
 mod backups;
 mod commands;
 mod detect;
+mod incidents;
 mod inspect;
 mod manager;
 mod reports;
+mod repos;
 mod targets;
 mod tools;
 mod transfer;
@@ -52,9 +54,13 @@ pub use access::{network_guard, ViaTls};
 use backups::*;
 use commands::*;
 use detect::*;
+pub(crate) use incidents::command_choices;
+use incidents::*;
 use inspect::*;
 use manager::*;
 use reports::*;
+pub(crate) use repos::load_git_tokens;
+use repos::*;
 use targets::*;
 use tools::*;
 use transfer::*;
@@ -90,6 +96,9 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("js/settings/system.js", JS, include_str!("../../web/js/settings/system.js")),
     ("js/pages/lists.js", JS, include_str!("../../web/js/pages/lists.js")),
     ("js/pages/about.js", JS, include_str!("../../web/js/pages/about.js")),
+    ("js/pages/flow.js", JS, include_str!("../../web/js/pages/flow.js")),
+    ("js/pages/incidents.js", JS, include_str!("../../web/js/pages/incidents.js")),
+    ("js/settings/monitor.js", JS, include_str!("../../web/js/settings/monitor.js")),
     ("js/core/app.js", JS, include_str!("../../web/js/core/app.js")),
     ("js/login.js", JS, include_str!("../../web/js/login.js")),
 ];
@@ -148,6 +157,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/activity", get(activity))
         .route("/api/cron", get(cron_preview))
         .route("/api/fs/inspect", get(fs_inspect))
+        .route("/api/git/clone", post(clone))
+        .route("/api/incidents", get(incidents_list))
+        .route("/api/incidents/{id}/status", post(incident_status))
+        .route("/api/incidents/{id}/act", post(incident_act))
+        .route("/api/settings/monitor", get(monitor_get).put(monitor_put))
+        .route("/api/settings/alerts", get(alerts_get).put(alerts_put))
+        .route("/api/alerts/test", post(alerts_test))
+        .route("/api/ai/models", get(ai_models))
+        .route("/api/ai/test", post(ai_test))
+        .route("/api/traces/{trace_id}", get(trace_get))
+        .route("/api/monitor/stats", get(monitor_stats))
+        .route("/api/git/tokens", get(tokens_list).put(tokens_put))
         .route("/api/fs/launcher", post(fs_launcher))
         .route("/api/system", get(system))
         .route("/api/system/metrics", get(system_metrics))

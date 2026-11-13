@@ -77,6 +77,67 @@ function newView(cloneId) {
     let workers = [];
     let timer = null, seq = 0, portSeq = 0;
     const found = h("div"), runBox = h("div"), portBox = h("div"), optionsBox = h("div"), rest = h("div", { style: "display:none" });
+
+    // ---- step 1, "Clone from Git": clone into a folder, then carry on as with a local folder ----
+    const g = {
+      url: text({ placeholder: "https://github.com/acme/shop.git", "aria-label": "Repository URL" }),
+      parent: text({ placeholder: isWin() ? "C:\\Projects" : "/Users/me/projects", "aria-label": "Clone into this folder" }),
+      name: text({ placeholder: "folder name", "aria-label": "New folder name" }),
+      branch: text({ placeholder: "default branch", "aria-label": "Branch" }),
+      token: h("input", { type: "password", autocomplete: "off", placeholder: "access token (only for a private repository)", "aria-label": "Access token" }),
+    };
+    let nameTouched = false, savedHosts = [];
+    const cloneMsg = h("div", { class: "muted small", style: "min-height:18px" });
+    const tokenRow = h("div");
+    const hostOf = (u) => { const m = /^https?:\/\/(?:[^@/]+@)?([^/:]+)/i.exec(u.trim()); return m ? m[1].toLowerCase() : ""; };
+    const paintToken = () => {
+      const host = hostOf(g.url.value);
+      tokenRow.replaceChildren(!host ? null : savedHosts.includes(host)
+        ? h("div", { class: "muted small" }, icon("shield"), " An access token for " + host + " is saved; it is used for private repositories.")
+        : field("Private repository? Access token for " + host, g.token, "Optional. Saved encrypted for " + host + " and used for later pulls too. GitHub: a fine-grained token with read access to contents."));
+    };
+    api("GET", "/api/git/tokens").then((r) => { savedHosts = r.hosts; paintToken(); }, () => {});
+    g.name.oninput = () => (nameTouched = true);
+    g.url.oninput = () => {
+      if (!nameTouched) { const last = g.url.value.trim().replace(/\/+$/, "").split(/[\/:]/).pop() || ""; g.name.value = last.replace(/\.git$/, ""); }
+      paintToken();
+    };
+    const cloneBtn = btn("Clone", async () => {
+      cloneBtn.disabled = true;
+      const host = hostOf(g.url.value);
+      try {
+        if (g.token.value.trim()) { await api("PUT", "/api/git/tokens", { host, token: g.token.value.trim() }); g.token.value = ""; savedHosts.push(host); }
+        cloneMsg.className = "small"; cloneMsg.replaceChildren(h("span", { class: "dot info pulse" }), " Cloning\u2026");
+        const r = await api("POST", "/api/git/clone", { url: g.url.value.trim(), parent: g.parent.value.trim(), name: g.name.value.trim(), branch: g.branch.value.trim() });
+        cloneMsg.className = "small"; cloneMsg.replaceChildren(h("span", { class: "dot ok" }), " Cloned into ", h("span", { class: "mono" }, r.dir), r.branch ? " (" + r.branch + ")" : "");
+        f.dir.value = r.dir; mode("folder", true); inspect();
+      } catch (e) { cloneMsg.className = "small t-err"; cloneMsg.textContent = e.message; }
+      cloneBtn.disabled = false;
+    }, "hl", "download");
+    const cloneSink = (m) => {
+      if (m.type !== "clone_progress" || !cloneBtn.disabled) return;
+      const pct = m.total ? Math.round((m.received / m.total) * 100) : 0;
+      cloneMsg.className = "small"; cloneMsg.replaceChildren(h("span", { class: "dot info pulse" }), " Cloning\u2026 " + pct + "% (" + m.received + " of " + m.total + " objects)");
+    };
+    sinks.add(cloneSink);
+    def.cleanup = () => sinks.delete(cloneSink);
+    const clonePanel = h("div", {},
+      h("div", { class: "grid g2", style: "gap:10px" }, field("Repository URL (HTTPS)", g.url), field("Branch", g.branch, "Leave empty for the repository's default.")),
+      h("div", { class: "grid g2", style: "gap:10px" },
+        field("Clone into", h("div", { class: "rowf", style: "flex-wrap:nowrap" }, h("div", { style: "flex:1" }, g.parent),
+          btn("Browse\u2026", () => pickFolder(g.parent.value.trim(), (p) => { g.parent.value = p; }), "", "box"))),
+        field("New folder", g.name, "Created inside that folder; it must not exist yet.")),
+      tokenRow, h("div", { class: "rowf", style: "margin-top:6px" }, cloneBtn, cloneMsg));
+    const folderPanel = h("div");
+    const tabs = h("div", { class: "rowf", style: "margin:0 0 12px" });
+    const mode = (which, keep) => {
+      tabs.replaceChildren(btn("Folder on this machine", () => mode("folder"), "sm" + (which === "folder" ? " on" : ""), "box"),
+        btn("Clone from Git", () => mode("clone"), "sm" + (which === "clone" ? " on" : ""), "download"));
+      folderPanel.style.display = which === "folder" ? "" : "none";
+      clonePanel.style.display = which === "clone" ? "" : "none";
+      if (!keep && which === "clone") g.url.focus();
+    };
+    mode("folder", true);
     const err = h("span", { class: "errtxt" });
     const starter = () => (choice && choice.type === "starter" && info ? info.starters.find((s) => s.id === choice.id) : null);
     const isService = () => (starter() ? starter().run_mode === "SERVICE" : f.mode.value === "SERVICE");
@@ -229,9 +290,10 @@ function newView(cloneId) {
       h("div", { class: "head" }, h("div", { class: "grow" }, h("h1", {}, src ? "Add another process" : "New target"),
         h("p", { class: "sub" }, "Point PortalControl at a project folder. It runs the project in place: nothing is copied or wrapped."))),
       h("form", { onsubmit: submit },
-        h("div", { class: "box", style: "margin-bottom:14px" }, step(1, "Project folder", "The folder that holds the project on this machine."),
-          h("div", { class: "rowf", style: "flex-wrap:nowrap;margin-bottom:10px" }, h("div", { style: "flex:1" }, f.dir),
-            btn("Browse\u2026", () => pickFolder(f.dir.value.trim(), (p) => { f.dir.value = p; inspect(); }), "", "box")), found),
+        h("div", { class: "box", style: "margin-bottom:14px" }, step(1, "Project folder", "A folder on this machine, or a Git repository to clone into one."),
+          src ? null : tabs, src ? null : clonePanel,
+          (folderPanel.replaceChildren(h("div", { class: "rowf", style: "flex-wrap:nowrap;margin-bottom:10px" }, h("div", { style: "flex:1" }, f.dir),
+            btn("Browse\u2026", () => pickFolder(f.dir.value.trim(), (p) => { f.dir.value = p; inspect(); }), "", "box"))), folderPanel), found),
         h("div", {}, rest),
         h("datalist", { id: "projlist" }, [...new Set(targets.map((t) => t.project))].map((p) => h("option", { value: p })))),
       (() => {

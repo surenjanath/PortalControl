@@ -52,11 +52,15 @@ function attentionItems(list) {
 function attentionPanel(list) {
   const items = attentionItems(list);
   if (!list.length) return null;
-  if (!items.length) return h("div", { class: "attn clear" }, h("span", { class: "dot ok" }), h("b", {}, "All clear."), h("span", { class: "muted" }, " Everything is running, healthy, up to date and clean."));
+  const inc = (sys && sys.open_incidents) || 0;
+  const incRow = inc ? h("div", { class: "attn-row" }, h("span", { class: "dot err" }),
+    h("span", { class: "grow" }, h("a", { href: "#/incidents", class: "nm" }, inc + " open incident" + (inc === 1 ? "" : "s")), h("span", { class: "muted" }, " \u2014 found by the monitor, with an explanation and a suggested fix")),
+    h("a", { class: "btn sm ghost", href: "#/incidents" }, "Review")) : null;
+  if (!items.length && !inc) return h("div", { class: "attn clear" }, h("span", { class: "dot ok" }), h("b", {}, "All clear."), h("span", { class: "muted" }, " Everything is running, healthy, up to date and clean."));
   const shown = items.slice(0, 6);
   return h("div", { class: "attn box" },
-    h("div", { class: "attn-h" }, h("b", {}, "Needs attention"), h("span", { class: "dim small" }, " " + items.length + " item" + (items.length === 1 ? "" : "s"))),
-    shown.map((x) => h("div", { class: "attn-row" }, h("span", { class: "dot " + x.cls }),
+    h("div", { class: "attn-h" }, h("b", {}, "Needs attention"), h("span", { class: "dim small" }, " " + (items.length + (inc ? 1 : 0)) + " item" + (items.length + (inc ? 1 : 0) === 1 ? "" : "s"))),
+    incRow, shown.map((x) => h("div", { class: "attn-row" }, h("span", { class: "dot " + x.cls }),
       h("span", { class: "grow" }, h("a", { href: "#/target/" + x.t.id, class: "nm" }, x.t.name), h("span", { class: "muted" }, " \u2014 " + x.text)),
       h("a", { class: "btn sm ghost", href: x.href }, x.action))),
     items.length > shown.length ? h("div", { class: "dim small", style: "padding:6px 2px 0" }, "+ " + (items.length - shown.length) + " more \u2014 see the PDF report for the full list") : null);

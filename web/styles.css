@@ -119,7 +119,7 @@
 
   label.f { display: block; margin-bottom: 14px; }
   label.f > span { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; font-weight: 500; }
-  input[type=text], input[type=number], input[type=search], select, textarea { width: 100%; font: inherit; color: var(--text); background: var(--bg);
+  input[type=text], input[type=number], input[type=search], input[type=password], select, textarea { width: 100%; font: inherit; color: var(--text); background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
   textarea { font-family: var(--mono); font-size: 12.5px; min-height: 200px; resize: vertical; line-height: 1.6; }
   input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -140,6 +140,57 @@
   .attn-row .nm { font-weight: 600; }
   .attn-row .nm:hover { color: var(--accent); }
   .attn.clear { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--ok); border-radius: 6px; background: var(--panel); font-size: 13px; }
+  /* ---- live monitor pipeline (flow.js) ---- */
+  .flow { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 14px 10px; margin-bottom: 16px; }
+  .flow-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; }
+  .flow-status b { color: var(--text); font-weight: 700; }
+  .flow-wrap { overflow-x: auto; }
+  .flow-svg { width: 100%; min-width: 760px; height: auto; display: block; margin-top: 8px; }
+  .flow-svg text { font-family: var(--mono); text-anchor: middle; }
+  .flow-svg .ft { font-size: 12.5px; font-weight: 700; fill: var(--text); letter-spacing: .8px; }
+  .flow-svg .fs { font-size: 9.5px; fill: var(--muted); letter-spacing: .6px; }
+  .flow-svg .fnote { fill: var(--accent); }
+  .flow-svg .fl { font-size: 9.5px; fill: var(--dim); letter-spacing: .9px; text-anchor: start; }
+  .flow-svg .fcont { fill: none; stroke: var(--dim); stroke-width: 1.1; stroke-dasharray: 6 5; }
+  .flow-svg .fbox rect, .flow-svg .fbox path { fill: var(--panel); stroke: var(--text); stroke-width: 1.4; transition: stroke .3s, fill .3s; }
+  .flow-svg .fbox .cyl-top { fill: none; }
+  .flow-svg .fbox.dashed rect { stroke-dasharray: 5 4; }
+  .flow-svg .fbox.dim rect { stroke: var(--dim); } .flow-svg .fbox.dim .ft { fill: var(--dim); }
+  .flow-svg .fbox.ai rect { stroke: var(--warn); stroke-width: 2.2; }
+  .flow-svg .fbox.ai.off rect { stroke: var(--dim); stroke-dasharray: 4 4; }
+  .flow-svg .fbox.thinking rect { stroke: var(--accent); stroke-dasharray: 10 6; animation: flowdash .7s linear infinite; }
+  @keyframes flowdash { to { stroke-dashoffset: -16; } }
+  .flow-svg .fbox.hit rect, .flow-svg .fbox.hit path { animation: fhit .6s ease-out; }
+  .flow-svg .fbox.hitwarn rect { animation: fhitw .7s ease-out; }
+  .flow-svg .fbox.hiterr rect { animation: fhite 1s ease-out; }
+  @keyframes fhit { 0% { fill: var(--accent-soft); stroke: var(--accent); } }
+  @keyframes fhitw { 0% { fill: var(--warn-bg); stroke: var(--warn); } }
+  @keyframes fhite { 0% { fill: var(--err-bg); stroke: var(--err); } }
+  .flow-svg .fpath { fill: none; stroke: var(--text); stroke-width: 1.5; opacity: .85; }
+  .flow-svg .fpath.event { stroke-dasharray: 5 4; opacity: .6; }
+  .flow-svg .farrow { fill: var(--text); }
+  .flow-svg .fjoin { fill: var(--info); }
+  .flow-svg .fnum { fill: var(--panel); stroke: var(--text); stroke-width: 1.3; }
+  .flow-svg .fnt { font-size: 11px; font-weight: 700; fill: var(--text); }
+  .flow-svg .fcomp { fill: none; stroke: var(--text); stroke-width: 1.2; }
+  .flow-svg .pt { fill: var(--muted); }
+  .flow-svg .pt.warn { fill: var(--warn); } .flow-svg .pt.err { fill: var(--err); filter: drop-shadow(0 0 4px var(--err)); }
+  .flow-svg .pt.accent { fill: var(--accent); } .flow-svg .pt.ok { fill: var(--ok); }
+  .flow-svg .ptl { font-size: 9px; font-weight: 700; fill: var(--err); text-anchor: start; }
+  .flow-cap { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .t-ok { color: var(--ok); }
+  .trace-chip { font-family: var(--mono); font-size: 11.5px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel2); color: var(--accent); cursor: pointer; }
+  .trace-chip:hover { border-color: var(--accent); }
+  .tstep { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .tstep .tn { width: 22px; height: 22px; flex: none; border-radius: 50%; border: 1px solid var(--text); display: grid; place-items: center; font-size: 11px; font-weight: 700; }
+  .tstep.bad .tn { border-color: var(--err); color: var(--err); } .tstep.good .tn { border-color: var(--ok); color: var(--ok); }
+
+  /* ---- incidents ---- */
+  .incident { margin-bottom: 12px; }
+  .incident.closed { opacity: .72; }
+  .inc-title { font-weight: 600; font-size: 15px; }
+  .inc-text { margin: 10px 0 0; font-size: 13.5px; line-height: 1.55; }
+  .inc-fix { display: flex; gap: 12px; align-items: center; margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; background: var(--panel2); font-size: 13.5px; }
   .proj-h { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px; }
   .t-warn { color: var(--warn); } .t-err { color: var(--err); }
   .dangerzone { border: 1px solid var(--err); border-radius: 8px; }
