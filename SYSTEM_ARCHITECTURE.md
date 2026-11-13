@@ -7,9 +7,9 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.4.0 |
-| Application version | 0.9.0 (`Cargo.toml`) |
-| Last updated | 2026-11-12 |
+| Document version | 1.6.0 |
+| Application version | 0.11.0 (`Cargo.toml`) |
+| Last updated | 2026-11-13 |
 
 ## 1. System Overview
 
@@ -26,8 +26,8 @@ one place to start, stop, deploy and watch them, without Docker, a CI server or 
 process manager per project.
 
 **Form.** One executable (`portalcontrol`, about 5.6 MB on Windows). The dashboard,
-SQLite and libgit2 are compiled in. It needs no installer, no runtime and no other
-files; it creates its data folder on first start.
+SQLite and libgit2 are compiled in. It needs no runtime and no other files, and it is
+its own installer (3.8); it creates its data folder on first start.
 
 **Core lifecycle.**
 
@@ -104,7 +104,9 @@ files; it creates its data folder on first start.
 | Login autostart | Registry Run key (winreg), launchd agent, systemd user unit | `autostart.rs` |
 | External tools, optional | `bandit`, `pip-audit` | Only for security scans. PortalControl installs them itself into `<data>/tools/venv` when a scan finds them missing or broken (`toolbox.rs`); a copy on PATH is used when it has none. Installing needs Python 3 and PyPI |
 | PDF | Built-in writer (`pdf.rs`) | Reports use the standard Helvetica fonts every PDF reader has, so nothing is embedded and no PDF library is linked |
-| Deployment | Copy the executable | Windows build links the C runtime statically (`.cargo/config.toml`). macOS: `scripts/make-macos-app.sh` builds `PortalControl.app` |
+| Deployment | The program installs itself (`install.rs`, 3.8) | Windows build links the C runtime statically (`.cargo/config.toml`). macOS: `scripts/make-macos-app.sh` builds `PortalControl.app` |
+| Local AI model, optional | Ollama over plain HTTP (`ollama.rs`) | Explains incidents and investigates suspected attacks. Runs on this machine or a trusted one; nothing is sent to a cloud service |
+| Email alerts, optional | Built-in SMTP client (`mail.rs`) with tokio-rustls and webpki-roots | STARTTLS, implicit TLS or a plain local relay |
 | Supported systems | Windows x64, macOS, Linux | Built on the system it runs on |
 
 There are no third-party web APIs. Outbound network traffic is Git fetches and health
@@ -127,6 +129,7 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `.github/workflows/ci.yml` | On every push and pull request: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on Windows and macOS |
 | `rustfmt.toml` | Formatting rules (`max_width = 110`) |
 | `scripts/` | `install-autostart.ps1` / `.sh` (build, install, register autostart), `make-icon.py`, `make-macos-app.sh` |
+| `integrations/django/portalcontrol_requestlog.py` | Request-log middleware for Django projects; embedded in the program and offered for download (3.9) |
 | `README.md` | User guide |
 | `docs/screenshots/` | Dashboard screenshots and a PDF report preview used by the README, taken from a demo setup |
 | `prd.md` | Original product requirements |
@@ -136,7 +139,14 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 
 | Module | Responsibility |
 | --- | --- |
-| `main.rs` | Command line (`serve`, `stop`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, shutdown, tray status text, author and build details |
+| `main.rs` | Command line (`serve`, `stop`, `install`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, the install sequence, repair of the login entry at start, opening and re-trying the network address, shutdown, tray status text, author and build details |
+| `install.rs` | Where the program is installed, replacing the installed copy, the "Install?" question of a double-clicked copy, the Start Menu shortcut (see 3.8) |
+| `monitor.rs` | The log monitor (added in 0.10.0): rules and learned patterns over every target's output, incidents, the AI stage with its two briefs (fault, attack), alert emails |
+| `threat.rs` | Attack detection: reads requests out of log lines, rules per target, the evidence text for the investigation (see 3.9) |
+| `ollama.rs` | Client for a local Ollama server: list models, ask for an answer in a JSON schema |
+| `mail.rs`, `alerts.rs` | SMTP client; alert settings, throttling and sending |
+| `api/incidents.rs` | Incidents, applying a suggested fix, monitor and alert settings, traces, live counters, download of the Django middleware |
+| `api/repos.rs` | Cloning a repository for a new target and stored access tokens (added in 0.10.0) |
 | `api/mod.rs` | The router, the embedded dashboard assets and the helpers every handler shares |
 | `api/access.rs` | Sign-in, sessions and the request guards (allowed hosts, same-origin, network gate) |
 | `api/views.rs` | Validation of target settings and the JSON view of a target |
@@ -169,7 +179,7 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `auth.rs` | Optional dashboard password, sessions, sign-in lockout, the control token |
 | `net.rs` | Which addresses may be bound and which `Host` values are answered |
 | `netcfg.rs` | Network settings of the manager: stored values, what a start will open, loading the certificate, this machine's addresses (see 3.7) |
-| `autostart.rs` | Register and remove start at login on the three systems |
+| `autostart.rs` | Register and remove start at login on the three systems; read which program an entry starts and point it at another one, keeping its options |
 | `tray.rs` | Tray or menu-bar icon: status tooltip, menu, runs the user-interface loop on the main thread. Holds the native About window for Windows (`about_window`); macOS uses the system About panel |
 | `util.rs` | Time formatting and the manager's own log file |
 
@@ -190,6 +200,8 @@ global functions. Routing is by URL hash (`#/target/3/logs`).
 | `js/pages/new.js` | New Target page with project detection |
 | `js/pages/lists.js` | Deployments, Security and Activity pages |
 | `js/pages/about.js` | About page |
+| `js/pages/incidents.js`, `js/pages/flow.js` | Incidents page; live diagram of the monitor pipeline (added in 0.10.0) |
+| `js/settings/monitor.js` | Settings sections Email Alerts and AI Monitor, with the attack-detection note and middleware download |
 | `js/target/target.js` | The target page frame: header, tabs, saving |
 | `js/target/config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
 | `js/target/python.js` | Configuration section "Python Environment" (`CFG.python`) |
@@ -272,7 +284,12 @@ address of the machine (the network door), in plain HTTP or, with a certificate,
   and `--port` (the command line wins; `netcfg::effective`) and opens the doors. What
   was opened is kept in `AppState::net` (`netcfg::Active`).
 - If the network door cannot be opened, the manager still starts and records the
-  reason, which the Settings page shows. With `--bind` the failure is fatal, as before.
+  reason, which the Settings page shows. It then tries again every 5 seconds
+  (`NETWORK_RETRY`) and serves the address as soon as it can be bound, updating
+  `AppState::net` and writing a log line and an Activity entry. This is what makes a
+  start at login work: the manager usually starts before Wi-Fi, a VPN or Tailscale has
+  an address. With `--bind` the failure is fatal only when the program was started from
+  a terminal; started in the background it re-tries like the stored setting.
 - Settings are read only at start. Saving stores them; `GET /api/system/network`
   reports `restart_needed` when a start would open something different from what is
   running. `POST /api/system/restart` stops the manager and, after everything is
@@ -299,6 +316,88 @@ TCP connection to the port succeeds on `127.0.0.1` and on each private address o
 machine. The dashboard rewrites a generated start script through the existing
 `POST /api/fs/starter` with host `127.0.0.1` or `0.0.0.0`. Scripts PortalControl did
 not write are never edited. No listener of the manager sits in front of a project.
+
+### 3.8 Installing and updating
+
+A release is one program file, or on macOS one `.app` folder. `install.rs` gives it one
+fixed place per user: `%LOCALAPPDATA%\PortalControl\bin\portalcontrol.exe` on Windows,
+`/Applications/PortalControl.app` on macOS (`~/Applications` when that folder cannot be
+written), `~/.local/bin/portalcontrol` for a bare binary. `PORTALCONTROL_INSTALL_DIR`
+names another folder.
+
+- **`portalcontrol install`** (`install_command` in `main.rs`): if a manager answers on
+  the local address it is stopped through `/api/system/shutdown` with the control token
+  and the port is awaited; the new copy is written next to the destination, the installed
+  copy is renamed aside and the new one renamed into place (`install::replace`; a failed
+  step puts the old copy back); on Windows it then waits until the old file can be
+  deleted, which is when the old process has ended; an existing login entry is pointed at
+  the installed copy; the Start Menu shortcut is written (Windows, through
+  `WScript.Shell` in a hidden PowerShell); the installed copy is started with
+  `serve --detach` plus the given options and the dashboard is opened when it answers.
+  Renaming instead of overwriting is what makes it work while the old version runs:
+  Windows locks a running program against writing, not against renaming.
+- **Double click.** Started with no arguments, in a release build, from a place that is
+  not the install place, the program asks whether to install (`install::offer`: a
+  message box on Windows, `osascript` on macOS, nothing on Linux). Yes runs the sequence
+  above; No runs from where it is; an install error is shown in a dialog.
+  `PORTALCONTROL_NO_INSTALL` turns the question off.
+- **Login entry repair** (`heal_autostart` in `main.rs`, at every manager start): when
+  the entry starts a file that no longer exists, or the running copy is the installed one
+  and the entry starts another file, `autostart::repoint` rewrites the program path and
+  keeps the options. On macOS only the plist file is rewritten (launchd reads it at the
+  next login; reloading would start a second manager). A copy running from macOS app
+  translocation (`/AppTranslocation/`) is never registered: `install-autostart` refuses
+  there, and repair skips it.
+- A background manager on Windows no longer inherits the output handles of the command
+  that started it (`keep_output_handles`), so `portalcontrol install | more` and scripts
+  that read the output return when the command ends.
+- `/api/system` reports `installed` and `install_path`; Settings -> Start at Login shows
+  a note when the running copy is not the installed one. The start of every run logs
+  `program: <path>`.
+- The launchd agent is written with `ProcessType` `Interactive` instead of `Background`,
+  which asked macOS to throttle the manager and the services it starts.
+
+There is no uninstall command; the README says what to delete.
+
+### 3.9 Attack detection
+
+`threat.rs` runs inside the monitor's worker (`monitor.rs`), on the same `log` events,
+before the error rules.
+
+1. **Parse.** `parse_request` reads a request out of a line: the `PCREQ {json}` line of
+   the Django middleware (`ip`, `xff`, `m`, `p`, `s`, `ms`, `u`, `ua`, `ref`, `host`,
+   `len`; the forwarded address is used when the direct sender is loopback), the
+   common/combined access-log format (gunicorn, uvicorn, nginx) and Django's `runserver`
+   line, which has no sender. `PCREQ` lines are not fed to the error rules or the learned
+   patterns.
+2. **Rules.** One `Tracker` per target keeps the last 3,000 requests of 30 minutes.
+   `classify` marks a request (percent-decoded, lower-cased): SQL injection, path
+   traversal, script injection, command injection, code-execution probes and scanner
+   user agents are "strong"; secret files, other software's paths and foreign page types
+   answered 404 are probes. Counted per sender when the log names one, else over all
+   requests: one strong request; 5 probes in 5 minutes; 20 marked requests in 5 minutes
+   (critical); 8 failed sign-ins in 5 minutes (a POST to a sign-in path answered 200,
+   400, 401, 403 or 429); a sign-in accepted (301 to 303) after those (critical); 20
+   answers 401; 40 answers 4xx in a minute; 150 requests in 10 seconds that are also 6
+   times the smoothed usual rate (critical; flood buckets are not learned). `signal`
+   handles Django's own lines: `Invalid HTTP_HOST header` 3 times, `Forbidden (CSRF` 10
+   times, `SuspiciousOperation` and relatives once. Each rule has a 15-minute cooldown
+   per target.
+3. **Report.** An alarm is written to Activity at once (kind `security`) and becomes a
+   trigger of kind `attack`, `brute_force` or `flood` with its own severity and an
+   **evidence** text (`Tracker::evidence`): totals, answers, senders, most requested
+   paths, and, scoped to the sender the incident is about, its browsers, signed-in
+   accounts, sign-in counts and its last 40 requests with what was recognised in each.
+   Other senders' attack-looking requests are only counted, and named as separate.
+4. **Investigate.** With AI on, `handle` uses `SECURITY_PROMPT` and `security_prompt`
+   (rule, evidence, offered actions, the last 30 raw lines) with the same answer schema
+   as faults, and a 75-second limit instead of 180. The evidence is the incident's
+   excerpt and, when log lines are allowed in emails, the email's body (first 45 lines).
+
+Nothing is blocked; PortalControl is not in the request path of a project. The middleware
+is `integrations/django/portalcontrol_requestlog.py`, embedded with `include_str!` and
+served by `GET /api/monitor/django-middleware`. It prints no request bodies, cookies or
+other headers.
 
 ## 4. Data Models & State Management
 
@@ -359,6 +458,13 @@ target are kept.
 (`target_id`, `t`); `t` is unix seconds at the start of the minute. Columns `cpu`,
 `mem`, `mem_max`, `procs`, `latency`, `probes`, `probes_up`.
 
+**`incidents`** and **`ai_traces`** (added in 0.10.0): what the monitor found, and for
+each incident the trace of its analysis (trigger, prompt, model, answer, timing). The
+columns are in `db.rs` (`Incident`, `Trace`); an incident's `trigger` is one of `failure`,
+`crash_loop`, `health_down`, `deploy_failed`, `error_burst`, `new_error`, and since 0.11.0
+`attack`, `brute_force`, `flood`. 0.11.0 adds no tables or columns. The `settings` table
+also holds the keys `monitor`, `alerts` and `git_tokens`.
+
 **Migrations.** The base tables are created with `CREATE TABLE IF NOT EXISTS`. Columns
 added later are listed in `MIGRATIONS` in `db.rs` and applied with
 `add_column_if_missing` at every start, so an older database is upgraded in place and
@@ -384,7 +490,8 @@ Lost on restart and rebuilt by the workers:
 | `auth` | Password hash, sessions, failed sign-ins, control token |
 | `events` | Broadcast channel feeding every WebSocket client |
 | `shutdown`, `restart` | Notified to stop the manager; flag to start it again afterwards |
-| `net`, `cli_net` | What this manager listens on, and the `--bind` / `--port` it was started with |
+| `net`, `cli_net` | What this manager listens on (replaced when the network address is opened later; read through `AppState::net()`), and the `--bind` / `--port` it was started with |
+| Monitor worker (local to its task) | Per target: the log watch (context lines, learned patterns) and the attack `Tracker` (request history, usual rate, cooldowns) |
 
 ### 4.3 Browser state
 
@@ -481,7 +588,13 @@ what a request can make it run.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (112 at the time of writing).** Target registration and
+**Working and covered by tests (142 at the time of writing).** Installing: the install
+place of a program and of an app bundle, replacing a file and a whole folder, leaving the
+installed copy alone when the copy fails; pointing a login entry at another program on all
+three systems with its options kept. Attack detection: reading the three log formats,
+recognising attack requests and leaving ordinary ones alone, each rule with its threshold,
+the flood rule against a busy and a quiet baseline, Django's security messages, the
+evidence scoped to one sender. Target registration and
 validation, running and stopping scripts, services with auto-restart, timeouts, quick
 commands, live logs, history, Git state, pull, rollback, deploy, auto-deploy, cron
 schedules, webhooks, health probes and history, metrics and 7-day history, security
@@ -510,6 +623,22 @@ downloaded from a running manager, opened with poppler (`pdfinfo`, `pdftoppm`) a
 checked page by page. The dashboard's Needs attention panel, report buttons and the
 Scanner Tools page were checked in Chrome.
 
+**Checked by hand on Windows (0.11.0), with scratch folders, ports and data.**
+`portalcontrol install` into an empty folder; installing again over the running installed
+copy (stopped, replaced, started, no leftover files, 4 seconds); "already installed". A
+login entry pointing at a deleted download folder was re-pointed at the installed copy at
+start, options kept. A network address that could not be bound at start was opened by the
+retry 15 seconds later without a restart. A stand-in portal printing attack lines produced
+the five expected incidents and Activity entries, and with Ollama (`gemma3:4b`) each was
+analysed in 4 to 25 seconds; reports about one sender were accurate, while incidents
+without a sender picked up details of the other attacks running in the same seconds.
+
+**Written but not run (0.11.0).** The install question shown by a double click (release
+builds only) on Windows and macOS, the Start Menu shortcut, and everything about installing
+on macOS: the app bundle copy to Applications, the `osascript` dialogs, the launchd plist
+rewrite and the refusal under app translocation. The Django middleware was not run inside
+a Django project; its output format is what the parser tests use.
+
 **Written but not yet run on the real system.** The macOS menu-bar icon, its About
 panel and `scripts/make-macos-app.sh`. They use the same code as Windows but have not been built
 or started on a Mac.
@@ -530,7 +659,16 @@ quick-command timeout 900 s, default port 7878.
 - One network address at a time; no listening on every interface.
 - The per-target Network page only tests connections from this machine, so it cannot
   see a firewall that blocks other computers.
-- Environment variables are stored unencrypted.
+- Start at login runs at login, not at boot: after a restart nothing runs until the
+  user signs in. There is no system service.
+- No uninstall command, and no code signing, so each new download meets SmartScreen or
+  Gatekeeper again before it can install itself.
+- The network address is re-tried forever, also for a cause that will not go away (a
+  missing certificate file).
+- Attack detection uses fixed thresholds and blocks nothing. Without the middleware or
+  an access log with addresses, per-sender rules count all requests together. Paths that
+  contain a double quote are not parsed from access-log lines. Request history is in
+  memory and lost at a restart. Small models mix up attacks that overlap in time.
 - Security scans cover Python only and do not use the target's Python environment
   setting yet; `pip-audit` reads `requirements.txt`, else an environment inside the
   folder.
@@ -585,6 +723,8 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.6.0 | 0.11.0 | 2026-11-13 | **Installing** (`install.rs`, 3.8): `portalcontrol install` and an "Install?" question on double click put the program in one fixed place per user and replace the installed version, also while it runs; Start Menu shortcut on Windows. **Start at login no longer starts an old version**: installing re-points the login entry, and the installed copy repairs an entry that starts another or a missing file at every start (`autostart::registered_exe`, `repoint`); refused under macOS app translocation; launchd agent `ProcessType` now `Interactive`. **After a restart of the computer** the network address is re-tried every 5 seconds until it can be opened, instead of staying shut until a manual restart (`AppState::net` is now replaceable); `--bind` is fatal only from a terminal. Background managers on Windows no longer hold the starter's output pipe. `/api/system` gained `installed`, `install_path`; the log names the program file at start. **Attack detection** (`threat.rs`, 3.9): requests are read from the Django middleware's `PCREQ` lines, access logs and `runserver` lines; rules for injection, traversal, scanners, probes, scans, password guessing and a guessed password, 4xx sweeps, floods and Django's security messages; immediate Activity entry; incidents of kind `attack`, `brute_force`, `flood` with an evidence text; a security brief for the AI model with a 75-second limit; `GET /api/monitor/django-middleware`; `integrations/django/portalcontrol_requestlog.py`. Monitor counters gained `requests`, `threats`. Removed the outdated limitation "environment variables are stored unencrypted" (they are sealed since 0.9.0). |
+| 1.5.0 | 0.10.0 | 2026-11-12 | Written on 2026-11-13 from the code, because 0.10.0 was released without updating this file: clone a repository for a new target with stored access tokens (`api/repos.rs`, `git.rs`); the log monitor with rules, learned patterns, incidents and AI analysis through a local Ollama model (`monitor.rs`, `ollama.rs`, `api/incidents.rs`, tables `incidents` and `ai_traces`); email alerts (`mail.rs`, `alerts.rs`); Incidents page, trace view and live pipeline diagram (`incidents.js`, `flow.js`, `settings/monitor.js`). New dependencies tokio-rustls and webpki-roots; serde_json `preserve_order`. Sections 4 and 5 describe these only in outline. |
 | 1.4.0 | 0.9.0 | 2026-11-12 | Webhooks: POST only (GET is refused with 405 so link previews cannot deploy); optional signing secret (new column `portal_targets.webhook_secret`, `POST`/`DELETE /api/targets/{id}/webhook/secret`) checked as a GitHub/Gitea HMAC, GitLab token or `X-Webhook-Secret` header; pushes to other branches, tags and GitHub pings are acknowledged without deploying (`webhook.rs`). Environment variables and webhook secrets encrypted at rest (`secrets.rs`, `secret.key`, ChaCha20-Poly1305; plaintext sealed at start; `secure_delete` on). Export leaves out variable values unless asked (`?env_values=1`) and now includes start order and Python environment. Sign-in lockout per client address with a global backstop. Health: 30 s startup grace, planned stops and restarts not counted as outages. Fix: quick commands, launchers and the static-site starter used `python`, which macOS does not have; they now use `python3` there. Fix: the New Target page showed Windows examples on macOS until system info had loaded. `api.rs` split into `api/` with one file per area (code moved unchanged). CI workflow (clippy, tests on Windows and macOS); releases run the tests first. Clippy clean. New dependencies hmac and ring. Self-healing scanner tools (`toolbox.rs`, Settings > Scanner Tools, `GET /api/system/tools`, `POST /api/system/tools/install`): a scan installs or repairs bandit / pip-audit in `<data>/tools/venv` and retries; pinned `requirements.txt` audited without installing. PDF reports (`pdf.rs`, `report.rs`, `GET /api/reports/overall.pdf`, `GET /api/reports/project/{name}`). Dashboard: Needs attention panel, PDF report buttons, critical issues and vulnerable packages shown apart, uptime on cards, per-project running/failing summary. Health: routine probes of a stopped service no longer count as outages. README screenshots (`docs/screenshots/`). |
 | 1.3.0 | 0.8.0 | 2026-11-12 | Stricter network access: a guard on the network listener refuses every peer while no password is set, peers outside the bound address's network (default), and everyone after an optional time limit; both limits apply without a restart. Peers are listed in Settings and logged to Activity, sign-ins carry the peer address, two more response headers. New sign-in page. Fix: networks that use address space outside the private ranges internally could not be configured; such an address is now accepted in Settings when the machine has it and the user confirms the network is internal. Fix: on Windows the dashboard stopped answering ("Loading...", empty lists) once eight services were running, because their output pipes used all 16 threads of the blocking pool and database calls had none left; the cap is now 512. The target list also loads scans and last runs in one query each instead of one per target. |
 | 1.2.0 | 0.7.0 | 2026-11-12 | Network settings for the manager (`netcfg.rs`, Settings section, `GET`/`PUT /api/system/network`): address for other computers, port, host names, HTTPS with a user-supplied certificate; stored as JSON in `settings`. The manager now always listens on 127.0.0.1 and optionally on one network address; `--bind` adds the network address instead of replacing loopback, and `stop` always uses the local address. Restart from the dashboard (`POST /api/system/restart`). Password required for network access. Per-target Network page (`GET /api/targets/{id}/network`). New dependencies rustls and axum-server; sysinfo `network` feature. Dashboard scripts grouped into folders (`js/core`, `js/pages`, `js/target`, `js/settings`); the Settings page now has a side menu with one section per address (`#/settings/<section>`), each a `SET.<name>` function. Release workflow on GitHub Actions. |

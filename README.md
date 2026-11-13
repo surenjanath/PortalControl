@@ -246,14 +246,89 @@ deleted.
 - **Activity feed.** Deployments, health changes, new commits, scans and automation
   events (the last 300, kept in memory).
 
+## Attack detection
+
+The monitor that explains Django errors also watches for people attacking a portal. It
+reads the requests out of each target's output and reports, in the same second:
+
+| What it sees | When it reports |
+| --- | --- |
+| SQL injection, path traversal, script or command injection in the address asked for; a scanner program (sqlmap, nikto, nuclei, ...) | The first such request |
+| Probing for secret files (`/.env`, `/.git/`) or for other software (`/wp-login.php`, `/phpmyadmin`) | 5 within 5 minutes |
+| An automated scan | 20 attack requests from one sender within 5 minutes (critical) |
+| Password guessing | 8 failed sign-ins from one sender within 5 minutes, or 20 answers `401` |
+| A guessed password | A sign-in that is accepted after those failures (critical) |
+| Someone trying addresses | 40 answers `4xx` to one sender within a minute |
+| A flood (DoS) | 150 requests within 10 seconds that are also 6 times the target's usual rate (critical) |
+| Django's own warnings | A forged `Host` header 3 times, a failed CSRF check 10 times, any `SuspiciousOperation` |
+
+Each report appears at once under Activity and becomes an incident. The incident carries
+the **evidence**: how many requests, from which addresses, what was asked for and what the
+application answered, and everything the sender in question did in the last ten minutes.
+With a local AI model set up (Settings -> AI Monitor), the model investigates that
+evidence: what kind of attack it is, who is behind it, whether anything succeeded (a `500`
+or a `200` on an injection, a sign-in accepted after many failures) and what to do. The
+alert email contains the same. For attacks the model gets 75 seconds; if it has not
+answered by then the incident and the email go out with the rule's own description.
+
+Nothing is blocked automatically. PortalControl does not sit in front of your projects;
+block an address at the firewall or router.
+
+**See who is sending.** Django's development server prints each request without the
+sender's address, so rules that count per sender then count everything together. For
+addresses, signed-in users, browsers and response times, add PortalControl's request log
+to the Django project:
+
+1. Settings -> AI Monitor -> **download portalcontrol_requestlog.py** (the same file is in
+   `integrations/django/` in this repository) and put it next to `manage.py`.
+2. In `settings.py`, add it as the first entry of `MIDDLEWARE`:
+   `"portalcontrol_requestlog.RequestLogMiddleware"`.
+3. Restart the target.
+
+It prints one line per request (address, method, path with query string, status, time,
+signed-in user, browser, referrer, host). Request bodies, cookies and other headers are
+never printed. gunicorn, uvicorn and nginx access logs are understood as they are.
+
+The rules are fixed thresholds, not a firewall: a determined attacker who goes slowly stays
+under them, and a busy page of your own can cross one. Small models (3-4B) sometimes mix up
+two attacks that happen in the same minute; a 7B or larger model reports more precisely.
+
 ## Download
 
 Ready-made builds are on the repository's **Releases** page:
 
-- **Windows:** `PortalControl-<version>-windows-x64.zip`. Unzip and run `portalcontrol.exe`.
+- **Windows:** `PortalControl-<version>-windows-x64.zip`. Unzip, double-click
+  `portalcontrol.exe` and answer **Yes** to "Install PortalControl on this computer?".
 - **macOS:** `PortalControl-<version>-macos-universal.zip` (Apple Silicon and Intel). Unzip,
-  move `PortalControl.app` to Applications, and the first time right-click it and choose
-  **Open**, because the app is not notarised.
+  right-click `PortalControl.app` and choose **Open** the first time (the app is not
+  notarised), then choose **Install**.
+
+### Installing and updating
+
+Installing copies the program to one fixed place and starts it from there:
+
+| System | Installed at |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\PortalControl\bin\portalcontrol.exe`, with a Start Menu entry |
+| macOS | `/Applications/PortalControl.app` (`~/Applications` if that folder cannot be written) |
+| Linux, or a bare binary on macOS | `~/.local/bin/portalcontrol` |
+
+**To update, do the same with the new download.** The running PortalControl is stopped,
+the installed copy is replaced by the new one, and the new one starts and opens the
+dashboard. Because the place never changes, "Start at login" and the Start Menu entry
+start the new version from then on. Your targets, history and settings are not touched:
+they live in the data folder.
+
+- A copy that is not installed asks whether to install each time it is double-clicked.
+  **No** (Windows) or **Run From Here** (macOS) runs it from where it is, once.
+- From a terminal or a script: `portalcontrol install`. Options such as `--port` are
+  passed on to the copy it starts.
+- `PORTALCONTROL_INSTALL_DIR` names another folder to install into;
+  `PORTALCONTROL_NO_INSTALL=1` turns the question off.
+- The replacement also works while the old version is running: the old file is moved
+  aside, not overwritten, and put back if the copy fails.
+- To remove PortalControl: turn off start at login, quit it, and delete the installed
+  file or app. Delete the data folder as well to remove targets and history.
 
 They are built by GitHub Actions (`.github/workflows/release.yml`). To publish a new
 release, raise `version` in `Cargo.toml` and push to `main`: the workflow builds both
@@ -339,7 +414,10 @@ Things to know:
   or from Tailscale avoids that.
 - If the network address cannot be opened (cable unplugged, Tailscale off, certificate
   file gone), PortalControl still starts, stays reachable on this computer and shows the
-  reason in this section.
+  reason in this section. It tries again every 5 seconds and opens the address by itself
+  as soon as it can. This matters after a restart of the computer, when PortalControl
+  starts at login before Wi-Fi, a VPN or Tailscale has an address: other computers can
+  connect a few seconds after the network is up, with nothing to click.
 - `--bind` and `--port` on the command line still work and win over these settings.
 
 ### Network settings of a project
@@ -359,8 +437,10 @@ built from and when, the SQLite and libgit2 versions inside it, the machine, the
 uptime, and where the program and its data folder are. **Copy details** puts all of it on
 the clipboard.
 
-A new version replaces only the program file. Targets, history and settings live in the
-data folder and are kept; new database columns are added automatically at start.
+A new version replaces only the program file (see [Installing and updating](#installing-and-updating)).
+Targets, history and settings live in the data folder and are kept; new database columns
+are added automatically at start. The first lines of `portalcontrol.log` after each start
+name the version and the program file that is running.
 
 ## Tray icon and app icon
 
@@ -415,9 +495,25 @@ portalcontrol autostart-status
 portalcontrol uninstall-autostart
 ```
 
-The entry points at the executable you ran the command from, so install the binary
-somewhere permanent first (the scripts in `scripts/` do this for you). On Windows the
-login launch uses `serve --detach`, which runs without a console window.
+The entry starts one particular program file. Install PortalControl first (see
+[Installing and updating](#installing-and-updating)); the entry then points at the
+installed copy, which every update replaces in place. Two things keep it from starting
+an old version or nothing at all:
+
+- Installing a version re-points an existing entry at the installed copy, keeping its
+  options.
+- At every start, the installed copy checks the entry. If it starts another file, or a
+  file that no longer exists (a deleted download folder), it is pointed at the running
+  copy. The log says so.
+
+On macOS an app opened straight from the download runs from a temporary place that is gone
+after a restart; start at login refuses to be turned on from there and asks you to install
+first. On Windows the login launch uses `serve --detach`, which runs without a console
+window.
+
+Start at login means at *login*: after a restart, PortalControl and its targets come up
+when you sign in to the computer, not while it sits at the sign-in screen. On a machine
+that must serve without anyone signing in, turn on automatic sign-in for that account.
 
 Targets can also be started automatically: tick **Start this target automatically when
 PortalControl starts** on a target and it is launched (as `SYSTEM_AUTO`) whenever the
@@ -431,6 +527,7 @@ portalcontrol [COMMAND] [OPTIONS]
 
 serve                 Run the manager and web dashboard (default)
 stop                  Stop a running manager (same --bind/--port)
+install               Install this copy: replaces the installed version, keeps the data
 install-autostart     Start PortalControl automatically at login
 uninstall-autostart   Remove the login autostart entry
 autostart-status      Show whether autostart is installed
@@ -580,6 +677,7 @@ protection*).
 | GET | `/api/fs/inspect?dir=` | Scripts, project type and Git state of a directory |
 | GET | `/api/system`, `/api/system/metrics`, `/api/system/log` | Manager details, host samples, manager log tail |
 | POST / DELETE | `/api/system/autostart` | Enable / disable start at login |
+| GET | `/api/monitor/django-middleware` | The request-log middleware for Django projects, as a file |
 | POST | `/api/system/shutdown` | Stop the manager and its child processes |
 | GET | `/ws` | WebSocket event stream (`log`, `run_started`, `run_finished`, `health`, `git`, `scan_*`, `activity`) |
 

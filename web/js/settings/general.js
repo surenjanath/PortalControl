@@ -8,6 +8,7 @@ SET.startup = () => {
         h("div", { class: "box rowf" }, h("div", { style: "flex:1;min-width:240px" }, sys.autostart ? [h("span", { class: "pill ok" }, h("span", { class: "dot ok" }), "Enabled"), h("div", { class: "mono dim", style: "margin-top:8px;word-break:break-all" }, sys.autostart)]
             : [h("span", { class: "pill off" }, "Disabled"), h("div", { class: "muted small", style: "margin-top:8px" }, "PortalControl only runs while you start it yourself. Enable this to bring it (and every target marked \u201cStart with PortalControl\u201d) up when you log in.")]),
           sys.autostart ? btn("Disable", () => act(() => api("DELETE", "/api/system/autostart"), "Start at login disabled"), "danger") : btn("Enable start at login", () => act(() => api("POST", "/api/system/autostart"), "Start at login enabled"), "hl")),
+        sys.installed === false ? h("div", { class: "note-box" }, "This copy runs from ", h("span", { class: "mono" }, sys.executable), " and is not installed, so start at login depends on that file staying where it is. To install it" + (sys.install_path ? " to " + sys.install_path : "") + ": quit PortalControl, double-click the program again and choose Install (or run ", h("span", { class: "mono" }, "portalcontrol install"), "). A newer version installed the same way replaces it, and start at login follows.") : null,
     );
   };
   paint();

@@ -106,8 +106,10 @@ pub struct AppState {
     pub data_dir: OnceLock<PathBuf>,
     /// The `serve` options this manager was started with (for login autostart).
     pub serve_args: OnceLock<Vec<String>>,
-    /// What this manager is listening on (see `netcfg.rs`).
-    pub net: OnceLock<crate::netcfg::Active>,
+    /// What this manager is listening on (see `netcfg.rs`). It changes while
+    /// running when the network address only becomes available later; read
+    /// it with `net()`.
+    pub net: Mutex<Option<crate::netcfg::Active>>,
     /// `--bind` and `--port` as given on the command line.
     pub cli_net: OnceLock<(Option<std::net::IpAddr>, Option<u16>)>,
     /// Limits on other computers that can change while running.
@@ -122,6 +124,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// What this manager is listening on right now.
+    pub fn net(&self) -> Option<crate::netcfg::Active> {
+        self.net.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn set_net(&self, active: crate::netcfg::Active) {
+        *self.net.lock().unwrap_or_else(|p| p.into_inner()) = Some(active);
+    }
+
     pub fn new(db: Db, bind: SocketAddr) -> Arc<Self> {
         let (events, _) = broadcast::channel(4096);
         Arc::new(Self {
@@ -146,7 +157,7 @@ impl AppState {
             shutdown: Notify::new(),
             data_dir: OnceLock::new(),
             serve_args: OnceLock::new(),
-            net: OnceLock::new(),
+            net: Mutex::new(None),
             cli_net: OnceLock::new(),
             net_limits: Mutex::new(crate::netcfg::Limits::default()),
             clients: Mutex::new(HashMap::new()),
