@@ -88,10 +88,12 @@ CFG.processes = (ctx) => {
         return h("div", { class: "box rowf", style: "margin-bottom:8px" },
           h("div", { style: "flex:1;min-width:260px" }, h("b", {}, w.label), reg ? [" ", pill(tStatus(reg))] : null,
             h("div", { class: "mono muted", style: "margin-top:4px;word-break:break-all" }, w.command),
-            h("div", { class: "dim small", style: "margin-top:2px" }, "Detected: " + w.why + (w.script_exists ? " · launcher " + w.script + " exists" : ""))),
+            h("div", { class: "dim small", style: "margin-top:2px" }, "Detected: " + w.why + (w.script_exists ? " · launcher " + w.script + " exists" : "")),
+            (w.started_by || []).length ? h("div", { class: "small t-warn", style: "margin-top:2px" }, (reg ? "Runs twice if " : "Already started by ") + w.started_by.join(", ") + (reg ? " is also running: that script starts it too." : ". Adding it would run it twice.")) : null),
           reg ? h("a", { class: "btn sm", href: "#/target/" + reg.id }, "Open") : btn("Add to project", async () => {
             const project = x.project === "Default" ? x.name : x.project;
             const body = [h("p", {}, "This registers “" + x.name + " · " + w.label + "” as a second service in project “" + project + "”, with restart on crash enabled."),
+              (w.started_by || []).length ? h("p", { class: "t-warn" }, w.started_by.join(", ") + " already starts the " + w.label + ". If a target runs that script, the process will run twice against the same database. Remove it from the script first, or do not add this.") : null,
               w.script_exists ? null : h("p", {}, "A small launcher script, ", h("span", { class: "mono" }, w.script), ", will be created in the project folder. It only runs: ", h("span", { class: "mono" }, w.command)),
               project !== x.project ? h("p", {}, "“" + x.name + "” moves from the Default project into “" + project + "” so the two are grouped.") : null];
             if (!(await confirmDlg("Add " + w.label + "?", body, "Add process"))) return;

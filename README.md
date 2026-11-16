@@ -246,6 +246,18 @@ deleted.
 - **Activity feed.** Deployments, health changes, new commits, scans and automation
   events (the last 300, kept in memory).
 
+## Where the monitor's lines come from
+
+The Incidents page counts every output line the monitor has read since the manager
+started. That number is cumulative; the log view of a target keeps only its last 2,000
+lines, so the two do not match. The diagram draws the five targets that printed the most,
+and the table under it lists every target with its lines, share, error lines and current
+rate, busiest first. Click a row to open that target.
+
+When a project's own start script already starts its Django-Q cluster, Celery worker or
+npm process, PortalControl says so and does not tick "Also add" for it: adding it as a
+second target would run the same process twice against one database.
+
 ## Attack detection
 
 The monitor that explains Django errors also watches for people attacking a portal. It

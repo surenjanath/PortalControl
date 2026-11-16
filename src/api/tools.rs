@@ -80,6 +80,7 @@ pub(super) fn inspect_dir(dir: &std::path::Path) -> Value {
                 "script": w.script,
                 "script_exists": dir.join(&w.script).is_file(),
                 "why": w.why,
+                "started_by": w.started_by,
             })
         })
         .collect();

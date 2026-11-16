@@ -389,6 +389,17 @@ mod tests {
         assert_eq!(v["workers"][0]["kind"], "qcluster");
         assert_eq!(v["workers"][0]["script_exists"], true);
         assert_eq!(v["workers"][1]["script_exists"], false);
+
+        // A start script that already runs the cluster is named, so the
+        // cluster is not added a second time; a comment does not count.
+        assert_eq!(v["workers"][0]["started_by"], json!([]));
+        let start = if cfg!(windows) { "start.bat" } else { "start.sh" };
+        std::fs::write(p.join(start), "# then: python manage.py qcluster\necho hi\n").unwrap();
+        assert!(detect_workers(p)[0].started_by.is_empty());
+        std::fs::write(p.join(start), "python manage.py qcluster &\npython manage.py runserver\n").unwrap();
+        assert_eq!(detect_workers(p)[0].started_by, vec![start.to_string()]);
+        assert!(detect_workers(p)[1].started_by.is_empty(), "celery is not started by it");
+        assert_eq!(inspect_dir(p)["workers"][0]["started_by"], json!([start]));
     }
 
     #[test]
