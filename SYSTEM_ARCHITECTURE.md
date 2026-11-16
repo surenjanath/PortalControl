@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.6.1 |
-| Application version | 0.11.1 (`Cargo.toml`) |
+| Document version | 1.7.0 |
+| Application version | 0.12.0 (`Cargo.toml`) |
 | Last updated | 2026-11-16 |
 
 ## 1. System Overview
@@ -145,6 +145,8 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `threat.rs` | Attack detection: reads requests out of log lines, rules per target, the evidence text for the investigation (see 3.9) |
 | `ollama.rs` | Client for a local Ollama server: list models, ask for an answer in a JSON schema |
 | `mail.rs`, `alerts.rs` | SMTP client; alert settings, throttling and sending |
+| `analytics.rs` | Analytics over everything stored (added in 0.12.0): figures per target and for the machine, the reliability score, the findings (see 3.10). Stores nothing |
+| `api/analytics.rs` | `GET /api/analytics`: hands the period, the time and the local time zone to `analytics.rs` |
 | `api/incidents.rs` | Incidents, applying a suggested fix, monitor and alert settings, traces, live counters, download of the Django middleware |
 | `api/repos.rs` | Cloning a repository for a new target and stored access tokens (added in 0.10.0) |
 | `api/mod.rs` | The router, the embedded dashboard assets and the helpers every handler shares |
@@ -201,6 +203,7 @@ global functions. Routing is by URL hash (`#/target/3/logs`).
 | `js/pages/lists.js` | Deployments, Security and Activity pages |
 | `js/pages/about.js` | About page |
 | `js/pages/incidents.js`, `js/pages/flow.js` | Incidents page; live diagram of the monitor pipeline (added in 0.10.0). The diagram has room for five sources and shows the targets that printed the most; the table under it ("Where the lines come from", 0.11.1) lists every target with its lines, share, error lines and patterns since the manager started |
+| `js/pages/analytics.js` | Analytics page (0.12.0): summary tiles, findings, trend charts, runs and incidents per day or hour, the weekday-by-hour grid of failures, the sortable table that compares targets, projects, monitor and AI figures (see 3.10) |
 | `js/settings/monitor.js` | Settings sections Email Alerts and AI Monitor, with the attack-detection note and middleware download |
 | `js/target/target.js` | The target page frame: header, tabs, saving |
 | `js/target/config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
@@ -399,6 +402,54 @@ is `integrations/django/portalcontrol_requestlog.py`, embedded with `include_str
 served by `GET /api/monitor/django-middleware`. It prints no request bodies, cookies or
 other headers.
 
+### 3.10 Analytics
+
+The Analytics page (`#/analytics`) makes one request, `GET /api/analytics?range=24h|7d|30d`
+(7 days when left out), and `analytics.rs` answers it from what is already stored. Nothing
+is written and there is no new table.
+
+**What is read.** All `metric_points` rows of the period (one per target per minute),
+the runs and incidents created in it, the AI traces grouped by status, the newest
+security scan of every target, and the monitor's in-memory line counters
+(`monitor::stats()`). Days and hours are local: the handler passes the time zone's offset
+from UTC, and the tests pass their own.
+
+**Per target** (`TargetStats`): availability (probes answered), response time (average,
+median, 95th percentile, maximum), CPU and memory (average, peak), minutes running,
+outages with total and longest downtime (`metrics::outages`), mean time to recover and
+mean time between outages, runs (succeeded, failed, average and 95th-percentile duration;
+quick commands are left out, as on the Metrics tab), crash restarts (runs triggered by
+`AUTO_RESTART`), incidents (all, critical, open), log lines and error lines since start,
+and the scan counters.
+
+**Derived figures.**
+
+| Figure | Rule |
+| --- | --- |
+| Memory trend | Least-squares line through the memory of the minutes running: slope in bytes per hour and r². `mem_growing` when there are at least 120 minutes, r² is 0.6 or more, and the line gained at least 20 MB and a fifth of the average |
+| Response anomaly | The last hour's average against the time before it (at least 5 and 30 minutes with a probe): flagged when it is more than three standard deviations above, at least 1.5 times and at least 50 ms more |
+| Reliability score | 100 minus: 2 points per percent of missed probes (at most 40); the failed share of runs times 25; 3 per crash restart (at most 15); 2 per incident plus 2 more per critical one (at most 10); 5 per critical issue plus 1 per vulnerable package (at most 10). Every deduction is returned with its reason (`deductions`) and shown as the score's tooltip |
+| Timeline | Runs and incidents per local hour (24 hours) or local day (7 and 30 days), empty bars included |
+| Failure grid | Failed runs and incidents by local weekday and hour |
+
+**Findings** (`insights`), most serious first: a critical issue in the newest scan; outages
+(error under 95 % availability); three or more crash restarts (error from ten); 30 % or
+more of at least three runs failed; growing memory; a response anomaly; a fifth or more of
+at least 1,000 log lines looking like errors; one target printing four fifths of at least
+10,000 lines among three or more targets; one hour of the day holding 40 % or more of at
+least ten failures.
+
+**For the machine.** The series adds CPU and memory up over the targets per bucket
+(5 minutes for 24 hours, otherwise 30), adds the probes up for availability and averages
+the response time; `summary` holds the totals and the average score; `projects` groups the
+target figures by project.
+
+**Limits of the answer.** They are the limits of the tables: minute rows are kept 7 days
+(a 30-day period has resource and health figures for its last 7 days, and the page says
+so), 200 runs per target, the newest 500 incidents and traces. Line counters begin again
+when the manager restarts. The page asks again at most once a minute while open, and on
+Refresh.
+
 ## 4. Data Models & State Management
 
 ### 4.1 Database
@@ -588,7 +639,11 @@ what a request can make it run.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (142 at the time of writing).** Installing: the install
+**Working and covered by tests (150 at the time of writing).** Analytics: the memory
+trend (steady growth found, an up-and-down pattern and a flat line not), availability,
+outages and recovery times, the response anomaly, the score with its deductions and
+ceilings, run counting without quick commands, the timeline and failure grid in local
+time, the order of findings, and the whole answer built from a database. Installing: the install
 place of a program and of an app bundle, replacing a file and a whole folder, leaving the
 installed copy alone when the copy fails; pointing a login entry at another program on all
 three systems with its options kept. Attack detection: reading the three log formats,
@@ -633,6 +688,15 @@ the five expected incidents and Activity entries, and with Ollama (`gemma3:4b`) 
 analysed in 4 to 25 seconds; reports about one sender were accurate, while incidents
 without a sender picked up details of the other attacks running in the same seconds.
 
+**Checked by hand on Windows (0.12.0), with a scratch data folder and made-up data.** The
+Analytics page in Chrome against a development build: five targets, 50,400 minute rows,
+140 runs, 22 incidents. Tiles, findings, the five trend charts, the timeline, the failure
+grid, the three bar lists, the target table and its sorting, the project table, the
+monitor and AI tiles, all three periods (the 30-day note about the 7 days of minute rows
+included), dark and light theme. The request took about half a second in a debug build.
+Not looked at: a narrow window, and the page on a machine with real output, so the line
+counters were all zero.
+
 **Written but not run (0.11.0).** The install question shown by a double click (release
 builds only) on Windows and macOS, the Start Menu shortcut, and everything about installing
 on macOS: the app bundle copy to Applications, the `osascript` dialogs, the launchd plist
@@ -650,6 +714,10 @@ quick-command timeout 900 s, default port 7878.
 **Limitations and technical debt.**
 
 - One machine only. There is no agent for remote hosts and no shared database.
+- Analytics are worked out on every request from the stored rows (all minute rows of the
+  period are read) and are not cached. The reliability score's weights are fixed in
+  `analytics.rs`; they are a judgement, not a standard. An incident has no closing time,
+  so there is no time-to-resolve figure.
 - One user. A password protects the dashboard, but there are no accounts or roles.
 - Health checks of `https://` URLs only test that the port answers.
 - HTTPS is for the dashboard's network address only. PortalControl does not serve
@@ -723,6 +791,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.7.0 | 0.12.0 | 2026-11-16 | **Analytics page** (`analytics.rs`, `api/analytics.rs`, `js/pages/analytics.js`, section 3.10): `GET /api/analytics?range=24h\|7d\|30d` works out, from the minute rows, runs, incidents, AI traces, scans and the monitor's counters, figures per target and for the machine (availability, response time, CPU, memory, outages, time to recover and between outages, runs, crash restarts, incidents, log lines), a memory trend that marks steady growth, a check of the last hour's response time against the time before, a reliability score whose every deduction is named, a timeline and a weekday-by-hour grid of failures in local time, a roll-up per project, and a list of findings. The page shows them with a sortable table that compares the targets. New sidebar entry and `chart` icon; Incidents and Analytics added to the command palette. Nothing is stored and there is no schema change. 8 new tests (150). |
 | 1.6.1 | 0.11.1 | 2026-11-16 | **Monitor view names the source of the lines.** The pipeline diagram drew the first five targets of the list, so with more than five targets a target printing millions of lines could be one of the hidden ones while the five shown stood at 0.0 lines/s. It now draws the five that printed the most (running first) and gives the rest a dashed box of their own ("+N OTHER", or "NOT IN THE LIST" for a process whose target the page does not know): before, the moving dots of an undrawn target were drawn on the line of the last box, as if that target had printed them; a table under it lists every target with lines, share, error lines, patterns and current rate, busiest first, and opens the target on a click. `GET /api/monitor/stats` gained `error_lines` per target (`Watch::seen_errors`); counters of deleted targets are dropped; the header says "lines since start" (the count is cumulative, the log view keeps the last 2,000 lines per target). **A companion process is not added twice** (`detect.rs`: `Worker::started_by`, `scripts_starting`): when a script in the project folder already starts the Django-Q cluster, the Celery worker or beat, or the npm process (a non-comment line with the command), `GET /api/fs/inspect` names it in `workers[].started_by`; the New target page then leaves "Also add" unticked and says why, and the Configuration tab and its confirmation warn. Found on a Mac where `start.sh` and the generated `portalcontrol_qcluster.sh` ran two clusters on one SQLite database and printed 17 million lines in an hour. No schema change. |
 | 1.6.0 | 0.11.0 | 2026-11-13 | **Installing** (`install.rs`, 3.8): `portalcontrol install` and an "Install?" question on double click put the program in one fixed place per user and replace the installed version, also while it runs; Start Menu shortcut on Windows. **Start at login no longer starts an old version**: installing re-points the login entry, and the installed copy repairs an entry that starts another or a missing file at every start (`autostart::registered_exe`, `repoint`); refused under macOS app translocation; launchd agent `ProcessType` now `Interactive`. **After a restart of the computer** the network address is re-tried every 5 seconds until it can be opened, instead of staying shut until a manual restart (`AppState::net` is now replaceable); `--bind` is fatal only from a terminal. Background managers on Windows no longer hold the starter's output pipe. `/api/system` gained `installed`, `install_path`; the log names the program file at start. **Attack detection** (`threat.rs`, 3.9): requests are read from the Django middleware's `PCREQ` lines, access logs and `runserver` lines; rules for injection, traversal, scanners, probes, scans, password guessing and a guessed password, 4xx sweeps, floods and Django's security messages; immediate Activity entry; incidents of kind `attack`, `brute_force`, `flood` with an evidence text; a security brief for the AI model with a 75-second limit; `GET /api/monitor/django-middleware`; `integrations/django/portalcontrol_requestlog.py`. Monitor counters gained `requests`, `threats`. Removed the outdated limitation "environment variables are stored unencrypted" (they are sealed since 0.9.0). |
 | 1.5.0 | 0.10.0 | 2026-11-12 | Written on 2026-11-13 from the code, because 0.10.0 was released without updating this file: clone a repository for a new target with stored access tokens (`api/repos.rs`, `git.rs`); the log monitor with rules, learned patterns, incidents and AI analysis through a local Ollama model (`monitor.rs`, `ollama.rs`, `api/incidents.rs`, tables `incidents` and `ai_traces`); email alerts (`mail.rs`, `alerts.rs`); Incidents page, trace view and live pipeline diagram (`incidents.js`, `flow.js`, `settings/monitor.js`). New dependencies tokio-rustls and webpki-roots; serde_json `preserve_order`. Sections 4 and 5 describe these only in outline. |

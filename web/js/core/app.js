@@ -28,7 +28,7 @@ async function toggleNotify() {
 function openPalette() {
   if ($("palette")) return;
   const items = [];
-  [["Dashboard", ""], ["Projects", "projects"], ["New target", "new"], ["Deployments", "deployments"], ["Security", "security"], ["Activity", "activity"], ["Settings", "settings"]]
+  [["Dashboard", ""], ["Projects", "projects"], ["New target", "new"], ["Deployments", "deployments"], ["Security", "security"], ["Incidents", "incidents"], ["Analytics", "analytics"], ["Activity", "activity"], ["Settings", "settings"]]
     .forEach(([label, path]) => items.push({ label, hint: "Page", run: () => go(path) }));
   byProject(targets).forEach(([name]) => items.push({ label: name, hint: "Project terminals", run: () => { location.hash = projHref(name); } }));
   targets.forEach((t) => {

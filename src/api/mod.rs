@@ -34,6 +34,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
 mod access;
+mod analytics;
 mod backups;
 mod commands;
 mod detect;
@@ -51,6 +52,7 @@ mod ws;
 
 use access::*;
 pub use access::{network_guard, ViaTls};
+use analytics::*;
 use backups::*;
 use commands::*;
 use detect::*;
@@ -98,6 +100,7 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("js/pages/about.js", JS, include_str!("../../web/js/pages/about.js")),
     ("js/pages/flow.js", JS, include_str!("../../web/js/pages/flow.js")),
     ("js/pages/incidents.js", JS, include_str!("../../web/js/pages/incidents.js")),
+    ("js/pages/analytics.js", JS, include_str!("../../web/js/pages/analytics.js")),
     ("js/settings/monitor.js", JS, include_str!("../../web/js/settings/monitor.js")),
     ("js/core/app.js", JS, include_str!("../../web/js/core/app.js")),
     ("js/login.js", JS, include_str!("../../web/js/login.js")),
@@ -168,6 +171,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ai/test", post(ai_test))
         .route("/api/traces/{trace_id}", get(trace_get))
         .route("/api/monitor/stats", get(monitor_stats))
+        .route("/api/analytics", get(analytics_overview))
         .route("/api/monitor/django-middleware", get(django_middleware))
         .route("/api/git/tokens", get(tokens_list).put(tokens_put))
         .route("/api/fs/launcher", post(fs_launcher))

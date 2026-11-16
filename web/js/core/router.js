@@ -32,6 +32,7 @@ function resolve(r) {
   if (a === "security") return securityView();
   if (a === "activity") return activityView();
   if (a === "incidents") return incidentsView();
+  if (a === "analytics") return analyticsView();
   if (a === "settings") return settingsView(b);
   if (a === "about") return aboutView();
   if (a === "target" && b) return targetView(Number(b), c || "configuration", d);
@@ -52,6 +53,7 @@ function renderSide(r) {
       item("deployments", "Deployments", "list", a === "deployments", sys && sys.active_runs ? sys.active_runs + " active" : null),
       item("security", "Security", "shield", a === "security"),
       item("incidents", "Incidents", "bell", a === "incidents", sys && sys.open_incidents ? sys.open_incidents + " open" : null),
+      item("analytics", "Analytics", "chart", a === "analytics"),
       item("activity", "Activity", "activity", a === "activity", failing ? failing + " failing" : null),
       item("settings", "Settings", "settings", a === "settings"),
       item("about", "About", "info", a === "about")),

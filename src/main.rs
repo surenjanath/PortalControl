@@ -11,6 +11,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod alerts;
+mod analytics;
 mod api;
 mod auth;
 mod automation;
