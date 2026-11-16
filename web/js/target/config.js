@@ -134,9 +134,31 @@ CFG.environment = (ctx) => {
         : h("div", { class: "muted small" }, "No variables defined."));
     };
     ta.oninput = paintList; paintList();
+    // Fill the box from an env file: one in the project folder, or one chosen
+    // from this computer. Nothing is stored until Save.
+    const loader = h("div"), loaded = h("div");
+    const put = async (text, from, quiet) => {
+      const clean = text.replace(/\r\n?/g, "\n").split("\n").map((l) => l.replace(/^\s*export\s+/, "")).join("\n").trim();
+      if (!quiet && ta.value.trim() && ta.value.trim() !== clean && !(await confirmDlg("Replace what is in the box?", h("p", {}, "The variables in the box are replaced by those from " + from + ". Nothing is stored until you press Save."), "Replace"))) return;
+      ta.value = clean; paintList();
+      const n = clean.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#") && l.includes("=")).length;
+      loaded.replaceChildren(h("div", { class: "note-box ok" }, h("b", {}, n + " variable" + (n === 1 ? "" : "s") + " loaded from " + from + "."), " Not stored yet: check them below and press Save."));
+    };
+    const fromProject = (name, quiet) => api("GET", "/api/targets/" + id + "/env/files?name=" + encodeURIComponent(name)).then((r) => put(r.text || "", name + " in the project folder", quiet), (e) => toast(e.message, true));
+    const pick = h("input", { type: "file", style: "display:none", onchange: () => { const f = pick.files[0]; if (!f) return; if (f.size > 65536) { toast("That file is larger than 64 KB", true); return; }
+      const rd = new FileReader(); rd.onload = () => put(String(rd.result), f.name); rd.readAsText(f); pick.value = ""; } });
+    api("GET", "/api/targets/" + id + "/env/files").then((r) => {
+      const sel = r.files.length ? h("select", { style: "width:auto", "aria-label": "Env file in the project folder" }, r.files.map((f) => h("option", { value: f.name }, f.name))) : null;
+      loader.replaceChildren(h("div", { class: "rowf", style: "margin-bottom:14px" },
+        sel ? [h("span", { class: "muted small" }, "In the project folder:"), sel, btn("Load into the box", () => fromProject(sel.value, false), "sm", "download")] : h("span", { class: "muted small" }, "No .env file in the project folder."),
+        btn("Choose a file…", () => pick.click(), "sm", null, { title: "Load an env file from this computer into the box" }), pick));
+      // Nothing stored yet and the project has a .env: show it straight away.
+      if (!t.env_vars && !ta.value.trim() && r.files.some((f) => f.name === ".env")) fromProject(".env", true);
+    }, () => {});
     return [
       h("div", { class: "note-box" }, "These variables are set for the script and everything it starts. They are stored in PortalControl's local database, not in the project folder. ",
         h("span", { class: "mono" }, "PORTALCONTROL=1"), " and ", h("span", { class: "mono" }, "PYTHONUNBUFFERED=1"), " are always set. Changes apply to the next run."),
+      loader, loaded,
       saveForm(t, [field("Variables (.env format)", ta, "One KEY=VALUE per line. Lines starting with # are ignored; quotes around a value are removed.")], () => ({ env_vars: ta.value }), "Environment variables saved"),
       h("h3", {}, "Parsed"), list,
     ];
@@ -146,31 +168,84 @@ CFG.git = (ctx) => {
   const { t, id, live } = ctx;
     const branch = h("input", { type: "text", value: t.git_branch, spellcheck: "false" });
     const auto = h("input", { type: "checkbox", checked: t.auto_deploy });
-    const commits = h("div"), changes = h("div");
+    const commits = h("div"), changes = h("div"), advice = h("div"), incoming = h("div"), diffBox = h("div");
+    const base = "/api/targets/" + id + "/git/";
+    let plan = null;
+    const pathList = (paths) => h("ul", { style: "margin:6px 0 8px 18px" }, paths.slice(0, 12).map((p) => h("li", { class: "mono" }, p)), paths.length > 12 ? h("li", { class: "dim" }, "+ " + (paths.length - 12) + " more") : null);
+    // Undo local changes (a copy is kept by the server), optionally pulling after.
+    const discard = async (paths, thenPull) => {
+      const body = [h("p", {}, paths.length === 1 ? "The change to this file on this computer is undone:" : "The changes to these " + paths.length + " files on this computer are undone:"), pathList(paths),
+        h("p", {}, "A file that is in the repository goes back to the checked-out commit. A file that is not in the repository is moved out of the project folder."),
+        h("p", { class: "small" }, "Nothing is lost: each file is first copied, as it is now, to the git-backups folder in PortalControl's data folder."),
+        thenPull ? h("p", {}, "Then the incoming commits are pulled.") : null];
+      if (!(await confirmDlg(thenPull ? "Undo local changes and pull?" : "Undo local changes?", body, thenPull ? "Undo and pull" : "Undo", true))) return;
+      try {
+        const r = await api("POST", base + "discard", { paths });
+        toast((r.restored.length + r.removed.length) + " change(s) undone. Copies kept in " + r.backup);
+        if (thenPull) { const p = await api("POST", base + "pull"); toast(p.updated ? "Pulled " + p.commits + " commit(s)" : "Already up to date"); }
+      } catch (e) { toast(e.message, true); }
+      diffBox.replaceChildren(); load(); scheduleRefresh(60);
+    };
+    const showDiff = (path) => {
+      diffBox.replaceChildren(h("p", { class: "muted" }, "Loading…"));
+      const part = (title, text, none) => h("div", {}, h("div", { class: "chart-h", style: "margin:12px 0 6px" }, h("b", {}, title)),
+        text ? h("pre", { class: "log gdiff" }, text.replace(/\n$/, "").split("\n").map((l) => h("div", { class: /^\+(?!\+\+)/.test(l) ? "a" : /^-(?!--)/.test(l) ? "d" : l.startsWith("@@") ? "hh" : null }, l || " ")))
+          : h("div", { class: "muted small" }, none));
+      api("GET", base + "diff?path=" + encodeURIComponent(path)).then((d) => {
+        diffBox.replaceChildren(h("div", { class: "box", style: "margin-top:12px" },
+          h("div", { class: "rowf" }, h("b", { class: "mono" }, d.path), btn("Close", () => diffBox.replaceChildren(), "sm ghost right")),
+          part("Changed on this computer", d.mine, "Not changed on this computer."), part("Changed by the incoming commits", d.incoming, "The incoming commits do not change this file."),
+          d.truncated ? h("div", { class: "dim small", style: "margin-top:8px" }, "The change is long; only the first part is shown.") : null));
+        diffBox.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }, (e) => diffBox.replaceChildren(h("div", { class: "note-box err", style: "margin-top:12px" }, e.message)));
+    };
+    const paintPlan = () => {
+      const p = plan, n = p.local.length, b = p.blocked_by.length;
+      advice.replaceChildren(
+        b ? h("div", { class: "note-box err" }, h("b", {}, "Pull is blocked by " + b + " file" + (b === 1 ? "" : "s") + "."), " Changed on this computer, and changed by the incoming commits too:", pathList(p.blocked_by),
+            "Open each one below with Show change to compare. If the change made here is not needed, undo it; a copy is kept. The other local changes are not in the way.",
+            h("div", { style: "margin-top:10px" }, btn(b === 1 ? "Undo this one and pull" : "Undo these " + b + " and pull", () => discard(p.blocked_by, true), "sm danger", "pull")))
+        : p.reason ? h("div", { class: "note-box err" }, h("b", {}, "Pull is not possible: "), p.reason + ". ",
+            p.ahead ? "Push those commits from this computer with Git, or move the branch back to origin, then pull." : "Check out the tracked branch in the project folder, or change Branch to track below.")
+        : p.can_pull ? h("div", { class: "note-box ok" }, h("b", {}, p.behind + " commit" + (p.behind === 1 ? "" : "s") + " can be pulled."), n ? " The " + n + " local change" + (n === 1 ? " is to another file and stays as it is." : "s are to other files and stay as they are.") : " The working tree is clean.")
+        : n ? h("div", { class: "note-box" }, h("b", {}, "Nothing to pull."), " " + n + " local change" + (n === 1 ? "" : "s") + " on this computer; nothing is in the way right now.") : null);
+      const fresh = (st) => st === "untracked" || st === "added";
+      changes.replaceChildren(n ? table(["State", "Path", "Pull", ""], p.local.map((fl) => [
+        h("span", { class: "tag " + (fl.status === "untracked" ? "" : "warn") }, fl.status), h("span", { class: "mono" }, fl.path),
+        fl.blocks ? h("span", { class: "tag err", title: "The incoming commits change this path too" }, "blocks pull") : h("span", { class: "dim small" }, p.behind ? "not in the way" : "-"),
+        h("div", { class: "rowf", style: "justify-content:flex-end;flex-wrap:nowrap" }, btn("Show change", () => showDiff(fl.path), "sm"),
+          btn(fresh(fl.status) ? "Remove" : "Undo", () => discard([fl.path], false), "sm", null, { title: fresh(fl.status) ? "Move this file out of the project folder (a copy is kept)" : "Put this file back as it is in the checked-out commit (a copy is kept)" }))]))
+        : h("div", { class: "muted small" }, "The working tree is clean."));
+      const mine = new Set(p.local.map((c) => c.path));
+      incoming.replaceChildren(p.incoming.length ? [h("h3", {}, "Files the incoming commits change", h("span", { class: "dim small", style: "font-weight:400" }, "  " + p.incoming.length + (p.incoming.length === 500 ? " or more" : ""))),
+        table(["Change", "Path", "", ""], p.incoming.slice(0, 100).map((fl) => [h("span", { class: "tag info" }, fl.status), h("span", { class: "mono" }, fl.path),
+          mine.has(fl.path) ? h("span", { class: "tag err" }, "also changed here") : null,
+          h("div", { class: "rowf", style: "justify-content:flex-end" }, btn("Show change", () => showDiff(fl.path), "sm"))])),
+        p.incoming.length > 100 ? h("div", { class: "dim small", style: "margin-top:6px" }, "The first 100 are listed.") : null] : null);
+    };
     const load = () => {
+      api("GET", base + "plan").then((p) => { plan = p; paintPlan(); }, () => { plan = null; advice.replaceChildren(); incoming.replaceChildren(); });
       api("GET", "/api/targets/" + id + "/git/log").then((log) => {
         commits.replaceChildren(log.length ? table(["", "Commit", "Message", "Author", "When", ""], log.map((cm) => [
           cm.state === "incoming" ? h("span", { class: "tag info" }, "incoming") : cm.state === "local" ? h("span", { class: "tag warn" }, "not pushed") : h("span", { class: "tag" }, "deployed"),
           h("span", { class: "mono" }, short(cm.sha)), cm.summary, cm.author, when(new Date(cm.time * 1000)),
           cm.state === "synced" ? rollbackButton(T(id), cm.sha, true) : null])) : h("div", { class: "muted small" }, "No commits to show."));
       }, () => {});
-      api("GET", "/api/targets/" + id + "/git/changes").then((files) => {
-        changes.replaceChildren(files.length ? table(["State", "Path"], files.map((fl) => [h("span", { class: "tag " + (fl.status === "untracked" ? "" : "warn") }, fl.status), h("span", { class: "mono" }, fl.path)])) : h("div", { class: "muted small" }, "The working tree is clean."));
-      }, () => {});
     };
     load();
     let lastHead = t.git && t.git.head + "|" + t.git.remote_head + "|" + t.git.dirty_files;
     ctx.onUpdate = () => { const x = T(id); const k = x && x.git && x.git.head + "|" + x.git.remote_head + "|" + x.git.dirty_files; if (k !== lastHead) { lastHead = k; load(); } };
     return [
+      advice,
       live((x) => {
         const g = x.git;
         if (!g) return h("div", { class: "box muted" }, "Inspecting repository\u2026");
         if (!g.is_repo) return h("div", { class: "note-box" }, g.error || "This directory is not a Git repository, so there is nothing to track. Deployments still work.");
-        const canPull = g.behind > 0 && g.ahead === 0;
+        const canPull = plan ? plan.can_pull : g.behind > 0 && g.ahead === 0;
         return h("div", { class: "box", style: "margin-bottom:22px" },
           h("div", { class: "rowf", style: "margin-bottom:12px" }, gitTag(x),
             h("span", { class: "right rowf" }, btn("Fetch", () => act(() => api("POST", "/api/targets/" + id + "/git/refresh"), "Fetched origin"), "sm", "restart"),
-              btn("Pull", () => act(async () => { const r = await api("POST", "/api/targets/" + id + "/git/pull"); toast(r.updated ? "Pulled " + r.commits + " commit(s)" : "Already up to date"); }), "sm" + (canPull ? " hl" : ""), "pull"))),
+              btn("Pull", async () => { await act(async () => { const r = await api("POST", "/api/targets/" + id + "/git/pull"); toast(r.updated ? "Pulled " + r.commits + " commit(s)" : "Already up to date"); }); load(); }, "sm" + (canPull ? " hl" : ""), "pull"))),
           facts([
             ["Remote", g.remote_url ? h("span", { class: "mono" }, g.remote_url) : "no origin remote"],
             ["Checked out", h("span", {}, g.checked_out_branch || "detached HEAD", " \u00b7 ", h("span", { class: "mono" }, short(g.head)), " ", g.head_summary || "")],
@@ -181,9 +256,9 @@ CFG.git = (ctx) => {
       }),
       saveForm(t, [
         field("Branch to track", branch, "Compared against origin/<branch>. Origin is fetched every 5 minutes; fetching never changes your files."),
-        check(auto, "Auto-deploy", "When origin has new commits, fast-forward the working tree and run the script (a running service is restarted). Skipped if tracked files were edited locally or the branch has unpushed commits."),
+        check(auto, "Auto-deploy", "When origin has new commits, fast-forward the working tree and run the script (a running service is restarted). Skipped if a file edited on this computer is also changed by the new commits, or the branch has unpushed commits."),
       ], () => ({ git_branch: branch.value, auto_deploy: auto.checked })),
-      h("h3", {}, "Commits"), commits, h("h3", {}, "Working tree changes"), changes,
+      h("h3", {}, "Changes on this computer"), changes, diffBox, incoming, h("h3", {}, "Commits"), commits,
     ];
 };
 

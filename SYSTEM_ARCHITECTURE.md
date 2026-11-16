@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.7.0 |
-| Application version | 0.12.0 (`Cargo.toml`) |
+| Document version | 1.8.0 |
+| Application version | 0.13.0 (`Cargo.toml`) |
 | Last updated | 2026-11-16 |
 
 ## 1. System Overview
@@ -167,7 +167,7 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool. That pool must not be capped low: on Windows every output pipe of a running process (two per service) holds one of its threads while waiting for output, so the limit is tokio's default of 512 (`MAX_BLOCKING_THREADS` in `main.rs`) |
 | `runner.rs` | Starts scripts and one-off commands, pumps their output, enforces timeouts, kills process trees, queues crashed services for restart |
 | `pyenv.rs` | Works out and activates a target's Python environment (see 3.6) |
-| `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files |
+| `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files; the pull plan, the text of a change and undoing local changes (see 3.11) |
 | `health.rs` | Worker that probes each health URL (15 s) with a small built-in HTTP/1.1 client: `LIVE`, `SLOW`, `DOWN`. A process in its first 30 s that is not answering yet is not recorded as DOWN (startup grace); the probe right after a planned stop or restart, and routine probes of a service that is stopped on purpose or not started yet, update the status without counting as an outage. A service whose last run failed has crashed, and that is recorded |
 | `metrics.rs` | Worker that samples the host and every process tree (5 s), keeps 15 minutes in memory and one row per target per minute in SQLite for 7 days |
 | `automation.rs` | Cron schedules, deploy (pull then run), auto-deploy on new commits, auto-restart with crash-loop detection, deploy webhooks |
@@ -450,6 +450,35 @@ so), 200 runs per target, the newest 500 incidents and traces. Line counters beg
 when the manager restarts. The page asks again at most once a minute while open, and on
 Refresh.
 
+### 3.11 Pulling with local changes, and env files
+
+**Pull** (`git::pull_ff`, also used by deploy and auto-deploy) still only fast-forwards.
+Until 0.13.0 it refused whenever a tracked file had a local change. Now it refuses only
+when a path changed on this computer is also changed by the commits being pulled
+(`plan_in`): tracked files that were edited or deleted, and untracked files or folders
+where the commits add or change something. Other local changes stay as they are; the
+checkout is libgit2's safe mode, which leaves them alone. Rollback is unchanged and still
+wants unmodified tracked files.
+
+| Call | What it does |
+| --- | --- |
+| `GET /api/targets/{id}/git/plan` | `PullPlan`: commits behind and ahead, the files the waiting commits change (at most 500), every local change with `blocks`, `blocked_by`, `can_pull` and the reason when not. No fetch, nothing is changed |
+| `GET /api/targets/{id}/git/diff?path=` | The patch text of one path: against the checked-out commit (`mine`, untracked content included) and between the checked-out commit and `origin/<branch>` (`incoming`). 200 KB per side. The path must be one the plan lists |
+| `POST /api/targets/{id}/git/discard` | For each named path, exactly as the status lists it: what is there is copied to `<data>/git-backups/<target id>/<YYYYMMDD-HHMMSS>/` first; then a tracked file is checked out from the current commit, and a file that is not in the repository is removed from the folder. If a copy cannot be written nothing is changed. An Activity entry names the backup folder |
+
+The Git Source section (`config.js`) shows the plan as one sentence at the top (blocked by
+which files, can be pulled, nothing to pull, or why not), marks each local change "blocks
+pull" or "not in the way", lists the files the incoming commits change, and offers Show
+change, Undo / Remove per file and "Undo these and pull" for all blocking files.
+
+**Env files.** `GET /api/targets/{id}/env/files` lists files in the project folder itself
+named `.env`, `.env.*` or `*.env` (at most 20, `.env` first) and with `?name=` returns the
+text of one (64 KB at most; the name must be in the list, so no other file can be read).
+The Environment Variables section fills its box from one, or from a file chosen in the
+browser; a leading `export ` is dropped. With nothing stored and a `.env` present it is
+loaded when the section opens. Nothing is stored until Save, and the stored copy does not
+follow later edits of the file.
+
 ## 4. Data Models & State Management
 
 ### 4.1 Database
@@ -639,7 +668,11 @@ what a request can make it run.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (150 at the time of writing).** Analytics: the memory
+**Working and covered by tests (152 at the time of writing).** Pulling with local changes:
+the plan naming the path in the way, the pull refusing with it and working once it is
+moved out, other local changes surviving the pull, the text of a change, undoing tracked
+and untracked changes with copies kept, refusal of paths without a change; finding the env
+files of a folder. Analytics: the memory
 trend (steady growth found, an up-and-down pattern and a flat line not), availability,
 outages and recovery times, the response anomaly, the score with its deductions and
 ceilings, run counting without quick commands, the timeline and failure grid in local
@@ -696,6 +729,22 @@ monitor and AI tiles, all three periods (the 30-day note about the 7 days of min
 included), dark and light theme. The request took about half a second in a debug build.
 Not looked at: a narrow window, and the page on a machine with real output, so the line
 counters were all zero.
+
+**Checked by hand on Windows (0.13.0), with a scratch repository and data folder.** Git
+Source in Chrome on a clone two commits behind with six local changes, two of them in the
+way: the blocked note naming both, the marks per file, Show change with both sides, and
+"Undo these 2 and pull", after which the branch was level with origin, the four other
+local changes were still there and the copies were in `git-backups`. Environment Variables
+on the same target: the `.env` of the folder was shown on opening with its three variables.
+Not tried: Choose a file, an untracked folder in the way on screen, and a repository of
+real size.
+
+**Checked by hand on macOS (0.11.1 and 0.12.0).** `portalcontrol install` from a
+downloaded release, over SSH, onto a running installed copy in `/Applications`: the
+manager stopped, the app was replaced and the new one started in about three seconds, no
+copy was left behind, the login entry still pointed at the installed app, and all nine
+autostart targets were started again. Whether the menu-bar icon appears when started this
+way was not seen.
 
 **Written but not run (0.11.0).** The install question shown by a double click (release
 builds only) on Windows and macOS, the Start Menu shortcut, and everything about installing
@@ -791,6 +840,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.8.0 | 0.13.0 | 2026-11-16 | **A blocked pull says what blocks it** (section 3.11). `pull_ff` no longer refuses for any local change to a tracked file: it refuses only when a path changed on this computer is also changed by the commits being pulled, and names those paths; other local changes are kept. This also applies to deploy and auto-deploy. New `git::pull_plan`, `file_diff`, `discard_changes` and `GET /api/targets/{id}/git/plan`, `GET …/git/diff?path=`, `POST …/git/discard`; undone changes are first copied to `<data>/git-backups/<target id>/<time>/`. Git Source shows the plan in a sentence, marks each local change, lists the incoming files, and offers Show change, Undo / Remove and "Undo these and pull". **Env files**: `GET /api/targets/{id}/env/files`; the Environment Variables section loads the project's `.env` when nothing is stored, or a chosen file, into its box. Section 6 gained the macOS install that was run over SSH. No schema change. 2 new tests (152). |
 | 1.7.0 | 0.12.0 | 2026-11-16 | **Analytics page** (`analytics.rs`, `api/analytics.rs`, `js/pages/analytics.js`, section 3.10): `GET /api/analytics?range=24h\|7d\|30d` works out, from the minute rows, runs, incidents, AI traces, scans and the monitor's counters, figures per target and for the machine (availability, response time, CPU, memory, outages, time to recover and between outages, runs, crash restarts, incidents, log lines), a memory trend that marks steady growth, a check of the last hour's response time against the time before, a reliability score whose every deduction is named, a timeline and a weekday-by-hour grid of failures in local time, a roll-up per project, and a list of findings. The page shows them with a sortable table that compares the targets. New sidebar entry and `chart` icon; Incidents and Analytics added to the command palette. Nothing is stored and there is no schema change. 8 new tests (150). |
 | 1.6.1 | 0.11.1 | 2026-11-16 | **Monitor view names the source of the lines.** The pipeline diagram drew the first five targets of the list, so with more than five targets a target printing millions of lines could be one of the hidden ones while the five shown stood at 0.0 lines/s. It now draws the five that printed the most (running first) and gives the rest a dashed box of their own ("+N OTHER", or "NOT IN THE LIST" for a process whose target the page does not know): before, the moving dots of an undrawn target were drawn on the line of the last box, as if that target had printed them; a table under it lists every target with lines, share, error lines, patterns and current rate, busiest first, and opens the target on a click. `GET /api/monitor/stats` gained `error_lines` per target (`Watch::seen_errors`); counters of deleted targets are dropped; the header says "lines since start" (the count is cumulative, the log view keeps the last 2,000 lines per target). **A companion process is not added twice** (`detect.rs`: `Worker::started_by`, `scripts_starting`): when a script in the project folder already starts the Django-Q cluster, the Celery worker or beat, or the npm process (a non-comment line with the command), `GET /api/fs/inspect` names it in `workers[].started_by`; the New target page then leaves "Also add" unticked and says why, and the Configuration tab and its confirmation warn. Found on a Mac where `start.sh` and the generated `portalcontrol_qcluster.sh` ran two clusters on one SQLite database and printed 17 million lines in an hour. No schema change. |
 | 1.6.0 | 0.11.0 | 2026-11-13 | **Installing** (`install.rs`, 3.8): `portalcontrol install` and an "Install?" question on double click put the program in one fixed place per user and replace the installed version, also while it runs; Start Menu shortcut on Windows. **Start at login no longer starts an old version**: installing re-points the login entry, and the installed copy repairs an entry that starts another or a missing file at every start (`autostart::registered_exe`, `repoint`); refused under macOS app translocation; launchd agent `ProcessType` now `Interactive`. **After a restart of the computer** the network address is re-tried every 5 seconds until it can be opened, instead of staying shut until a manual restart (`AppState::net` is now replaceable); `--bind` is fatal only from a terminal. Background managers on Windows no longer hold the starter's output pipe. `/api/system` gained `installed`, `install_path`; the log names the program file at start. **Attack detection** (`threat.rs`, 3.9): requests are read from the Django middleware's `PCREQ` lines, access logs and `runserver` lines; rules for injection, traversal, scanners, probes, scans, password guessing and a guessed password, 4xx sweeps, floods and Django's security messages; immediate Activity entry; incidents of kind `attack`, `brute_force`, `flood` with an evidence text; a security brief for the AI model with a 75-second limit; `GET /api/monitor/django-middleware`; `integrations/django/portalcontrol_requestlog.py`. Monitor counters gained `requests`, `threats`. Removed the outdated limitation "environment variables are stored unencrypted" (they are sealed since 0.9.0). |

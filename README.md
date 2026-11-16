@@ -222,13 +222,24 @@ deleted.
 
 - **Environment variables.** A `.env`-style block per target, set for the script and
   everything it starts. Stored in PortalControl's database, not in the project folder.
+  The section lists the env files of the project folder (`.env`, `.env.production`,
+  `prod.env`); *Load into the box* fills the box from one, and *Choose a file…* from any
+  file on your computer. When nothing is stored yet and the project has a `.env`, it is
+  shown straight away. Nothing is stored until you press Save.
 - **Scheduled task.** A five-field cron expression in local time (`0 2 * * *`), with a
   preview of the next runs. A scheduled task that is still running is skipped; a
   scheduled service is restarted.
 - **Pull and deploy.** *Pull* fast-forwards the working tree to `origin/<branch>`. It
-  only ever fast-forwards: it refuses if tracked files were edited locally, if the
-  branch has commits that are not on origin, or if another branch is checked out.
-  Untracked files (databases, media) are left alone.
+  only ever fast-forwards: it refuses if the branch has commits that are not on origin,
+  if another branch is checked out, or if a file changed on this computer is also changed
+  by the commits being pulled. Local changes to other files, and untracked files
+  (databases, media), are left as they are.
+- **When a pull is blocked.** *Git Source* says which files are in the way. *Show change*
+  shows what was changed on this computer and what the incoming commits change in the
+  same file. *Undo* puts a file back as it is in the checked-out commit (*Remove* moves a
+  file that is not in the repository out of the folder), and *Undo these and pull* does
+  that for every blocking file and then pulls. A copy of each file as it was is kept in
+  `git-backups/<target id>/<date-time>/` in PortalControl's data folder.
 - **Auto-deploy.** When the 5-minute fetch finds new commits, pull and run the script
   (a running service is restarted). A failure is reported once per commit.
 - **Deploy webhook.** A per-target URL with a random token; `POST` to it to pull and
@@ -689,6 +700,10 @@ protection*).
 | POST | `/api/targets/{id}/git/refresh` | Fetch `origin` and re-inspect now |
 | POST | `/api/targets/{id}/git/pull` | Fast-forward to `origin/<branch>` |
 | GET | `/api/targets/{id}/git/log`, `/git/changes` | Recent commits / changed files |
+| GET | `/api/targets/{id}/git/plan` | What a pull would do: incoming files, local changes, which of them block it |
+| GET | `/api/targets/{id}/git/diff?path=` | The change to one file, on this computer and in the incoming commits |
+| POST | `/api/targets/{id}/git/discard` | Undo the named local changes (`{"paths": […]}`); copies are kept |
+| GET | `/api/targets/{id}/env/files` | Env files in the project folder; with `?name=` the text of one |
 | POST | `/api/targets/{id}/health/check` | Probe now |
 | GET | `/api/targets/{id}/health/history` | Last 240 probes |
 | GET | `/api/targets/{id}/metrics` | CPU / memory samples of the process tree |

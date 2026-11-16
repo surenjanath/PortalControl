@@ -277,6 +277,8 @@
   .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
   .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  /* Git Source: the text of a change */
+  pre.gdiff { height: auto; min-height: 0; max-height: 340px; } pre.gdiff .a { color: var(--ok); } pre.gdiff .d { color: var(--err); } pre.gdiff .hh { color: var(--info); }
   /* Analytics page (analytics.js) */
   .an-cols { display: flex; align-items: flex-end; justify-content: space-between; gap: 3px; height: 110px; margin-top: 8px; border-bottom: 1px solid var(--line); }
   .an-col { flex: 1; min-width: 0; max-width: 34px; height: 100%; display: flex; flex-direction: column-reverse; gap: 2px; }

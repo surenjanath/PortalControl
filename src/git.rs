@@ -450,11 +450,293 @@ pub fn changed_files(dir: &Path, limit: usize) -> Result<Vec<ChangedFile>, Strin
         .collect())
 }
 
+/// A change in the working tree, and whether it stands in the way of a pull.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LocalChange {
+    pub path: String,
+    pub status: &'static str,
+    /// The commits waiting on origin change this path too.
+    pub blocks: bool,
+}
+
+/// What a pull would do, worked out without touching anything (no fetch).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PullPlan {
+    pub behind: usize,
+    pub ahead: usize,
+    /// Files the waiting commits change (at most 500).
+    pub incoming: Vec<ChangedFile>,
+    pub local: Vec<LocalChange>,
+    /// The local changes with `blocks` set.
+    pub blocked_by: Vec<String>,
+    pub can_pull: bool,
+    /// Why a pull is not possible, when there is something to pull.
+    pub reason: Option<String>,
+}
+
+fn plan_in(repo: &Repository, branch: &str) -> Result<PullPlan, String> {
+    let err = |e: git2::Error| e.message().to_string();
+    let mut plan = PullPlan::default();
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    plan.local = repo
+        .statuses(Some(&mut opts))
+        .map_err(err)?
+        .iter()
+        .take(500)
+        .map(|e| LocalChange {
+            path: e.path().unwrap_or("?").to_string(),
+            status: status_label(e.status()),
+            blocks: false,
+        })
+        .collect();
+
+    let head = repo.head().map_err(err)?;
+    let on_branch = head.is_branch() && head.shorthand() == Some(branch);
+    let head_oid = head.target().ok_or("HEAD does not point at a commit")?;
+    let Ok(remote_oid) = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")) else {
+        plan.reason = Some(format!("origin has no branch '{branch}'"));
+        return Ok(plan);
+    };
+    if head_oid == remote_oid {
+        return Ok(plan);
+    }
+    let (ahead, behind) = repo.graph_ahead_behind(head_oid, remote_oid).map_err(err)?;
+    plan.ahead = ahead;
+    plan.behind = behind;
+
+    let head_tree = repo.find_commit(head_oid).and_then(|c| c.tree()).map_err(err)?;
+    let remote_tree = repo.find_commit(remote_oid).and_then(|c| c.tree()).map_err(err)?;
+    let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(&remote_tree), None).map_err(err)?;
+    let mut touched: HashSet<String> = HashSet::new();
+    for delta in diff.deltas() {
+        let name = |f: git2::DiffFile| f.path().map(|p| p.to_string_lossy().replace('\\', "/"));
+        let (old, new) = (name(delta.old_file()), name(delta.new_file()));
+        let status = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Renamed => "renamed",
+            _ => "modified",
+        };
+        if let Some(path) = new.clone().or_else(|| old.clone()) {
+            if plan.incoming.len() < 500 {
+                plan.incoming.push(ChangedFile { path, status });
+            }
+        }
+        touched.extend(old);
+        touched.extend(new);
+    }
+    for change in &mut plan.local {
+        // An untracked folder is listed as `folder/`.
+        let folder =
+            if change.path.ends_with('/') { change.path.clone() } else { format!("{}/", change.path) };
+        change.blocks = touched.contains(&change.path) || touched.iter().any(|p| p.starts_with(&folder));
+    }
+    plan.blocked_by = plan.local.iter().filter(|c| c.blocks).map(|c| c.path.clone()).collect();
+
+    plan.reason = if !on_branch {
+        Some(format!(
+            "the checked-out branch is '{}', not the tracked branch '{branch}'",
+            head.shorthand().unwrap_or("detached HEAD")
+        ))
+    } else if ahead > 0 {
+        Some(format!(
+            "the local branch has {ahead} commit(s) that are not on origin; a fast-forward is not possible"
+        ))
+    } else if !plan.blocked_by.is_empty() {
+        Some(format!(
+            "{} file(s) with local changes are also changed by the incoming commits",
+            plan.blocked_by.len()
+        ))
+    } else {
+        None
+    };
+    plan.can_pull = behind > 0 && plan.reason.is_none();
+    Ok(plan)
+}
+
+/// What a pull would do right now: the files the waiting commits change, the
+/// local changes, and which of those are in the way.
+pub fn pull_plan(dir: &Path, branch: &str) -> Result<PullPlan, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    plan_in(&repo, branch)
+}
+
+/// The change to one file as text: what was changed here (`mine`, against
+/// the checked-out commit) and what the waiting commits change (`incoming`).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub mine: String,
+    pub incoming: String,
+    pub truncated: bool,
+}
+
+/// Longest diff text returned for one side.
+const DIFF_LIMIT: usize = 200 * 1024;
+
+fn patch_text(diff: &git2::Diff) -> (String, bool) {
+    let mut out = String::new();
+    let mut cut = false;
+    // Stopping early makes `print` report an error; the text so far is kept.
+    let _ = diff.print(git2::DiffFormat::Patch, |_, _, line| {
+        if out.len() > DIFF_LIMIT {
+            cut = true;
+            return false;
+        }
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            out.push(line.origin());
+        }
+        out.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    });
+    (out, cut)
+}
+
+/// `path` must be one of the paths `pull_plan` lists; anything else is refused.
+pub fn file_diff(dir: &Path, branch: &str, path: &str) -> Result<FileDiff, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let err = |e: git2::Error| e.message().to_string();
+    let plan = plan_in(&repo, branch)?;
+    if !plan.local.iter().any(|c| c.path == path) && !plan.incoming.iter().any(|c| c.path == path) {
+        return Err("that file is not among the changes".into());
+    }
+    let head_tree = repo.head().and_then(|h| h.peel_to_tree()).map_err(err)?;
+    let only = |opts: &mut git2::DiffOptions| {
+        opts.pathspec(path).disable_pathspec_match(true);
+    };
+
+    let mut opts = git2::DiffOptions::new();
+    only(&mut opts);
+    opts.include_untracked(true).recurse_untracked_dirs(true).show_untracked_content(true);
+    let (mine, cut_mine) = repo
+        .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))
+        .map(|d| patch_text(&d))
+        .map_err(err)?;
+
+    let mut incoming = (String::new(), false);
+    if let Ok(remote) = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")) {
+        let remote_tree = repo.find_commit(remote).and_then(|c| c.tree()).map_err(err)?;
+        let mut opts = git2::DiffOptions::new();
+        only(&mut opts);
+        incoming = repo
+            .diff_tree_to_tree(Some(&head_tree), Some(&remote_tree), Some(&mut opts))
+            .map(|d| patch_text(&d))
+            .map_err(err)?;
+    }
+    Ok(FileDiff { path: path.to_string(), mine, incoming: incoming.0, truncated: cut_mine || incoming.1 })
+}
+
+/// What `discard_changes` did.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Discarded {
+    /// Tracked files put back as they are in the checked-out commit.
+    pub restored: Vec<String>,
+    /// Files that are not in the repository, moved out of the folder.
+    pub removed: Vec<String>,
+    /// Where the copies of what was there are kept.
+    pub backup: String,
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let kind = std::fs::symlink_metadata(from)?.file_type();
+    if kind.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if kind.is_file() {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
+/// Undo local changes to the given paths, after copying what is there now
+/// into `backup` (same relative paths). A tracked file goes back to the
+/// checked-out commit; a file that is not in the repository is moved out.
+/// Every path must be one that the status lists, exactly as it lists it.
+pub fn discard_changes(dir: &Path, paths: &[String], backup: &Path) -> Result<Discarded, String> {
+    let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
+    let err = |e: git2::Error| e.message().to_string();
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let known: HashMap<String, Status> = repo
+        .statuses(Some(&mut opts))
+        .map_err(err)?
+        .iter()
+        .filter_map(|e| e.path().map(|p| (p.to_string(), e.status())))
+        .collect();
+
+    let mut out =
+        Discarded { restored: Vec::new(), removed: Vec::new(), backup: backup.display().to_string() };
+    let mut plan: Vec<(&String, bool)> = Vec::new();
+    for path in paths {
+        let status = known.get(path).ok_or_else(|| format!("'{path}' has no local change"))?;
+        let plain = Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!("'{path}' is not a path inside the project"));
+        }
+        plan.push((path, status.intersects(Status::WT_NEW | Status::INDEX_NEW)));
+    }
+    if plan.is_empty() {
+        return Err("no files were named".into());
+    }
+
+    // Copies first: nothing is changed unless every copy was written.
+    for (path, _) in &plan {
+        let from = dir.join(path);
+        if std::fs::symlink_metadata(&from).is_ok() {
+            copy_tree(&from, &backup.join(path))
+                .map_err(|e| format!("could not keep a copy of '{path}': {e}"))?;
+        }
+    }
+
+    let mut checkout = CheckoutBuilder::new();
+    checkout.force().disable_pathspec_match(true);
+    for (path, new) in &plan {
+        if *new {
+            let full = dir.join(path);
+            let gone = match std::fs::symlink_metadata(&full) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&full),
+                Ok(_) => std::fs::remove_file(&full),
+                Err(_) => Ok(()),
+            };
+            gone.map_err(|e| format!("could not remove '{path}': {e}"))?;
+            if let Ok(mut index) = repo.index() {
+                if index.remove_path(Path::new(path)).is_ok() {
+                    let _ = index.write();
+                }
+            }
+            out.removed.push((*path).clone());
+        } else {
+            checkout.path(path);
+            out.restored.push((*path).clone());
+        }
+    }
+    // Without a path the checkout would put back every file.
+    if !out.restored.is_empty() {
+        repo.checkout_head(Some(&mut checkout)).map_err(|e| format!("restore failed: {}", e.message()))?;
+    }
+    Ok(out)
+}
+
 /// Fetch `origin` and fast-forward the checked-out branch to
 /// `origin/<branch>`. This is the only operation that changes the working
 /// tree, and it refuses to do so unless the update is a clean fast-forward:
-/// the tracked branch must be checked out, tracked files must be unmodified
-/// and there must be no local commits missing from origin.
+/// the tracked branch must be checked out, there must be no local commits
+/// missing from origin, and no file changed here may also be changed by the
+/// commits being pulled. Local changes to other files stay as they are.
 pub fn pull_ff(dir: &Path, branch: &str) -> Result<PullOutcome, String> {
     fetch(dir)?;
     let repo = Repository::open(dir).map_err(|e| e.message().to_string())?;
@@ -486,12 +768,16 @@ pub fn pull_ff(dir: &Path, branch: &str) -> Result<PullOutcome, String> {
         ));
     }
 
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(false).include_ignored(false).exclude_submodules(true);
-    let modified = repo.statuses(Some(&mut opts)).map_err(err)?.len();
-    if modified > 0 {
+    // Local changes are in the way only where the pulled commits change the
+    // same file; the others are left exactly as they are.
+    let blocked = plan_in(&repo, branch)?.blocked_by;
+    if !blocked.is_empty() {
+        let shown: Vec<&str> = blocked.iter().take(5).map(String::as_str).collect();
         return Err(format!(
-            "{modified} tracked file(s) have local changes; commit or discard them before pulling"
+            "{} file(s) with local changes are also changed by the incoming commits ({}{}); discard those changes or move the files first",
+            blocked.len(),
+            shown.join(", "),
+            if blocked.len() > shown.len() { ", ..." } else { "" }
         ));
     }
 
@@ -929,6 +1215,80 @@ mod tests {
 
         // So does tracking a branch that is not the one checked out.
         assert!(pull_ff(clone_dir.path(), "release").unwrap_err().contains("tracked branch"));
+    }
+
+    #[test]
+    fn pull_names_what_is_in_the_way_and_keeps_the_other_local_changes() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = init_repo(origin_dir.path());
+        std::fs::write(origin_dir.path().join("run.bat"), "run v1\n").unwrap();
+        std::fs::write(origin_dir.path().join("start.bat"), "start v1\n").unwrap();
+        commit_all(&origin, "scripts");
+        let clone_dir = tempfile::tempdir().unwrap();
+        Repository::clone(origin_dir.path().to_str().unwrap(), clone_dir.path()).unwrap();
+        let dir = clone_dir.path();
+
+        // Origin changes app.py and adds a migration.
+        std::fs::write(origin_dir.path().join("app.py"), "print('v2')\n").unwrap();
+        std::fs::create_dir(origin_dir.path().join("migrations")).unwrap();
+        std::fs::write(origin_dir.path().join("migrations").join("0002.py"), "theirs\n").unwrap();
+        commit_all(&origin, "second");
+        fetch(dir).unwrap();
+
+        // Here: an edited script, a deleted one, notes, and a migration of the same name.
+        std::fs::write(dir.join("run.bat"), "mine\n").unwrap();
+        std::fs::remove_file(dir.join("start.bat")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "wip").unwrap();
+        std::fs::create_dir(dir.join("migrations")).unwrap();
+        std::fs::write(dir.join("migrations").join("0002.py"), "made here\n").unwrap();
+
+        let plan = pull_plan(dir, "main").unwrap();
+        assert_eq!((plan.behind, plan.ahead), (1, 0));
+        assert_eq!(plan.blocked_by, vec!["migrations/".to_string()]);
+        assert!(!plan.can_pull && plan.reason.as_deref().unwrap().contains("1 file(s)"));
+        assert_eq!(plan.local.len(), 4);
+        let mut incoming: Vec<(&str, &str)> =
+            plan.incoming.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        incoming.sort();
+        assert_eq!(incoming, vec![("app.py", "modified"), ("migrations/0002.py", "added")]);
+        let err = pull_ff(dir, "main").unwrap_err();
+        assert!(err.contains("migrations/") && err.contains("local changes"), "{err}");
+
+        // The text of a change, mine and incoming; other paths are refused.
+        let mine = file_diff(dir, "main", "run.bat").unwrap();
+        assert!(mine.mine.contains("-run v1") && mine.mine.contains("+mine") && mine.incoming.is_empty());
+        assert!(file_diff(dir, "main", "app.py").unwrap().incoming.contains("v2"));
+        assert!(file_diff(dir, "main", "migrations/").unwrap().mine.contains("made here"));
+        assert!(file_diff(dir, "main", "../secret").is_err());
+
+        // Moving the file in the way out keeps a copy, and the pull then works
+        // without touching the other local changes.
+        let backup = tempfile::tempdir().unwrap();
+        let done = discard_changes(dir, &["migrations/".to_string()], backup.path()).unwrap();
+        assert_eq!((done.restored.len(), done.removed), (0, vec!["migrations/".to_string()]));
+        assert_eq!(
+            std::fs::read_to_string(backup.path().join("migrations").join("0002.py")).unwrap(),
+            "made here\n"
+        );
+        assert!(!dir.join("migrations").exists());
+        assert!(pull_plan(dir, "main").unwrap().can_pull);
+        assert!(pull_ff(dir, "main").unwrap().updated);
+        assert!(std::fs::read_to_string(dir.join("app.py")).unwrap().contains("v2"));
+        assert!(std::fs::read_to_string(dir.join("migrations").join("0002.py")).unwrap().contains("theirs"));
+        assert_eq!(std::fs::read_to_string(dir.join("run.bat")).unwrap(), "mine\n");
+        assert!(!dir.join("start.bat").exists());
+        assert!(dir.join("notes.txt").exists());
+
+        // Undoing changes to tracked files puts them back and keeps what was there.
+        let done =
+            discard_changes(dir, &["run.bat".to_string(), "start.bat".to_string()], backup.path()).unwrap();
+        assert_eq!(done.restored.len(), 2);
+        assert!(std::fs::read_to_string(dir.join("run.bat")).unwrap().contains("run v1"));
+        assert!(dir.join("start.bat").exists());
+        assert_eq!(std::fs::read_to_string(backup.path().join("run.bat")).unwrap(), "mine\n");
+        assert!(dir.join("notes.txt").exists(), "files that were not named are left alone");
+        assert!(discard_changes(dir, &["app.py".to_string()], backup.path()).is_err());
+        assert!(discard_changes(dir, &[], backup.path()).is_err());
     }
 
     #[test]
