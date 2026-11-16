@@ -60,6 +60,139 @@ pub(super) async fn git_changes(State(state): State<Arc<AppState>>, Path(id): Pa
     Ok(ok(json!(files)))
 }
 
+/// Largest env file that is read for the dashboard.
+const ENV_FILE_LIMIT: u64 = 64 * 1024;
+
+/// `.env`, `.env.production`, `prod.env`: a file in the project folder itself.
+fn is_env_file_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    (lower == ".env" || lower.starts_with(".env.") || lower.ends_with(".env"))
+        && !name.contains(['/', '\\'])
+        && name != ".."
+}
+
+/// Env files in the folder, `.env` first: (name, size in bytes).
+pub(super) fn env_files_in(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut found: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .take(5_000)
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    is_env_file_name(&name).then(|| (name, e.metadata().map(|m| m.len()).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort_by(|a, b| (a.0 != ".env", &a.0).cmp(&(b.0 != ".env", &b.0)));
+    found.truncate(20);
+    found
+}
+
+/// The env files of a target's project folder, for the Environment Variables
+/// section. With `?name=` also the text of that one file.
+pub(super) async fn env_files(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Params,
+) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let wanted = q.get("name").cloned();
+    let view = tokio::task::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from(&t.working_directory);
+        let files = env_files_in(&dir);
+        let text = match &wanted {
+            None => Ok(None),
+            Some(name) => match files.iter().find(|(n, _)| n == name) {
+                None => Err("that file is not an env file in the project folder".to_string()),
+                Some((_, size)) if *size > ENV_FILE_LIMIT => {
+                    Err("that file is larger than 64 KB".to_string())
+                }
+                Some((name, _)) => std::fs::read(dir.join(name))
+                    .map(|bytes| Some(String::from_utf8_lossy(&bytes).into_owned()))
+                    .map_err(|e| format!("could not read {name}: {e}")),
+            },
+        }?;
+        let list: Vec<Value> = files.iter().map(|(name, size)| json!({"name": name, "size": size})).collect();
+        Ok::<Value, String>(json!({"files": list, "name": wanted, "text": text}))
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(ok(view))
+}
+
+/// What a pull would do: incoming files, local changes, and which are in the way.
+pub(super) async fn git_plan(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let plan = tokio::task::spawn_blocking(move || {
+        git::pull_plan(std::path::Path::new(&t.working_directory), &t.git_branch)
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    Ok(ok(json!(plan)))
+}
+
+/// The change to one file, here and in the incoming commits (`?path=`).
+pub(super) async fn git_diff(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Params,
+) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let path = q.get("path").cloned().unwrap_or_default();
+    let diff = tokio::task::spawn_blocking(move || {
+        git::file_diff(std::path::Path::new(&t.working_directory), &t.git_branch, &path)
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(ok(json!(diff)))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct DiscardRequest {
+    pub(super) paths: Vec<String>,
+}
+
+/// Undo the named local changes. What was there is copied first to
+/// `<data>/git-backups/<target id>/<time>/`.
+pub(super) async fn git_discard(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<DiscardRequest>,
+) -> AppResult {
+    let t = load_target(&state, id).await?;
+    let data = state.data_dir.get().cloned().ok_or_else(|| internal("no data folder".into()))?;
+    let backup = data
+        .join("git-backups")
+        .join(id.to_string())
+        .join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
+    let dir = t.working_directory.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        git::discard_changes(std::path::Path::new(&dir), &req.paths, &backup)
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    state.activity(
+        "warn",
+        "git",
+        Some(id),
+        format!(
+            "Local changes undone: {} file(s) put back, {} moved out; copies kept in {}",
+            done.restored.len(),
+            done.removed.len(),
+            done.backup
+        ),
+    );
+    git::refresh_target(&state, id, t.working_directory, t.git_branch, false).await;
+    Ok(ok(json!(done)))
+}
+
 pub(super) async fn health_check(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     match t.health_url {

@@ -141,6 +141,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/targets/{id}/git/pull", post(git_pull))
         .route("/api/targets/{id}/git/log", get(git_log))
         .route("/api/targets/{id}/git/changes", get(git_changes))
+        .route("/api/targets/{id}/env/files", get(env_files))
+        .route("/api/targets/{id}/git/plan", get(git_plan))
+        .route("/api/targets/{id}/git/diff", get(git_diff))
+        .route("/api/targets/{id}/git/discard", post(git_discard))
         .route("/api/targets/{id}/health/check", post(health_check))
         .route("/api/targets/{id}/health/history", get(health_history))
         .route("/api/targets/{id}/metrics", get(target_metrics))
@@ -316,6 +320,18 @@ mod tests {
         let mut bad = input(dir.path(), "deploy.bat");
         bad.description = Some("x".repeat(501));
         assert!(clean_input(bad).is_err());
+    }
+
+    #[test]
+    fn env_files_of_a_project_folder_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".env.production", "notes.txt", ".env", "staging.env", "environment.py", ".envrc"] {
+            std::fs::write(dir.path().join(name), "A=1\n").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("old.env")).unwrap();
+        let names: Vec<String> = env_files_in(dir.path()).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec![".env", ".env.production", "staging.env"]);
+        assert!(env_files_in(&dir.path().join("missing")).is_empty());
     }
 
     #[test]
