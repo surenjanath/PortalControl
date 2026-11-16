@@ -47,6 +47,7 @@ const ICONS = {
   info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z", "M12 8h.01", "M11 12h1v5h1"],
   bell: ["M6 9a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 15 6 9z", "M10.3 20a1.9 1.9 0 0 0 3.4 0"],
   pull: ["M12 3v13", "M7 11l5 5 5-5", "M5 21h14"],
+  chart: ["M3 21h18", "M6 21v-7", "M11 21V5", "M16 21v-10", "M21 21v-4"],
 };
 function icon(name) { return s("svg", { class: "ic", viewBox: "0 0 24 24", "aria-hidden": "true" }, (ICONS[name] || []).map((d) => s("path", { d }))); }
 function btn(label, onclick, cls, ic, extra) {

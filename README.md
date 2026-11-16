@@ -52,6 +52,7 @@ purpose.*
 | Target → Metrics | CPU and memory of the whole process tree, health response time, run durations |
 | Target → Security | bandit and pip-audit findings, with scan history; missing scanner tools are installed automatically |
 | Deployments / Security / Activity | The same information across all targets, plus an event feed |
+| Analytics | Everything together over 24 hours, 7 days or 30 days: a reliability score, availability, response time, runs, incidents, trends, when failures happen, a table that compares the targets, and a list of what stands out |
 | Settings | Start at login, manager details, resource charts, scanner tools, the manager's own log, shutdown |
 
 ## Projects with several processes
@@ -245,6 +246,36 @@ deleted.
 - **Start with PortalControl.** Launch the target whenever the manager starts.
 - **Activity feed.** Deployments, health changes, new commits, scans and automation
   events (the last 300, kept in memory).
+
+## Analytics
+
+The Analytics page looks at all targets together. Choose 24 hours, 7 days or 30 days at
+the top right.
+
+- **Tiles.** Reliability score, availability, response time, share of runs that
+  succeeded, crash restarts, incidents, log lines and security findings.
+- **Findings.** What stands out, most serious first, each with a link to the target:
+  outages and how long recovery took, repeated crash restarts, runs that mostly fail,
+  memory that rises steadily and does not come back down (what a leak looks like), a last
+  hour that answered much slower than before, logs that are mostly errors, one target
+  printing nearly all the lines, and an hour of the day in which failures cluster.
+- **Trends.** Availability, response time, CPU, memory and the number of targets running,
+  for all targets together.
+- **Runs and incidents.** Per day (per hour for 24 hours), a grid of failed runs and
+  incidents by weekday and hour, what started the runs, and incidents by kind and severity.
+- **Targets compared.** One row per target; click a column to sort. Recovery is the
+  average time to come back after an outage; hover it for the average time between outages.
+- **Projects** and **Monitor and AI.** The same figures per project, and what the log
+  monitor and the AI model did.
+
+The reliability score starts at 100 and loses points for missed health probes (at most
+40), failed runs (at most 25), crash restarts (at most 15), incidents (at most 10) and
+security findings (at most 10). Hover a score to see what cost it points.
+
+Three things limit the figures. Availability, response time, CPU and memory are stored
+per minute for 7 days, so a 30-day period shows those for its last 7 days. The history
+keeps 200 runs per target and 500 incidents. Log-line counts start again whenever
+PortalControl restarts.
 
 ## Where the monitor's lines come from
 
@@ -689,6 +720,7 @@ protection*).
 | GET | `/api/fs/inspect?dir=` | Scripts, project type and Git state of a directory |
 | GET | `/api/system`, `/api/system/metrics`, `/api/system/log` | Manager details, host samples, manager log tail |
 | POST / DELETE | `/api/system/autostart` | Enable / disable start at login |
+| GET | `/api/analytics?range=24h\|7d\|30d` | Figures for every target and the whole machine, the reliability score and the findings (the Analytics page) |
 | GET | `/api/monitor/django-middleware` | The request-log middleware for Django projects, as a file |
 | POST | `/api/system/shutdown` | Stop the manager and its child processes |
 | GET | `/ws` | WebSocket event stream (`log`, `run_started`, `run_finished`, `health`, `git`, `scan_*`, `activity`) |
