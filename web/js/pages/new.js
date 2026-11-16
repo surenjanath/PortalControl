@@ -215,7 +215,9 @@ function newView(cloneId) {
       const db = (info.sqlite_files || [])[0];
       optionsBox.replaceChildren(
         workers.length ? [h("div", { class: "optlabel", style: "margin-top:0" }, "Related processes found"),
-          workers.map(({ w, box }) => check(box, "Also add: " + w.label, w.command + (w.script_exists ? "" : "  \u2014 creates " + w.script + " in the folder")))] : null,
+          workers.map(({ w, box }) => (w.started_by || []).length
+            ? check(box, "Also add: " + w.label, "Not ticked: " + w.started_by.join(", ") + " already starts it. Tick this only if the script you run does not, or the same process runs twice on one database.")
+            : check(box, "Also add: " + w.label, w.command + (w.script_exists ? "" : "  \u2014 creates " + w.script + " in the folder")))] : null,
         db ? check(f.backup, "Back up " + db + " before every run", "Keeps the newest 14 snapshots of the SQLite database in PortalControl's data folder, so a bad deployment or migration can be undone.") : null,
         isService() ? check(f.restart, "Restart on crash", "If the process exits on its own it is started again after 5 seconds.") : null,
         check(f.autostart, "Start with PortalControl", "Launch it whenever the manager starts, for example after a reboot."));
@@ -235,7 +237,7 @@ function newView(cloneId) {
       if (!touched.branch && r.branch) f.branch.value = r.branch;
       const registered = targets.filter((o) => o.working_directory.toLowerCase() === dir.toLowerCase());
       const taken = registered.map((o) => o.script_name.toLowerCase());
-      workers = (r.workers || []).filter((w) => !taken.includes(w.script.toLowerCase())).map((w) => ({ w, box: h("input", { type: "checkbox", checked: !src }) }));
+      workers = (r.workers || []).filter((w) => !taken.includes(w.script.toLowerCase())).map((w) => ({ w, box: h("input", { type: "checkbox", checked: !src && !(w.started_by || []).length }) }));
       found.replaceChildren(h("div", { class: "note-box ok" },
         h("div", { class: "rowf" }, h("b", { style: "color:var(--text);font-size:14px" }, r.project.label), r.detected.filter((d) => d !== r.project.label).map((d) => h("span", { class: "tag acc" }, d)),
           r.is_repo ? h("span", { class: "tag ok" }, icon("git"), r.branch || "detached HEAD") : h("span", { class: "tag" }, "not a Git repository")),

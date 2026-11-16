@@ -449,6 +449,54 @@ pub(super) struct Worker {
     pub(super) script: String,
     /// What gave it away, shown to the operator.
     pub(super) why: String,
+    /// Scripts in the project folder that already start this process. Adding
+    /// it as a target next to one of those runs it twice.
+    pub(super) started_by: Vec<String>,
+}
+
+/// Words that, together on one line of a script, mean it starts this worker.
+fn start_words(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "qcluster" => &["manage.py", "qcluster"],
+        "celery" => &["celery", " worker"],
+        "celery_beat" => &["celery", " beat"],
+        "npm_start" => &["npm", " start"],
+        "npm_dev" => &["npm", "run dev"],
+        "npm_worker" => &["npm", "run worker"],
+        _ => &[],
+    }
+}
+
+/// The scripts of this platform at the top of `dir` that start the worker
+/// themselves (comment lines do not count), leaving out its own launcher.
+pub(super) fn scripts_starting(dir: &std::path::Path, kind: &str, own_script: &str) -> Vec<String> {
+    let words = start_words(kind);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let exts: &[&str] = if cfg!(windows) { &["bat", "cmd", "ps1"] } else { &["sh", "command"] };
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .take(2_000)
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let ext = name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default();
+                    if !exts.contains(&ext.as_str()) || name.eq_ignore_ascii_case(own_script) {
+                        return None;
+                    }
+                    let starts = read_small(&e.path()).lines().map(str::trim).any(|l| {
+                        let comment = l.starts_with('#') || l.starts_with("rem ") || l.starts_with("::");
+                        !comment && words.iter().all(|w| l.contains(w))
+                    });
+                    starts.then_some(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
 }
 
 pub(super) fn read_small(path: &std::path::Path) -> String {
@@ -496,8 +544,12 @@ pub(super) fn detect_workers(dir: &std::path::Path) -> Vec<Worker> {
                 command: format!("npm run {script}"),
                 script: format!("portalcontrol_{kind}.{ext}"),
                 why: format!("\"{script}\" script in package.json"),
+                started_by: Vec::new(),
             });
         }
+    }
+    for w in &mut out {
+        w.started_by = scripts_starting(dir, w.kind, &w.script);
     }
     out
 }
@@ -567,6 +619,7 @@ pub(super) fn detect_django_workers(dir: &std::path::Path) -> Vec<Worker> {
             command: format!("{python} manage.py qcluster"),
             script: format!("portalcontrol_qcluster.{ext}"),
             why: format!("django_q found in {source}"),
+            started_by: Vec::new(),
         });
     }
 
@@ -580,6 +633,7 @@ pub(super) fn detect_django_workers(dir: &std::path::Path) -> Vec<Worker> {
             command: format!("{python} -m celery -A {app} worker --loglevel=info{pool}"),
             script: format!("portalcontrol_celery.{ext}"),
             why: format!("{app}/celery.py"),
+            started_by: Vec::new(),
         });
         if let Some(source) = find(&settings, &["django_celery_beat", "beat_schedule"]) {
             out.push(Worker {
@@ -588,6 +642,7 @@ pub(super) fn detect_django_workers(dir: &std::path::Path) -> Vec<Worker> {
                 command: format!("{python} -m celery -A {app} beat --loglevel=info"),
                 script: format!("portalcontrol_celery_beat.{ext}"),
                 why: format!("beat schedule found in {source}"),
+                started_by: Vec::new(),
             });
         }
     }

@@ -107,19 +107,57 @@ function monitorFlow() {
   // list (polled) says it is running.
   const live = (t) => t.running || (rate.get(t.id) || []).some((x) => Date.now() - x < 10000);
   const layoutSources = () => {
-    const list = targets.filter(live).concat(targets.filter((t) => !live(t))).slice(0, FLOW_SRC_MAX);
+    // Only FLOW_SRC_MAX boxes fit: show the targets that print the most, so
+    // the source of a flood of lines is never one of the hidden ones.
+    const order = new Map(targets.map((t, i) => [t.id, i]));
+    const list = targets.slice()
+      .sort((a, b) => (live(b) - live(a)) || (volume(b) - volume(a)) || (order.get(a.id) - order.get(b.id)))
+      .slice(0, FLOW_SRC_MAX)
+      .sort((a, b) => (live(b) - live(a)) || (order.get(a.id) - order.get(b.id)));
+    const hidden = targets.length - list.length;
     // Re-lay when a target starts or stops too, not only when the set changes.
-    const key = list.map((t) => t.id + (live(t) ? "r" : "s")).join(",");
+    // Lines of a target that has no box (more targets than boxes, or a
+    // process whose target is not in the list) get a box of their own, so
+    // they are never drawn as coming out of another target.
+    const other = hidden > 0 || otherRate.some((x) => Date.now() - x < 60000);
+    const key = list.map((t) => t.id + (live(t) ? "r" : "s")).join(",") + (other ? ",+" + hidden : "");
     if (key === srcKeys) return;
-    srcKeys = key; srcG.replaceChildren(); srcIndex = new Map(); srcBoxes = []; srcPaths = [];
-    if (!list.length) { const t = s("text", { x: 100, y: 220, class: "fs" }); t.textContent = "NO TARGETS YET"; srcG.append(t); return; }
+    srcKeys = key; srcG.replaceChildren(); srcIndex = new Map(); srcBoxes = []; srcPaths = []; otherBox = null; otherPath = null;
+    if (!list.length && !other) { const t = s("text", { x: 100, y: 220, class: "fs" }); t.textContent = "NO TARGETS YET"; srcG.append(t); return; }
+    const step = other ? 56 : 64, hgt = other ? 42 : 46, y0 = other ? 62 : 70;
     list.forEach((t, i) => {
-      const y = 70 + i * 64;
+      const y = y0 + i * step;
       const name = t.name.length > 16 ? t.name.slice(0, 15) + "…" : t.name;
-      srcBoxes.push(flowBox(srcG, 26, y, 148, 46, name.toUpperCase(), live(t) ? "LIVE" : "STOPPED", live(t) ? "" : "dim"));
-      srcPaths.push(flowPath(srcG, `M174,${y + 23} H205 V196 H250`));
+      srcBoxes.push(flowBox(srcG, 26, y, 148, hgt, name.toUpperCase(), live(t) ? "LIVE" : "STOPPED", live(t) ? "" : "dim"));
+      srcPaths.push(flowPath(srcG, `M174,${y + hgt / 2} H205 V196 H250`));
       srcIndex.set(t.id, i);
     });
+    if (other) {
+      const y = y0 + list.length * step;
+      otherBox = flowBox(srcG, 26, y, 148, hgt, hidden > 0 ? "+" + hidden + " OTHER" : "NOT IN THE LIST", "", "dashed");
+      otherPath = flowPath(srcG, `M174,${y + hgt / 2} H205 V196 H250`);
+    }
+  };
+  let otherBox = null, otherPath = null, otherRate = [];
+  const volume = (t) => (st.targets && st.targets[t.id] ? st.targets[t.id].lines : 0);
+
+  // ---- where the lines come from: every target, busiest first
+  const bySource = h("div", { class: "flow-src" });
+  const paintSources = () => {
+    const now = Date.now(), n = (x) => Number(x || 0).toLocaleString();
+    const rows = Object.entries(st.targets || {}).map(([id, x]) => ({ id: Number(id), t: T(id), x }))
+      .sort((a, b) => b.x.lines - a.x.lines);
+    if (!rows.length) { bySource.replaceChildren(); return; }
+    const total = rows.reduce((sum, r) => sum + r.x.lines, 0) || 1;
+    const shown = rows.slice(0, 12);
+    bySource.replaceChildren(
+      h("div", { class: "dim small", style: "margin:12px 0 6px" }, h("b", {}, "Where the lines come from"), " · counted since the manager started · click a row to open the target and its log"),
+      table(["Target", "Lines", "Share", "Error lines", "Patterns", "Now"], shown.map((r) => [
+        r.t ? r.t.name + (r.t.project ? " (" + r.t.project + ")" : "") : "target " + r.id,
+        n(r.x.lines), (100 * r.x.lines / total).toFixed(1) + "%", n(r.x.error_lines), n(r.x.patterns),
+        ((rate.get(r.id) || []).filter((ts) => now - ts < 10000).length / 10).toFixed(1) + " lines/s",
+      ]), (i) => { location.hash = "#/target/" + shown[i].id; }),
+      rows.length > shown.length ? h("div", { class: "dim small", style: "margin-top:4px" }, "and " + (rows.length - shown.length) + " quieter targets") : null);
   };
 
   // ---- particles
@@ -172,14 +210,16 @@ function monitorFlow() {
       const info = st.targets && st.targets[id];
       b.sub.textContent = t && live(t) ? (ts.length / 10).toFixed(1) + " LINES/S" + (info ? " · " + info.lines : "") : "STOPPED";
     });
+    otherRate = otherRate.filter((x) => now - x < 60000);
+    if (otherBox) otherBox.sub.textContent = (otherRate.filter((x) => now - x < 10000).length / 10).toFixed(1) + " LINES/S · SEE TABLE";
     status.replaceChildren(
       h("span", { class: "dot " + (st.enabled ? "ok pulse" : "") }), h("b", {}, st.enabled ? " LIVE " : " OFF "),
-      h("span", {}, h("b", {}, st.lines), " lines · ", h("b", {}, pct.toFixed(1) + "%"), " filtered · ", h("b", {}, st.flagged), " flagged · "),
+      h("span", {}, h("b", {}, st.lines), " lines since start · ", h("b", {}, pct.toFixed(1) + "%"), " filtered · ", h("b", {}, st.flagged), " flagged · "),
       h("span", {}, "AI ", h("b", {}, st.ai_enabled ? st.model || "—" : "off"), st.ai_avg_ms ? " · avg " + (st.ai_avg_ms / 1000).toFixed(1) + " s" : ""),
       st.ai_enabled ? h("span", { class: "t-ok" }, " local") : null,
       h("span", { class: "right mono" }, lastTrace ? lastTrace + "  " : "", fmtClock(new Date())));
   };
-  const loadStats = () => api("GET", "/api/monitor/stats").then((x) => { st = x; if (!lastTrace && x.last_trace) lastTrace = x.last_trace; paint(); }, () => {});
+  const loadStats = () => api("GET", "/api/monitor/stats").then((x) => { st = x; if (!lastTrace && x.last_trace) lastTrace = x.last_trace; layoutSources(); paint(); paintSources(); }, () => {});
 
   // ---- live events
   const pathFor = (trigger) => trigger === "error_burst" ? [P.burst, burst, P.fromBurst] : trigger === "new_error" ? [P.novel, novel, P.fromNovel] : [P.events, events, P.fromEvents];
@@ -193,8 +233,9 @@ function monitorFlow() {
       const now = performance.now();
       if (now - secondStart > 1000) { secondStart = now; spawnedThisSecond = 0; }
       if (spawnedThisSecond++ > 24 && !err) return; // sample busy streams; errors always show
-      const i = srcIndex.has(m.target_id) ? srcIndex.get(m.target_id) : -1;
-      const path = srcPaths[i >= 0 ? i : srcPaths.length - 1];
+      const drawn = srcIndex.has(m.target_id);
+      if (!drawn) { otherRate.push(Date.now()); if (!otherPath) layoutSources(); }
+      const path = drawn ? srcPaths[srcIndex.get(m.target_id)] : otherPath;
       run(path, 900, err ? "warn" : "", null, () => {
         flash(filter);
         if (!err) run(P.pass, 550, "", null, () => flash(pass));
@@ -229,7 +270,7 @@ function monitorFlow() {
   layoutSources(); loadStats();
   const timer = setInterval(() => { layoutSources(); loadStats(); }, 5000);
   const clock = setInterval(() => { layoutSources(); paint(); }, 1000);
-  const el = h("div", { class: "flow" }, status, h("div", { class: "flow-wrap" }, svg),
+  const el = h("div", { class: "flow" }, status, h("div", { class: "flow-wrap" }, svg), bySource,
     h("div", { class: "flow-cap" }, h("b", {}, "Figure. "), "Every line is checked on this machine in microseconds; ordinary output drops into PASS. Only flagged moments reach the AI model, each with its own trace id, so an alert can be followed back to the exact log lines."));
   return { el, cleanup: () => { sinks.delete(sink); clearInterval(timer); clearInterval(clock); cancelAnimationFrame(raf); } };
 }

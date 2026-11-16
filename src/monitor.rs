@@ -58,8 +58,8 @@ pub struct Stats {
     /// detection (`threat.rs`).
     pub requests: u64,
     pub threats: u64,
-    /// Per target: (lines read, patterns learned, still learning).
-    pub targets: HashMap<i64, (u64, usize, bool)>,
+    /// Per target: (lines read, error lines, patterns learned, still learning).
+    pub targets: HashMap<i64, (u64, u64, usize, bool)>,
 }
 
 pub static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -315,6 +315,7 @@ pub struct Watch {
     templates: HashMap<String, u32>,
     started: Option<Instant>,
     seen_lines: u64,
+    seen_errors: u64,
     errors: VecDeque<Instant>,
     /// Error lines per minute, smoothed.
     baseline: f64,
@@ -324,11 +325,11 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// (lines read, patterns learned, still learning) for the live view.
-    pub fn summary(&self, now: Instant) -> (u64, usize, bool) {
+    /// (lines read, error lines, patterns learned, still learning) for the live view.
+    pub fn summary(&self, now: Instant) -> (u64, u64, usize, bool) {
         let learned = self.started.is_some_and(|s| now.duration_since(s) >= LEARN_FOR)
             && self.seen_lines >= LEARN_LINES;
-        (self.seen_lines, self.templates.len(), !learned)
+        (self.seen_lines, self.seen_errors, self.templates.len(), !learned)
     }
 
     pub fn recent(&self, n: usize) -> Vec<String> {
@@ -371,6 +372,7 @@ impl Watch {
         if !is_error_line(line) {
             return None;
         }
+        self.seen_errors += 1;
         self.minute_errors += 1;
         self.errors.push_back(now);
         while self.errors.front().is_some_and(|t| now.duration_since(*t) > BURST_WINDOW) {
@@ -969,6 +971,7 @@ pub fn spawn_worker(state: Arc<AppState>) {
                     if let Ok(list) = state.db.list_targets().await {
                         watches.retain(|id, _| list.iter().any(|t| t.id == *id));
                         trackers.retain(|id, _| list.iter().any(|t| t.id == *id));
+                        with_stats(|s| s.targets.retain(|id, _| list.iter().any(|t| t.id == *id)));
                     }
                     None
                 }

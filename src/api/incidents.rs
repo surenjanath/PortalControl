@@ -252,8 +252,11 @@ pub(super) async fn monitor_stats(State(state): State<Arc<AppState>>) -> AppResu
     let targets: serde_json::Map<String, Value> = stats
         .targets
         .iter()
-        .map(|(id, (lines, patterns, learning))| {
-            (id.to_string(), json!({"lines": lines, "patterns": patterns, "learning": learning}))
+        .map(|(id, (lines, errors, patterns, learning))| {
+            (
+                id.to_string(),
+                json!({"lines": lines, "error_lines": errors, "patterns": patterns, "learning": learning}),
+            )
         })
         .collect();
     Ok(ok(json!({
