@@ -2,9 +2,9 @@
 # release named after the version in Cargo.toml.
 #
 # How to make a release: raise `version` in Cargo.toml and push to main.
-# A push that does not change the version builds nothing, because the release
-# for that version already exists. "Run workflow" on the Actions page builds
-# again and replaces the files of the existing release.
+# A push that does not change the version builds nothing when the release for
+# that version already has both downloads; a release missing one is built again.
+# "Run workflow" on the Actions page always builds and replaces the files.
 name: Release
 
 on:
@@ -35,13 +35,22 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release v$version already exists; nothing to build."
-            echo "build=false" >> "$GITHUB_OUTPUT"
+          # A release that exists but lacks one system's download (its build
+          # failed, or GitHub had no runner for it) is built again, so a
+          # re-run or the next push fills it in.
+          build=true
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] && \
+             assets=$(gh release view "v$version" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null); then
+            if echo "$assets" | grep -q -- '-windows-x64\.zip$' && echo "$assets" | grep -q -- '-macos-universal\.zip$'; then
+              echo "Release v$version already has both downloads; nothing to build."
+              build=false
+            else
+              echo "Release v$version is missing a download; building it again."
+            fi
           else
             echo "Building v$version."
-            echo "build=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Windows

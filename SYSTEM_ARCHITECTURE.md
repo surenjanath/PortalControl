@@ -7,7 +7,7 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.9.0 |
+| Document version | 1.9.1 |
 | Application version | 0.14.0 (`Cargo.toml`) |
 | Last updated | 2026-11-24 |
 
@@ -125,7 +125,7 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `src/` | The program (see 3.2) |
 | `web/` | The dashboard (see 3.3) |
 | `assets/` | `icon.ico`, `icon.icns`, `tray.rgba`, `tray-mac.rgba`; all drawn by `scripts/make-icon.py` |
-| `.github/workflows/release.yml` | Runs the tests, then builds Windows (x64) and macOS (universal app) on GitHub and publishes release `v<version>` when the version in `Cargo.toml` has no release yet |
+| `.github/workflows/release.yml` | Runs the tests, then builds Windows (x64) and macOS (universal app) on GitHub and publishes release `v<version>` when the version in `Cargo.toml` has no release yet, or (since 2026-11-24) when that release lacks the Windows or the macOS download, so a re-run or the next push fills in a system whose build failed or found no runner |
 | `.github/workflows/ci.yml` | On every push and pull request: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on Windows and macOS |
 | `rustfmt.toml` | Formatting rules (`max_width = 110`) |
 | `scripts/` | `install-autostart.ps1` / `.sh` (build, install, register autostart), `make-icon.py`, `make-macos-app.sh` |
@@ -968,6 +968,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.9.1 | 0.14.0 | 2026-11-24 | Release workflow: an existing release that lacks the Windows or macOS download is built again. v0.14.0 was published with Windows only because GitHub found no macOS runner and cancelled that job; re-runs then skipped because the release existed. CI fix: `sort_by_key` in `report.rs` for clippy 1.100. No code or schema change. |
 | 1.9.0 | 0.14.0 | 2026-11-24 | **Git repository folder** (3.12): new column `portal_targets.git_dir` (empty, `auto`, a folder), `git::repo_dir`, `check_repo_dir`, `GET /api/fs/repo`, `repo_dir` in the target view; every Git operation uses it; Git Source gained the choice with Browse. **Incidents** (3.13): new column `incidents.details` (context, run, signals, history, diagnosis, AI fields, source); new `diagnose.rs` explains incidents without a model and suggests an offered fix; the model's schema gained `key_error`, `steps`, `confidence`; emails carry the key error and steps; `POST /api/incidents/bulk`; the Incidents page gained counts, filters, selection, bulk actions and the details. **Reports** (3.14): the status, site and security reports rebuilt in a certificate layout with less noise; report branding (`report_brand`, `GET`/`PUT /api/settings/reports`) and logo (`report-logo.jpg`, `/api/settings/reports/logo`); Settings > Reports; `pdf.rs` gained Courier, letter spacing, outlined rectangles and JPEG images. **Security**: new `posture.rs`, `GET /api/security/posture`, `GET /api/reports/security.pdf`, CVE ids of vulnerable packages, the posture on the Security page. **Dashboard**: 24-hour charts and a ring of target states; links to the status and security reports. 15 new tests (167). |
 | 1.8.0 | 0.13.0 | 2026-11-16 | **A blocked pull says what blocks it** (section 3.11). `pull_ff` no longer refuses for any local change to a tracked file: it refuses only when a path changed on this computer is also changed by the commits being pulled, and names those paths; other local changes are kept. This also applies to deploy and auto-deploy. New `git::pull_plan`, `file_diff`, `discard_changes` and `GET /api/targets/{id}/git/plan`, `GET …/git/diff?path=`, `POST …/git/discard`; undone changes are first copied to `<data>/git-backups/<target id>/<time>/`. Git Source shows the plan in a sentence, marks each local change, lists the incoming files, and offers Show change, Undo / Remove and "Undo these and pull". **Env files**: `GET /api/targets/{id}/env/files`; the Environment Variables section loads the project's `.env` when nothing is stored, or a chosen file, into its box. Section 6 gained the macOS install that was run over SSH. No schema change. 2 new tests (152). |
 | 1.7.0 | 0.12.0 | 2026-11-16 | **Analytics page** (`analytics.rs`, `api/analytics.rs`, `js/pages/analytics.js`, section 3.10): `GET /api/analytics?range=24h\|7d\|30d` works out, from the minute rows, runs, incidents, AI traces, scans and the monitor's counters, figures per target and for the machine (availability, response time, CPU, memory, outages, time to recover and between outages, runs, crash restarts, incidents, log lines), a memory trend that marks steady growth, a check of the last hour's response time against the time before, a reliability score whose every deduction is named, a timeline and a weekday-by-hour grid of failures in local time, a roll-up per project, and a list of findings. The page shows them with a sortable table that compares the targets. New sidebar entry and `chart` icon; Incidents and Analytics added to the command palette. Nothing is stored and there is no schema change. 8 new tests (150). |
