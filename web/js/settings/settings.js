@@ -5,7 +5,7 @@
 // or { el, update, cleanup } when it follows live data or runs a timer.
 // The sections live in the other files of this folder.
 const SET = {};
-const SETTINGS_SUBS = [["access", "Access"], ["network", "Network"], ["startup", "Start at Login"], ["notifications", "Notifications"], ["alerts", "Email Alerts"], ["monitor", "AI Monitor"], ["transfer", "Export and Import"],
+const SETTINGS_SUBS = [["access", "Access"], ["network", "Network"], ["startup", "Start at Login"], ["notifications", "Notifications"], ["alerts", "Email Alerts"], ["monitor", "AI Monitor"], ["reports", "Reports"], ["transfer", "Export and Import"],
   ["manager", "Manager"], ["resources", "Resources"], ["tools", "Scanner Tools"], ["log", "Manager Log"], ["danger", "Danger Zone"]];
 
 function settingsView(sub) {

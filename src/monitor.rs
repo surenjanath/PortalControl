@@ -550,10 +550,20 @@ pub fn answer_schema(actions: &[Choice]) -> Value {
             "title": {"type": "string", "description": "at most 80 characters"},
             "summary": {"type": "string", "description": "what is happening, 1-3 sentences"},
             "likely_cause": {"type": "string", "description": "the most likely cause, or that the logs do not show it"},
+            "key_error": {"type": "string", "description": "the one log line that shows the problem, copied exactly, or empty"},
+            "steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "1 to 5 concrete steps for the operator, in order",
+            },
+            "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
             "action": {"type": "string", "enum": ids},
             "action_reason": {"type": "string", "description": "why this action, or what to change by hand"},
         },
-        "required": ["severity", "title", "summary", "likely_cause", "action", "action_reason"],
+        "required": [
+            "severity", "title", "summary", "likely_cause", "key_error", "steps", "confidence", "action",
+            "action_reason"
+        ],
     })
 }
 
@@ -609,6 +619,28 @@ pub fn apply_answer(inc: &mut Incident, answer: &Value, actions: &[Choice]) {
         }
     }
     inc.action_reason = clean(&s("action_reason"), 800);
+    // The extra fields of 0.14.0 go into the incident's details.
+    let steps: Vec<String> = answer
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|t| clean(t, 300))
+                .filter(|t| !t.is_empty())
+                .take(6)
+                .collect()
+        })
+        .unwrap_or_default();
+    let confidence = s("confidence");
+    if !inc.details.is_object() {
+        inc.details = json!({});
+    }
+    inc.details["ai"] = json!({
+        "key_error": clean(&s("key_error"), 400),
+        "steps": steps,
+        "confidence": matches!(confidence.as_str(), "low" | "medium" | "high").then_some(confidence),
+    });
 }
 
 /// The log lines to show the model: whichever source has the most of the
@@ -670,7 +702,8 @@ async fn handle(
         "Now: {}; health check: {}",
         if running { "running" } else { "not running" },
         health
-            .map(|h| format!("{} {}", h.status, h.detail.unwrap_or_default()))
+            .as_ref()
+            .map(|h| format!("{} {}", h.status, h.detail.clone().unwrap_or_default()))
             .unwrap_or_else(|| "none".into())
     );
 
@@ -699,6 +732,70 @@ async fn handle(
     };
 
     let actions = choices(&state, &t).await;
+
+    // Everything known about this moment, kept with the incident (0.14.0):
+    // what ran, the health and Git state, the key error, how often it
+    // happened before, and the rules' own diagnosis.
+    let diag = crate::diagnose::diagnose(trigger.kind.id(), &lines, &actions);
+    let run = match run_id {
+        Some(r) => state.db.get_run(r).await.ok().flatten(),
+        None => None,
+    };
+    let git = state.git.lock().ok().and_then(|m| m.get(&t.id).cloned());
+    let now = crate::util::now_secs();
+    let since = |secs: u64| crate::util::fmt_utc(now.saturating_sub(secs));
+    let kind_id = trigger.kind.id().to_string();
+    let (same_24h, previous_at) =
+        state.db.similar_incidents(t.id, kind_id.clone(), since(86_400)).await.unwrap_or((0, None));
+    let (same_7d, _) =
+        state.db.similar_incidents(t.id, kind_id, since(7 * 86_400)).await.unwrap_or((0, None));
+    let key_error = if security { None } else { crate::diagnose::key_error(&lines) };
+    let first_error: Option<String> = if security {
+        None
+    } else {
+        lines.iter().find(|l| is_error_line(l)).map(|l| l.trim().chars().take(400).collect())
+    };
+    inc.details = json!({
+        "context": {
+            "project": t.project,
+            "mode": t.run_mode,
+            "running": running,
+            "health_url": t.health_url,
+            "health": health.as_ref().map(|h| json!({
+                "status": h.status, "latency_ms": h.latency_ms, "http_status": h.http_status,
+                "detail": h.detail, "checked_at": h.checked_at,
+            })),
+            "git": git.as_ref().filter(|g| g.is_repo).map(|g| json!({
+                "branch": g.checked_out_branch, "head": g.head, "head_summary": g.head_summary,
+                "behind": g.behind, "ahead": g.ahead, "dirty_files": g.dirty_files,
+            })),
+        },
+        "run": run.as_ref().map(|r| json!({
+            "id": r.id, "triggered_by": r.triggered_by, "status": r.status, "exit_code": r.exit_code,
+            "duration_ms": r.duration_ms, "executed_at": r.executed_at, "commit_sha": r.commit_sha,
+            "commit_message": r.commit_message, "label": r.label,
+        })),
+        "signals": {
+            "rule": trigger.what,
+            "lines": lines.len(),
+            "error_lines": if security { 0 } else { lines.iter().filter(|l| is_error_line(l)).count() },
+            "key_error": key_error,
+            "first_error": first_error,
+        },
+        "history": {"same_24h": same_24h, "same_7d": same_7d, "previous_at": previous_at},
+        "diagnosis": diag.clone(),
+        "actions_offered": actions.clone(),
+        "source": "rules",
+    });
+    // A recognised error is a useful hint for a small model.
+    let extra = match &diag.matched {
+        Some(line) => format!(
+            "{extra}\nThe monitoring rules recognise this as \"{}\" from the line: {line}",
+            diag.title
+        ),
+        None => extra,
+    };
+
     if settings.ai_enabled && !settings.model.is_empty() {
         let (system, user) = if security {
             let raw = &lines[lines.len().saturating_sub(SECURITY_RAW_LINES)..];
@@ -756,6 +853,27 @@ async fn handle(
                 );
                 state.activity("warn", "ai", Some(t.id), format!("{trace_id}: AI analysis failed: {e}"));
             }
+        }
+    }
+
+    // Without an answer from the model, the rules' diagnosis explains it.
+    let answered = trace.status == "ok";
+    inc.details["source"] = json!(if answered {
+        "ai"
+    } else if settings.ai_enabled && !settings.model.is_empty() {
+        "rules_ai_failed"
+    } else {
+        "rules"
+    });
+    if !answered {
+        inc.cause = diag.cause.clone();
+        inc.action_reason = diag.steps.join(" ");
+        if diag.matched.is_some() {
+            inc.title = format!("{} \u{2014} {}", inc.title, diag.title.to_lowercase());
+        }
+        if let Some(a) = diag.action.as_ref().and_then(|id| actions.iter().find(|c| &c.id == id)) {
+            inc.action = a.id.clone();
+            inc.action_label = a.label.clone();
         }
     }
 
@@ -830,6 +948,26 @@ fn email_body(
     }
     if !inc.cause.is_empty() {
         b.push_str(&format!("Likely cause: {}\n\n", inc.cause));
+    }
+    let key = inc.details["ai"]["key_error"]
+        .as_str()
+        .filter(|k| !k.is_empty())
+        .or_else(|| inc.details["signals"]["key_error"].as_str());
+    if let Some(k) = key {
+        b.push_str(&format!("Key error: {k}\n\n"));
+    }
+    let steps: Vec<&str> = inc.details["ai"]["steps"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .or_else(|| inc.details["diagnosis"]["steps"].as_array())
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !steps.is_empty() {
+        b.push_str("Steps:\n");
+        for (n, s) in steps.iter().enumerate() {
+            b.push_str(&format!("  {}. {s}\n", n + 1));
+        }
+        b.push('\n');
     }
     if inc.action != "none" {
         b.push_str(&format!(
@@ -1114,8 +1252,25 @@ mod tests {
         let order: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
         assert_eq!(
             order,
-            ["severity", "title", "summary", "likely_cause", "action", "action_reason"],
+            [
+                "severity",
+                "title",
+                "summary",
+                "likely_cause",
+                "key_error",
+                "steps",
+                "confidence",
+                "action",
+                "action_reason"
+            ],
             "analysis before action"
         );
+        apply_answer(
+            &mut inc,
+            &json!({"steps": ["Apply migrations", " ", "Restart"], "confidence": "sure", "key_error": "E"}),
+            &actions,
+        );
+        assert_eq!(inc.details["ai"]["steps"], json!(["Apply migrations", "Restart"]));
+        assert_eq!(inc.details["ai"]["confidence"], Value::Null, "only low, medium or high");
     }
 }

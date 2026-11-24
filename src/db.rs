@@ -137,6 +137,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("portal_targets", "webhook_secret", "TEXT"),
     ("incidents", "trace_id", "TEXT NOT NULL DEFAULT ''"),
     ("incidents", "run_id", "INTEGER"),
+    ("portal_targets", "git_dir", "TEXT"),
+    ("incidents", "details", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Execution-history rows kept per target; older ones are pruned.
@@ -173,6 +175,9 @@ pub struct Target {
     /// Optional secret a webhook caller must prove (an HMAC signature or a
     /// header), on top of the token in the URL.
     pub webhook_secret: Option<String>,
+    /// Where the Git repository is: `None` for the working directory, `auto`
+    /// to search upward from it, or a folder. See `git::repo_dir`.
+    pub git_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -210,6 +215,8 @@ pub struct TargetInput {
     pub start_order: Option<i64>,
     #[serde(default)]
     pub python_env: Option<String>,
+    #[serde(default)]
+    pub git_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,10 +307,16 @@ pub struct Incident {
     pub trace_id: String,
     /// The run whose output triggered it.
     pub run_id: Option<i64>,
+    /// Everything known about the moment it was opened (added in 0.14.0):
+    /// the run, health and Git state, the key error line, how often it
+    /// happened before, the rules' diagnosis and the AI's extra fields. An
+    /// object; `null` for incidents from before 0.14.0. See `monitor.rs`.
+    #[serde(default)]
+    pub details: serde_json::Value,
 }
 
 const INCIDENT_COLS: &str = "id, target_id, created_at, trigger, severity, title, summary, cause, action, \
-     action_label, action_reason, analysed_by, excerpt, status, note, trace_id, run_id";
+     action_label, action_reason, analysed_by, excerpt, status, note, trace_id, run_id, details";
 /// Incidents kept; older ones are pruned.
 const INCIDENTS_KEPT: i64 = 500;
 
@@ -326,6 +339,10 @@ fn row_to_incident(r: &Row) -> rusqlite::Result<Incident> {
         note: r.get(14)?,
         trace_id: r.get(15)?,
         run_id: r.get(16)?,
+        details: r
+            .get::<_, Option<String>>(17)?
+            .and_then(|d| serde_json::from_str(&d).ok())
+            .unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -336,7 +353,7 @@ pub struct Db {
 
 const TARGET_COLS: &str = "id, name, working_directory, script_name, git_branch, \
      current_git_status, created_at, health_url, run_mode, autostart, timeout_secs, \
-     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order, python_env, webhook_secret";
+     description, project, env_vars, schedule, auto_deploy, auto_restart, webhook_token, db_file, backup_on_deploy, start_order, python_env, webhook_secret, git_dir";
 
 const RUN_COLS: &str = "h.id, h.target_id, h.triggered_by, h.status, h.exit_code, h.duration_ms, \
      h.executed_at, h.commit_sha, h.commit_message, h.label";
@@ -427,6 +444,7 @@ fn row_to_target(r: &Row) -> rusqlite::Result<Target> {
             .get::<_, Option<String>>(22)?
             .filter(|s| !s.is_empty())
             .map(|s| unseal_webhook_secret(&s)),
+        git_dir: r.get::<_, Option<String>>(23)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -566,8 +584,8 @@ impl Db {
             c.execute(
                 "INSERT INTO portal_targets (name, working_directory, script_name, git_branch, \
                  health_url, run_mode, autostart, timeout_secs, description, project, env_vars, \
-                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy, start_order, python_env) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                 schedule, auto_deploy, auto_restart, db_file, backup_on_deploy, start_order, python_env, git_dir) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     t.name,
                     t.working_directory,
@@ -587,6 +605,7 @@ impl Db {
                     t.backup_on_deploy.unwrap_or(false) as i64,
                     t.start_order.unwrap_or(0),
                     t.python_env,
+                    t.git_dir,
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -610,7 +629,7 @@ impl Db {
                 "UPDATE portal_targets SET name=?1, working_directory=?2, script_name=?3, \
                  git_branch=?4, health_url=?5, run_mode=?6, autostart=?7, timeout_secs=?8, \
                  description=?9, project=?10, env_vars=?11, schedule=?12, auto_deploy=?13, \
-                 auto_restart=?14, db_file=?15, backup_on_deploy=?16, start_order=?17, python_env=?18 WHERE id=?19",
+                 auto_restart=?14, db_file=?15, backup_on_deploy=?16, start_order=?17, python_env=?18, git_dir=?19 WHERE id=?20",
                 params![
                     t.name,
                     t.working_directory,
@@ -630,6 +649,7 @@ impl Db {
                     t.backup_on_deploy.unwrap_or(false) as i64,
                     t.start_order.unwrap_or(0),
                     t.python_env,
+                    t.git_dir,
                     id
                 ],
             )?;
@@ -744,7 +764,8 @@ impl Db {
         self.call(move |c| {
             c.execute(
                 "INSERT INTO incidents (target_id, trigger, severity, title, summary, cause, action, action_label, \
-                 action_reason, analysed_by, excerpt, trace_id, run_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 action_reason, analysed_by, excerpt, trace_id, run_id, details) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     i.target_id,
                     i.trigger,
@@ -758,7 +779,8 @@ impl Db {
                     i.analysed_by,
                     i.excerpt,
                     i.trace_id,
-                    i.run_id
+                    i.run_id,
+                    if i.details.is_null() { String::new() } else { i.details.to_string() }
                 ],
             )?;
             let id = c.last_insert_rowid();
@@ -874,6 +896,65 @@ impl Db {
                 params![text, trace_id],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Set the status of several incidents at once. Returns how many changed.
+    pub async fn set_incidents_status(
+        &self,
+        ids: Vec<i64>,
+        status: &'static str,
+        note: String,
+    ) -> Result<usize, String> {
+        self.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let mut n = 0;
+            {
+                let mut st = tx.prepare("UPDATE incidents SET status=?1, note=?2 WHERE id=?3")?;
+                for id in ids {
+                    n += st.execute(params![status, note, id])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
+    }
+
+    /// Delete incidents and their traces. Returns how many incidents went.
+    pub async fn delete_incidents(&self, ids: Vec<i64>) -> Result<usize, String> {
+        self.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let mut n = 0;
+            {
+                let mut traces = tx.prepare("DELETE FROM ai_traces WHERE incident_id=?1")?;
+                let mut incidents = tx.prepare("DELETE FROM incidents WHERE id=?1")?;
+                for id in ids {
+                    traces.execute([id])?;
+                    n += incidents.execute([id])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
+    }
+
+    /// Incidents of the same kind on the same target opened after `since`
+    /// (`YYYY-MM-DD HH:MM:SS`, UTC), and when the newest of them was opened.
+    pub async fn similar_incidents(
+        &self,
+        target_id: i64,
+        trigger: String,
+        since: String,
+    ) -> Result<(i64, Option<String>), String> {
+        self.call(move |c| {
+            c.query_row(
+                "SELECT COUNT(*), MAX(created_at) FROM incidents WHERE target_id=?1 AND trigger=?2 AND created_at>=?3",
+                params![target_id, trigger, since],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
         })
         .await
     }
@@ -1336,5 +1417,72 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db.insert_target(input("a")).await.unwrap();
         assert!(db.set_git_status(id, "BOGUS").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn git_dir_is_stored_and_cleared() {
+        let db = Db::open_in_memory().unwrap();
+        let mut t = input("a");
+        t.git_dir = Some("auto".into());
+        let id = db.insert_target(t).await.unwrap();
+        assert_eq!(db.get_target(id).await.unwrap().unwrap().git_dir.as_deref(), Some("auto"));
+        let mut t = input("a");
+        t.git_dir = Some(String::new());
+        db.update_target(id, t).await.unwrap();
+        assert_eq!(db.get_target(id).await.unwrap().unwrap().git_dir, None, "empty reads as not set");
+    }
+
+    #[tokio::test]
+    async fn incidents_keep_details_and_change_in_bulk() {
+        let db = Db::open_in_memory().unwrap();
+        let tid = db.insert_target(input("a")).await.unwrap();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let inc = Incident {
+                target_id: Some(tid),
+                trigger: "failure".into(),
+                severity: "warning".into(),
+                title: format!("t{n}"),
+                action: "none".into(),
+                trace_id: format!("TR-{n}"),
+                details: if n == 0 {
+                    serde_json::json!({"history": {"same_24h": 2}})
+                } else {
+                    serde_json::Value::Null
+                },
+                ..Default::default()
+            };
+            ids.push(db.insert_incident(inc).await.unwrap());
+            db.insert_trace(Trace {
+                trace_id: format!("TR-{n}"),
+                incident_id: ids.last().copied(),
+                trigger: "failure".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let first = db.get_incident(ids[0]).await.unwrap().unwrap();
+        assert_eq!(first.details["history"]["same_24h"], 2);
+        assert!(db.get_incident(ids[1]).await.unwrap().unwrap().details.is_null(), "old rows read as null");
+
+        let (n, last) =
+            db.similar_incidents(tid, "failure".into(), "2000-01-01 00:00:00".into()).await.unwrap();
+        assert_eq!(n, 3);
+        assert!(last.is_some());
+        assert_eq!(
+            db.similar_incidents(tid, "attack".into(), "2000-01-01 00:00:00".into()).await.unwrap().0,
+            0
+        );
+
+        assert_eq!(
+            db.set_incidents_status(vec![ids[0], ids[1], 9999], "resolved", "bulk".into()).await.unwrap(),
+            2
+        );
+        assert_eq!(db.list_incidents(true, 10).await.unwrap().len(), 1);
+        assert_eq!(db.delete_incidents(vec![ids[0], ids[2]]).await.unwrap(), 2);
+        assert_eq!(db.list_incidents(false, 10).await.unwrap().len(), 1);
+        assert!(db.get_trace("TR-0".into()).await.unwrap().is_none(), "the trace goes with its incident");
+        assert!(db.get_trace("TR-1".into()).await.unwrap().is_some());
     }
 }

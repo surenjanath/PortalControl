@@ -181,7 +181,7 @@ async fn is_running(state: &Arc<AppState>, target_id: i64) -> bool {
 /// Fast-forward the working tree to `origin/<branch>` (off the async
 /// runtime), record it in the activity feed and refresh the cached Git state.
 pub async fn pull(state: &Arc<AppState>, target: &Target) -> Result<git::PullOutcome, String> {
-    let (dir, branch) = (target.working_directory.clone(), target.git_branch.clone());
+    let (dir, branch) = (git::repo_dir(target), target.git_branch.clone());
     let outcome = tokio::task::spawn_blocking(move || git::pull_ff(Path::new(&dir), &branch))
         .await
         .map_err(|e| format!("git worker failed: {e}"))??;
@@ -201,8 +201,7 @@ pub async fn pull(state: &Arc<AppState>, target: &Target) -> Result<git::PullOut
             ),
         );
     }
-    git::refresh_target(state, target.id, target.working_directory.clone(), target.git_branch.clone(), false)
-        .await;
+    git::refresh_target(state, target.id, git::repo_dir(target), target.git_branch.clone(), false).await;
     Ok(outcome)
 }
 
@@ -218,7 +217,7 @@ pub async fn deploy(
     if !is_service && is_running(state, target.id).await {
         return Err("target is already running".into());
     }
-    if pull_first && Path::new(&target.working_directory).join(".git").exists() {
+    if pull_first && Path::new(&git::repo_dir(target)).join(".git").exists() {
         pull(state, target).await.map_err(|e| format!("git pull failed: {e}"))?;
     }
     if is_service && is_running(state, target.id).await {
@@ -268,8 +267,7 @@ pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Resu
     if !is_service && is_running(state, target.id).await {
         return Err("target is already running".into());
     }
-    let (dir, branch, wanted) =
-        (target.working_directory.clone(), target.git_branch.clone(), sha.to_string());
+    let (dir, branch, wanted) = (git::repo_dir(target), target.git_branch.clone(), sha.to_string());
     let outcome = tokio::task::spawn_blocking(move || git::rollback_to(Path::new(&dir), &branch, &wanted))
         .await
         .map_err(|e| format!("git worker failed: {e}"))?
@@ -290,8 +288,7 @@ pub async fn rollback(state: &Arc<AppState>, target: &Target, sha: &str) -> Resu
             if target.auto_deploy { ". Auto-deploy was switched off." } else { "" }
         ),
     );
-    git::refresh_target(state, target.id, target.working_directory.clone(), target.git_branch.clone(), false)
-        .await;
+    git::refresh_target(state, target.id, git::repo_dir(target), target.git_branch.clone(), false).await;
     if is_service && is_running(state, target.id).await {
         runner::restart(state, target, "ROLLBACK").await
     } else {

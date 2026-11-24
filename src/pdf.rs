@@ -1,7 +1,9 @@
-//! A small PDF writer for the reports: pages, text in Helvetica and
-//! Helvetica-Bold, filled rectangles and lines. Those two fonts are among the
-//! 14 every PDF reader has built in, so nothing is embedded and no font or PDF
-//! library is linked: the output is plain PDF 1.4 text.
+//! A small PDF writer for the reports: pages, text in Helvetica,
+//! Helvetica-Bold and Courier, filled and outlined rectangles, lines, circles
+//! and JPEG images (the report logo). Those fonts are among the 14 every PDF
+//! reader has built in, so nothing is embedded and no font or PDF library is
+//! linked: the output is plain PDF 1.4. A JPEG is stored as it is (DCTDecode),
+//! so no image library is needed either.
 //!
 //! Coordinates are in points (1/72 inch) measured from the **top-left** of an
 //! A4 page; they are flipped to PDF's bottom-left origin when written.
@@ -15,10 +17,6 @@ pub const PAGE_H: f64 = 841.89;
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    pub fn hex(s: &str) -> Rgb {
-        let v = u32::from_str_radix(s.trim_start_matches('#'), 16).unwrap_or(0);
-        Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
-    }
     fn ops(self) -> String {
         format!("{:.3} {:.3} {:.3}", self.0 as f64 / 255.0, self.1 as f64 / 255.0, self.2 as f64 / 255.0)
     }
@@ -28,6 +26,8 @@ impl Rgb {
 pub enum Font {
     Regular,
     Bold,
+    /// Courier: every character is 0.6 em wide. For codes and hashes.
+    Mono,
 }
 
 impl Font {
@@ -35,6 +35,7 @@ impl Font {
         match self {
             Font::Regular => "F1",
             Font::Bold => "F2",
+            Font::Mono => "F3",
         }
     }
 }
@@ -81,6 +82,7 @@ pub fn text_width(text: &str, font: Font, size: f64) -> f64 {
     let table = match font {
         Font::Regular => &HELVETICA,
         Font::Bold => &HELVETICA_BOLD,
+        Font::Mono => return text.chars().count() as f64 * 0.6 * size,
     };
     let units: u32 = text
         .chars()
@@ -90,6 +92,71 @@ pub fn text_width(text: &str, font: Font, size: f64) -> f64 {
         })
         .sum();
     units as f64 * size / 1000.0
+}
+
+/// Width of `text` drawn with `spacing` points between characters.
+pub fn spaced_width(text: &str, font: Font, size: f64, spacing: f64) -> f64 {
+    text_width(text, font, size) + spacing * text.chars().count().saturating_sub(1) as f64
+}
+
+/// A JPEG image as it is stored in the PDF. Only baseline and progressive
+/// JPEGs with 1 (grey) or 3 (colour) components are accepted; a browser's
+/// canvas writes those.
+#[derive(Clone, Debug)]
+pub struct Jpeg {
+    data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    components: u8,
+}
+
+impl Jpeg {
+    /// Read the size and colour components from the frame header.
+    pub fn parse(bytes: &[u8]) -> Result<Jpeg, String> {
+        if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+            return Err("not a JPEG file".into());
+        }
+        let mut i = 2;
+        while i + 4 <= bytes.len() {
+            if bytes[i] != 0xFF {
+                return Err("damaged JPEG file".into());
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            let is_frame = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+            if is_frame {
+                if i + 10 > bytes.len() {
+                    break;
+                }
+                let height = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let width = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                let components = bytes[i + 9];
+                if !matches!(marker, 0xC0..=0xC2) {
+                    return Err("this kind of JPEG (lossless or arithmetic coded) is not supported".into());
+                }
+                if components != 1 && components != 3 {
+                    return Err("only grey or RGB JPEGs are supported (not CMYK)".into());
+                }
+                if width == 0 || height == 0 {
+                    return Err("the JPEG has no size".into());
+                }
+                return Ok(Jpeg { data: bytes.to_vec(), width, height, components });
+            }
+            if marker == 0xDA || marker == 0xD9 {
+                break;
+            }
+            i += 2 + len;
+        }
+        Err("no image size found in the JPEG".into())
+    }
 }
 
 /// Shorten `text` with an ellipsis so it fits in `max` points.
@@ -157,12 +224,51 @@ impl Page {
     }
 
     pub fn text(&mut self, x: f64, y: f64, text: &str, font: Font, size: f64, color: Rgb) {
+        self.text_spaced(x, y, text, font, size, color, 0.0);
+    }
+
+    /// Text with `spacing` points added after each character (letter spacing),
+    /// for the small capital labels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_spaced(
+        &mut self,
+        x: f64,
+        y: f64,
+        text: &str,
+        font: Font,
+        size: f64,
+        color: Rgb,
+        spacing: f64,
+    ) {
         // `y` is the top of the text box; the baseline sits about 0.8 em lower.
         let base = PAGE_H - y - size * 0.8;
-        self.push(&format!("BT {} rg /{} {size:.2} Tf {x:.2} {base:.2} Td (", color.ops(), font.res()));
+        self.push(&format!(
+            "BT {} rg /{} {size:.2} Tf {spacing:.2} Tc {x:.2} {base:.2} Td (",
+            color.ops(),
+            font.res()
+        ));
         let esc = escape(text);
         self.ops.extend_from_slice(&esc);
         self.push(") Tj ET\n");
+    }
+
+    pub fn text_center(&mut self, center: f64, y: f64, text: &str, font: Font, size: f64, color: Rgb) {
+        let w = text_width(text, font, size);
+        self.text(center - w / 2.0, y, text, font, size, color);
+    }
+
+    /// The outline of a rectangle.
+    pub fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, width: f64, color: Rgb) {
+        self.push(&format!(
+            "{} RG {width:.2} w {x:.2} {:.2} {w:.2} {h:.2} re S\n",
+            color.ops(),
+            PAGE_H - y - h
+        ));
+    }
+
+    /// Image number `index` (from `Document::add_jpeg`) in the box at x, y.
+    pub fn image(&mut self, index: usize, x: f64, y: f64, w: f64, h: f64) {
+        self.push(&format!("q {w:.2} 0 0 {h:.2} {x:.2} {:.2} cm /Im{index} Do Q\n", PAGE_H - y - h));
     }
 
     pub fn text_right(&mut self, right: f64, y: f64, text: &str, font: Font, size: f64, color: Rgb) {
@@ -195,12 +301,6 @@ impl Page {
         self.push("f\n");
     }
 
-    pub fn ring(&mut self, cx: f64, cy: f64, r: f64, width: f64, color: Rgb) {
-        self.push(&format!("{} RG {width:.2} w ", color.ops()));
-        self.circle_path(cx, cy, r);
-        self.push("S\n");
-    }
-
     pub fn line(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: Rgb) {
         self.push(&format!(
             "{} RG {width:.2} w {x1:.2} {:.2} m {x2:.2} {:.2} l S\n",
@@ -215,11 +315,18 @@ impl Page {
 pub struct Document {
     pages: Vec<Page>,
     title: String,
+    images: Vec<Jpeg>,
 }
 
 impl Document {
     pub fn new(title: &str) -> Self {
-        Self { pages: Vec::new(), title: title.to_string() }
+        Self { pages: Vec::new(), title: title.to_string(), images: Vec::new() }
+    }
+
+    /// Add an image that pages can draw with `Page::image`; returns its number.
+    pub fn add_jpeg(&mut self, image: Jpeg) -> usize {
+        self.images.push(image);
+        self.images.len() - 1
     }
 
     pub fn add_page(&mut self) -> &mut Page {
@@ -240,8 +347,11 @@ impl Document {
         let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets: Vec<usize> = Vec::new();
         let n = self.pages.len();
-        // Object numbers: 1 catalog, 2 pages, 3-4 fonts, 5 info, then (page, content) pairs.
-        let page_obj = |i: usize| 6 + i * 2;
+        let images = self.images.len();
+        // Object numbers: 1 catalog, 2 pages, 3-5 fonts, 6 info, then the
+        // images, then (page, content) pairs.
+        let image_obj = |i: usize| 7 + i;
+        let page_obj = |i: usize| 7 + images + i * 2;
         let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
             offsets.push(out.len());
             let num = offsets.len();
@@ -252,7 +362,7 @@ impl Document {
         obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
         let kids: String = (0..n).map(|i| format!("{} 0 R ", page_obj(i))).collect();
         obj(&mut out, &mut offsets, format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>").as_bytes());
-        for base in ["Helvetica", "Helvetica-Bold"] {
+        for base in ["Helvetica", "Helvetica-Bold", "Courier"] {
             obj(
                 &mut out,
                 &mut offsets,
@@ -264,10 +374,26 @@ impl Document {
         info.extend(escape(&self.title));
         info.extend_from_slice(b") >>");
         obj(&mut out, &mut offsets, &info);
+        for img in &self.images {
+            let space = if img.components == 1 { "DeviceGray" } else { "DeviceRGB" };
+            let mut body = format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{space} \
+                 /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+                img.width,
+                img.height,
+                img.data.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(&img.data);
+            body.extend_from_slice(b"\nendstream");
+            obj(&mut out, &mut offsets, &body);
+        }
+        let xobjects: String = (0..images).map(|i| format!("/Im{i} {} 0 R ", image_obj(i))).collect();
+        let xobjects = if images > 0 { format!(" /XObject << {xobjects}>>") } else { String::new() };
         for (i, page) in self.pages.into_iter().enumerate() {
             let page_body = format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] \
-                 /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {} 0 R >>",
+                 /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >>{xobjects} >> /Contents {} 0 R >>",
                 page_obj(i) + 1
             );
             obj(&mut out, &mut offsets, page_body.as_bytes());
@@ -283,7 +409,7 @@ impl Document {
         }
         let _ = write!(
             xref,
-            "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
             offsets.len() + 1
         );
         out.extend_from_slice(xref.as_bytes());
@@ -319,11 +445,41 @@ mod tests {
         assert_eq!(escape("\u{2014}\u{4e2d}"), vec![0x97, b'?']);
     }
 
+    /// The smallest JPEG header that names a size: SOI, an APP0 segment, SOF0.
+    fn tiny_jpeg(w: u16, h: u16, components: u8) -> Vec<u8> {
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+        b.extend(h.to_be_bytes());
+        b.extend(w.to_be_bytes());
+        b.extend([components, 0x01, 0x11, 0x00, 0xFF, 0xD9]);
+        b
+    }
+
+    #[test]
+    fn reads_jpeg_sizes_and_refuses_other_files() {
+        let j = Jpeg::parse(&tiny_jpeg(320, 80, 3)).unwrap();
+        assert_eq!((j.width, j.height, j.components), (320, 80, 3));
+        assert!(Jpeg::parse(b"\x89PNG\r\n").is_err());
+        assert!(Jpeg::parse(&tiny_jpeg(10, 10, 4)).unwrap_err().contains("CMYK"));
+    }
+
+    #[test]
+    fn images_and_the_mono_font_are_referenced_from_every_page() {
+        let mut doc = Document::new("Logo");
+        let img = doc.add_jpeg(Jpeg::parse(&tiny_jpeg(40, 20, 3)).unwrap());
+        doc.add_page().image(img, 40.0, 40.0, 80.0, 40.0);
+        doc.add_page().text(40.0, 40.0, "ABC123", Font::Mono, 9.0, Rgb(0, 0, 0));
+        let text = String::from_utf8_lossy(&doc.finish()).into_owned();
+        assert!(text.contains("/Filter /DCTDecode") && text.contains("/Width 40 /Height 20"));
+        assert_eq!(text.matches("/XObject << /Im0 7 0 R >>").count(), 2);
+        assert!(text.contains("/BaseFont /Courier"));
+        assert!((text_width("ABCD", Font::Mono, 10.0) - 24.0).abs() < 1e-9);
+    }
+
     #[test]
     fn writes_a_valid_document_structure() {
         let mut doc = Document::new("Test (report)");
         let p = doc.add_page();
-        p.text(40.0, 40.0, "Hello", Font::Bold, 12.0, Rgb::hex("#7c3aed"));
+        p.text(40.0, 40.0, "Hello", Font::Bold, 12.0, Rgb(0x7c, 0x3a, 0xed));
         p.rect(40.0, 60.0, 100.0, 20.0, Rgb(240, 240, 240));
         doc.add_page().line(40.0, 40.0, 200.0, 40.0, 1.0, Rgb(0, 0, 0));
         let bytes = doc.finish();
@@ -337,7 +493,7 @@ mod tests {
             std::str::from_utf8(&bytes[sx..]).unwrap().lines().next().unwrap().parse().unwrap();
         let table = std::str::from_utf8(&bytes[xref_at..]).unwrap();
         let entries: Vec<&str> = table.lines().skip(3).take_while(|l| l.ends_with(" n ")).collect();
-        assert_eq!(entries.len(), 9, "catalog, pages, 2 fonts, info, 2 x (page, content)");
+        assert_eq!(entries.len(), 10, "catalog, pages, 3 fonts, info, 2 x (page, content)");
         for (n, line) in entries.iter().enumerate() {
             let off: usize = line[..10].parse().unwrap();
             assert!(

@@ -7,9 +7,9 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.8.0 |
-| Application version | 0.13.0 (`Cargo.toml`) |
-| Last updated | 2026-11-16 |
+| Document version | 1.9.0 |
+| Application version | 0.14.0 (`Cargo.toml`) |
+| Last updated | 2026-11-24 |
 
 ## 1. System Overview
 
@@ -103,7 +103,7 @@ its own installer (3.8); it creates its data folder on first start.
 | Windows system calls | windows-sys | Attaching to the parent terminal and the native About window (`TaskDialogIndirect`) |
 | Login autostart | Registry Run key (winreg), launchd agent, systemd user unit | `autostart.rs` |
 | External tools, optional | `bandit`, `pip-audit` | Only for security scans. PortalControl installs them itself into `<data>/tools/venv` when a scan finds them missing or broken (`toolbox.rs`); a copy on PATH is used when it has none. Installing needs Python 3 and PyPI |
-| PDF | Built-in writer (`pdf.rs`) | Reports use the standard Helvetica fonts every PDF reader has, so nothing is embedded and no PDF library is linked |
+| PDF | Built-in writer (`pdf.rs`) | Reports use the standard Helvetica and Courier fonts every PDF reader has, so no font is embedded and no PDF library is linked. The report logo is a JPEG stored in the PDF as it is (DCTDecode), so no image library is linked either |
 | Deployment | The program installs itself (`install.rs`, 3.8) | Windows build links the C runtime statically (`.cargo/config.toml`). macOS: `scripts/make-macos-app.sh` builds `PortalControl.app` |
 | Local AI model, optional | Ollama over plain HTTP (`ollama.rs`) | Explains incidents and investigates suspected attacks. Runs on this machine or a trusted one; nothing is sent to a cloud service |
 | Email alerts, optional | Built-in SMTP client (`mail.rs`) with tokio-rustls and webpki-roots | STARTTLS, implicit TLS or a plain local relay |
@@ -142,12 +142,14 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `main.rs` | Command line (`serve`, `stop`, `install`, `install-autostart`, `uninstall-autostart`, `autostart-status`, `reset-password`, `about`), start-up order, the install sequence, repair of the login entry at start, opening and re-trying the network address, shutdown, tray status text, author and build details |
 | `install.rs` | Where the program is installed, replacing the installed copy, the "Install?" question of a double-clicked copy, the Start Menu shortcut (see 3.8) |
 | `monitor.rs` | The log monitor (added in 0.10.0): rules and learned patterns over every target's output, incidents, the AI stage with its two briefs (fault, attack), alert emails |
+| `diagnose.rs` | Diagnosis by rules (0.14.0): known error signatures (missing migrations or packages, port in use, a dependency down, out of memory, code errors, missing settings, disk full, locked SQLite, ...) and a general diagnosis per incident kind, each with a cause, steps and the offered fix that applies; the key error line of a log (see 3.13) |
+| `posture.rs` | Security posture (0.14.0): checks of PortalControl's own settings and of each target's scans, environment values, repository and webhooks, the score and grade, the CVE ids of vulnerable packages (see 3.14). Pure functions, stores nothing |
 | `threat.rs` | Attack detection: reads requests out of log lines, rules per target, the evidence text for the investigation (see 3.9) |
 | `ollama.rs` | Client for a local Ollama server: list models, ask for an answer in a JSON schema |
 | `mail.rs`, `alerts.rs` | SMTP client; alert settings, throttling and sending |
 | `analytics.rs` | Analytics over everything stored (added in 0.12.0): figures per target and for the machine, the reliability score, the findings (see 3.10). Stores nothing |
 | `api/analytics.rs` | `GET /api/analytics`: hands the period, the time and the local time zone to `analytics.rs` |
-| `api/incidents.rs` | Incidents, applying a suggested fix, monitor and alert settings, traces, live counters, download of the Django middleware |
+| `api/incidents.rs` | Incidents, changing or deleting many at once (`POST /api/incidents/bulk`, 0.14.0), applying a suggested fix, monitor and alert settings, traces, live counters, download of the Django middleware |
 | `api/repos.rs` | Cloning a repository for a new target and stored access tokens (added in 0.10.0) |
 | `api/mod.rs` | The router, the embedded dashboard assets and the helpers every handler shares |
 | `api/access.rs` | Sign-in, sessions and the request guards (allowed hosts, same-origin, network gate) |
@@ -162,12 +164,12 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `api/detect.rs` | Project detection, generated start scripts, folder browsing, companion processes and launchers |
 | `api/manager.rs` | System info, the manager's log, start at login, shutdown / restart, network settings |
 | `api/ws.rs` | The event WebSocket |
-| `api/reports.rs` | Collects target views, runs, scans and 24-hour metrics into a report and returns the PDF |
+| `api/reports.rs` | Collects target views, runs, scans, 24-hour metrics, the 7-day analytics and the incidents into a report and returns the PDF; the security report and `GET /api/security/posture`; the report branding and logo (see 3.14) |
 | `state.rs` | `AppState`: everything kept in memory and shared between modules |
 | `db.rs` | Schema, migrations and all SQL. Each call runs on the blocking pool. That pool must not be capped low: on Windows every output pipe of a running process (two per service) holds one of its threads while waiting for output, so the limit is tokio's default of 512 (`MAX_BLOCKING_THREADS` in `main.rs`) |
 | `runner.rs` | Starts scripts and one-off commands, pumps their output, enforces timeouts, kills process trees, queues crashed services for restart |
 | `pyenv.rs` | Works out and activates a target's Python environment (see 3.6) |
-| `git.rs` | Worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files; the pull plan, the text of a change and undoing local changes (see 3.11) |
+| `git.rs` | Where a target's repository is (`repo_dir`, 3.12); worker that inspects each repository (30 s) and fetches `origin` (5 min); fast-forward pull, rollback, commit log, changed files; the pull plan, the text of a change and undoing local changes (see 3.11) |
 | `health.rs` | Worker that probes each health URL (15 s) with a small built-in HTTP/1.1 client: `LIVE`, `SLOW`, `DOWN`. A process in its first 30 s that is not answering yet is not recorded as DOWN (startup grace); the probe right after a planned stop or restart, and routine probes of a service that is stopped on purpose or not started yet, update the status without counting as an outage. A service whose last run failed has crashed, and that is recorded |
 | `metrics.rs` | Worker that samples the host and every process tree (5 s), keeps 15 minutes in memory and one row per target per minute in SQLite for 7 days |
 | `automation.rs` | Cron schedules, deploy (pull then run), auto-deploy on new commits, auto-restart with crash-loop detection, deploy webhooks |
@@ -175,8 +177,8 @@ updated (`toolbox.rs`), which happens only when a scan needs them or from Settin
 | `webhook.rs` | Checks an inbound deploy webhook: signing secret (HMAC or header), branch filter, ping |
 | `security.rs` | Runs `bandit` and `pip-audit`, reduces their JSON to counters, stores the report. A missing or broken tool triggers one install through `toolbox.rs` and a retry. A `requirements.txt` that pins every version is audited with `--no-deps --disable-pip`, so nothing is installed or built to resolve it |
 | `toolbox.rs` | Self-healing scanner tools: the managed virtualenv in `<data>/tools/venv`, finding a system Python (the `py` launcher first on Windows), install / repair (`--force-reinstall`) / upgrade, status for Settings |
-| `pdf.rs` | Minimal PDF 1.4 writer: pages, Helvetica text with exact widths, wrapping, rectangles, lines, circles |
-| `report.rs` | The overall and project reports: layout with page breaks and repeating table headers, the dashboard's status rules, the needs-attention rules |
+| `pdf.rs` | Minimal PDF 1.4 writer: pages, Helvetica and Courier text with exact widths, letter spacing, wrapping, filled and outlined rectangles, lines, circles, JPEG images |
+| `report.rs` | The status, site and security reports in the certificate layout (3.14): frame, masthead with logo, serial box, verdict, figure grid, banded sections, wrapping tables with repeating headers, the day chart, sign-off and the seal footer; the dashboard's status rules, the needs-attention rules |
 | `backup.rs` | Consistent SQLite snapshots of a target's database (`VACUUM INTO`), restore, pruning |
 | `auth.rs` | Optional dashboard password, sessions, sign-in lockout, the control token |
 | `net.rs` | Which addresses may be bound and which `Host` values are answered |
@@ -197,14 +199,15 @@ global functions. Routing is by URL hash (`#/target/3/logs`).
 | `js/core/components.js` | Charts, the log viewer, and small pieces (tables, tiles, form fields) |
 | `js/core/router.js` | Hash routing, the view lifecycle and the sidebar |
 | `js/core/app.js` | Notifications, command palette, data refresh, WebSocket, start-up |
-| `js/pages/home.js` | Dashboard and Projects |
+| `js/pages/home.js` | Dashboard (with the 24-hour charts and the state ring of 0.14.0) and Projects |
 | `js/pages/project.js` | Project page (grouped terminals) |
 | `js/pages/new.js` | New Target page with project detection |
-| `js/pages/lists.js` | Deployments, Security and Activity pages |
+| `js/pages/lists.js` | Deployments, Security (with the security posture, 0.14.0) and Activity pages |
 | `js/pages/about.js` | About page |
-| `js/pages/incidents.js`, `js/pages/flow.js` | Incidents page; live diagram of the monitor pipeline (added in 0.10.0). The diagram has room for five sources and shows the targets that printed the most; the table under it ("Where the lines come from", 0.11.1) lists every target with its lines, share, error lines and patterns since the manager started |
+| `js/pages/incidents.js`, `js/pages/flow.js` | Incidents page (0.14.0: filters, selection and bulk actions, the details of each incident; the diagram moved under the list); live diagram of the monitor pipeline (added in 0.10.0). The diagram has room for five sources and shows the targets that printed the most; the table under it ("Where the lines come from", 0.11.1) lists every target with its lines, share, error lines and patterns since the manager started |
 | `js/pages/analytics.js` | Analytics page (0.12.0): summary tiles, findings, trend charts, runs and incidents per day or hour, the weekday-by-hour grid of failures, the sortable table that compares targets, projects, monitor and AI figures (see 3.10) |
 | `js/settings/monitor.js` | Settings sections Email Alerts and AI Monitor, with the attack-detection note and middleware download |
+| `js/settings/reports.js` | Settings section Reports (0.14.0): organisation, address, contact, signatory, note, the logo (converted to JPEG in the browser) and the three report downloads |
 | `js/target/target.js` | The target page frame: header, tabs, saving |
 | `js/target/config.js` | Configuration tab, one function per section (`CFG.general`, `CFG.git`, ...) |
 | `js/target/python.js` | Configuration section "Python Environment" (`CFG.python`) |
@@ -479,6 +482,101 @@ browser; a leading `export ` is dropped. With nothing stored and a `.env` presen
 loaded when the section opens. Nothing is stored until Save, and the stored copy does not
 follow later edits of the file.
 
+### 3.12 Where the Git repository is (0.14.0)
+
+A target's repository need not be its working directory. `portal_targets.git_dir` holds,
+like `python_env` (3.6):
+
+| Value | Meaning |
+| --- | --- |
+| empty | The working directory, as before 0.14.0 |
+| `auto` | The nearest folder at or above the working directory that holds a repository (`git2::Repository::discover`); the working directory when there is none |
+| a folder | That folder, wherever it is; a relative path is taken from the working directory; choosing the `.git` folder means its parent |
+
+`git::repo_dir` resolves it, and every Git operation uses it: the worker, refresh, the
+commit log, changed files, the pull plan, the change of a file, undoing changes, pull,
+deploy, auto-deploy and rollback. Scripts still run in the working directory. Saving
+checks a chosen folder (it must exist and hold a repository); `auto` is always accepted.
+`GET /api/fs/repo?dir=&git_dir=` says where a setting leads without storing it, and the
+target view carries the resolved `repo_dir`. Configuration > Git Source has the choice,
+a Browse button and the live answer.
+
+### 3.13 Incident details and bulk actions (0.14.0)
+
+Every incident now carries `details`, a JSON object written when it is opened
+(`monitor::handle`):
+
+| Key | Holds |
+| --- | --- |
+| `context` | Project, run mode, running or not, the health check (status, latency, HTTP status, detail) and the Git state (branch, commit, behind, ahead, local changes) at that moment |
+| `run` | The run it is about: id, trigger, status, exit code, duration, commit |
+| `signals` | The rule's sentence, lines examined, error lines, the key error line (`diagnose::key_error`: the newest `XxxError:` line, else the newest error line) and the first error line |
+| `history` | Incidents of the same kind on the same target in the 24 hours and 7 days before, and when the last one was |
+| `diagnosis` | The rules' diagnosis (`diagnose.rs`): id, title, cause, steps, the matched line, the offered fix that applies |
+| `ai` | When the model answered: its key error line, steps and confidence (`low`, `medium`, `high`) |
+| `actions_offered`, `source` | The actions that were on offer; `ai`, `rules` or `rules_ai_failed` |
+
+Without an answer from the model (no model set up, or it failed), the diagnosis gives
+the incident its cause, its steps (`action_reason`) and, when the fix is on offer, its
+suggested action; a recognised error is added to the title. With a model, a recognised
+error is given to it as a hint, and the answer schema asks for `key_error`, `steps` and
+`confidence` before the action. Alert emails carry the key error and the steps.
+
+`POST /api/incidents/bulk` with `{ids, action}` sets `resolved`, `dismissed` or `open`
+(note "Marked ... in bulk") or deletes the incidents with their traces; at most 500 at
+once, written in one transaction, one Activity entry. The Incidents page filters by
+status, severity, kind, target and text, selects one, several or all shown, and shows
+the details of each incident.
+
+### 3.14 Reports, branding and the security posture (0.14.0)
+
+The three PDF reports share a layout modelled on a printed certificate: a double rule
+around each page; a masthead with the logo (or the organisation's name), its address and
+contact line, and a serial box with the report number (`OPS-`, `SITE-` or `SEC-`, the
+date and time, four hex digits) and a seal code; a centred title and lead; a verdict
+panel; a two-column grid of labelled figures; banded section headings; wrapping tables
+whose header repeats after a page break; a sign-off with a seal and a signature line; and
+on every page a footer with the page count, the time, the organisation, the host and the
+SHA-256 of the data the report states (`report::seal`).
+
+| Report | Route | Content |
+| --- | --- | --- |
+| Status | `GET /api/reports/overall.pdf` | Verdict, eight figures, items needing attention (with open incidents), runs per day for 7 days, sites, applications, notable events (failed runs, rollbacks, crash restarts, critical incidents; routine runs left out) |
+| Site | `GET /api/reports/project/{name}` | The same for one project, then per application (kept on one page): a path line, eight figures (status, availability and response, version, last deployment, resources, incidents, security, schedule) and its last five deployments without quick commands |
+| Security | `GET /api/reports/security.pdf` | Score and grade, six figures, priority actions (each finding with what to do), PortalControl's configuration checks, attacks of the last 30 days, code issues and vulnerable packages with CVE ids and fixed versions per application, method and scope |
+
+Removed as noise in 0.14.0: start order, Python environment, environment count and the
+auto flags per target, the 25 most recent runs, and the full scan findings in the site
+report (they are in the security report).
+
+**Branding.** `GET`/`PUT /api/settings/reports` store `{org_name, address, contact,
+prepared_by, signatory_title, note}` under the settings key `report_brand` (lengths
+checked). Without an organisation name the reports name `report::DEFAULT_ORG`,
+InsightFusionTech. `PUT /api/settings/reports/logo` takes a JPEG (grey or RGB, baseline or
+progressive, at most 1 MB) as the body and writes `report-logo.jpg` to the data folder;
+`GET` returns it and `DELETE` removes it. Settings > Reports converts any picture the
+browser can read to a JPEG on white of at most 900 by 400 pixels before sending it.
+
+**Security posture.** `posture::assess` turns facts into findings (high, medium, low),
+each with what was found and what to do, and checks of PortalControl itself. Score: 100
+minus 15 per high, 6 per medium and 2 per low finding; grade A from 90, B 80, C 70, D 60.
+
+| Checked | Finding |
+| --- | --- |
+| Dashboard password, network exposure, HTTPS on the network address, a time limit, the monitor, alert emails | Medium or low when missing; listed as Pass or Attention |
+| Scans | Never scanned (medium); high and medium bandit issues; vulnerable packages (high) with CVE ids from pip-audit's aliases and the lowest version that fixes every advisory; a scan part that failed or is older than 30 days (low) |
+| Environment (stored variables and the project's `.env`) | `DEBUG`, `DJANGO_DEBUG` or `FLASK_DEBUG` on for a service; `SECRET_KEY` the Django development default or shorter than 32 characters (high); `ALLOWED_HOSTS` with `*` (medium). Values are read, never reported |
+| Repository | Env files committed to its index (high, `git::tracked_env_files`); uncommitted changes (low) |
+| Webhook | A token without a signing secret (medium) |
+| Attacks | Open security incidents (high); closed ones in 30 days (low) |
+
+`GET /api/security/posture` returns the posture, the scan facts and the number of
+attacks; the Security page shows it, worked out again at most once a minute.
+
+**Dashboard charts.** The dashboard reads `GET /api/analytics?range=24h` once a minute and
+draws availability, response time, runs and incidents per hour, CPU and memory of all
+targets, and a ring of the targets' current states.
+
 ## 4. Data Models & State Management
 
 ### 4.1 Database
@@ -514,6 +612,7 @@ One SQLite file, `portalcontrol.db`, in the data folder
 | `backup_on_deploy` | INTEGER | Snapshot before each run |
 | `start_order` | INTEGER, default 0 | Position in the project's start sequence |
 | `python_env` | TEXT, nullable | See 3.6 (added in 0.5.0) |
+| `git_dir` | TEXT, nullable | Where the repository is: empty, `auto` or a folder (3.12, added in 0.14.0). Existing rows get NULL: the working directory, as before |
 
 **`process_execution_history`**: one row per run or quick command; the newest 200 per
 target are kept.
@@ -542,15 +641,17 @@ target are kept.
 each incident the trace of its analysis (trigger, prompt, model, answer, timing). The
 columns are in `db.rs` (`Incident`, `Trace`); an incident's `trigger` is one of `failure`,
 `crash_loop`, `health_down`, `deploy_failed`, `error_burst`, `new_error`, and since 0.11.0
-`attack`, `brute_force`, `flood`. 0.11.0 adds no tables or columns. The `settings` table
-also holds the keys `monitor`, `alerts` and `git_tokens`.
+`attack`, `brute_force`, `flood`. 0.11.0 adds no tables or columns. 0.14.0 adds
+`incidents.details` (TEXT, default `''`): the JSON object of 3.13; existing rows read as
+null. The `settings` table also holds the keys `monitor`, `alerts`, `git_tokens` and, since
+0.14.0, `report_brand` (3.14).
 
 **Migrations.** The base tables are created with `CREATE TABLE IF NOT EXISTS`. Columns
 added later are listed in `MIGRATIONS` in `db.rs` and applied with
 `add_column_if_missing` at every start, so an older database is upgraded in place and
 nothing is lost. Every added column is nullable or has a default.
 
-**Other files in the data folder.** `portalcontrol.log` (the manager's own log),
+**Other files in the data folder.** `report-logo.jpg` (the report logo, 0.14.0), `portalcontrol.log` (the manager's own log),
 `control.token` (see 5), `backups/<target id>/` (database snapshots).
 
 ### 4.2 In-memory state (`AppState`)
@@ -663,12 +764,26 @@ what a request can make it run.
   credentials are never stored; libgit2 uses the user's credential helper.
 - **Browser hardening.** A Content-Security-Policy allows scripts only from the program
   itself; there are no inline scripts.
+- **Reports and the security checks (0.14.0).** The security checks read environment
+  values (stored and from the project's `.env`) only to test them; findings, the posture
+  answer and the PDFs name the variable, never its value, which a test checks. The logo
+  upload accepts only a JPEG of at most 1 MB, checked by its header, and is stored under
+  a fixed name. A Git repository folder is only read and pulled into; scripts still run
+  in the working directory.
 - **Limits.** Log lines are capped at 8 KB; tasks are killed at their timeout; stdin is
   closed so a script cannot wait for input forever.
 
 ## 6. Current State & Known Limitations
 
-**Working and covered by tests (152 at the time of writing).** Pulling with local changes:
+**Working and covered by tests (167 at the time of writing).** 0.14.0: resolving the
+repository folder (empty, `auto` above the working directory and without a repository,
+relative, the `.git` folder) and checking it; committed env files; storing `git_dir`;
+incident details, similar-incident counts, bulk status and delete with traces; the rules'
+diagnosis (signatures, newest error first, fallback per kind, only offered fixes, attacks
+not read as errors) and the key error line; the model's extra fields; the posture (a
+clean setup, risky settings without showing values, CVE ids and the covering fix, `.env`
+reading); JPEG headers, images and Courier in the PDF; the three reports (no secrets,
+seal, logo and branding, page breaks, CVEs). Pulling with local changes:
 the plan naming the path in the way, the pull refusing with it and working once it is
 moved out, other local changes surviving the pull, the text of a change, undoing tracked
 and untracked changes with copies kept, refusal of paths without a change; finding the env
@@ -690,7 +805,14 @@ scan parsing, SQLite backups and restore, projects with start order, project det
 with generated start scripts and worker launchers (qcluster, Celery, Node), password
 protection with per-client sign-in lockout, export and import (variable values only on request), login autostart, Python environment selection, validation of network settings, webhook signatures and branch filter, encryption at rest of stored secrets, the health startup grace and the rule that a stopped service is not an outage, recognising pinned requirements, the PDF writer (structure, offsets, measuring, wrapping) and both reports (no secrets, page breaks), recognising broken tool installs.
 
-**Working, checked by hand only.** Network access end to end on Windows (HTTPS on a
+**Working, checked by hand only.** 0.14.0 on Windows against a scratch manager: a
+target in a subfolder of a repository with `auto` and with `..`, refusal of a missing and
+of a non-repository folder, a failing script opening a rules-only incident with its
+diagnosis, key error and details, bulk resolve and reopen, the posture finding a weak
+secret key, a committed `.env` and `ALLOWED_HOSTS=*` with no value in the answer or the
+PDFs, the logo upload, and the three reports rendered and looked at page by page; the
+dashboard charts, Incidents, Security, Settings > Reports and Git Source pages in Chrome.
+The AI model's new fields were not run against Ollama. Network access end to end on Windows (HTTPS on a
 LAN address with a self-signed certificate, host names, restart from the dashboard,
 password rules) and the per-target Network page with a generated start script. The
 dashboard pages, the Windows tray icon and its
@@ -798,6 +920,12 @@ quick-command timeout 900 s, default port 7878.
 - No Linux tray icon.
 - The frontend uses global functions across script files; load order matters.
 - No automated browser tests.
+- The security checks of environment values know Django and Flask names only, and read
+  only the `.env` in the working directory. The posture is worked out on each request.
+- Incident details are recorded from 0.14.0 on; older incidents show their stored text
+  only. The rules' diagnosis matches phrases, so an unusual message falls back to the
+  general diagnosis of its kind.
+- The report logo must become a JPEG: transparency is flattened onto white.
 
 **Next steps under consideration.** Run the macOS build and fix what it shows; use the
 target's Python environment for security scans.
@@ -840,6 +968,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.9.0 | 0.14.0 | 2026-11-24 | **Git repository folder** (3.12): new column `portal_targets.git_dir` (empty, `auto`, a folder), `git::repo_dir`, `check_repo_dir`, `GET /api/fs/repo`, `repo_dir` in the target view; every Git operation uses it; Git Source gained the choice with Browse. **Incidents** (3.13): new column `incidents.details` (context, run, signals, history, diagnosis, AI fields, source); new `diagnose.rs` explains incidents without a model and suggests an offered fix; the model's schema gained `key_error`, `steps`, `confidence`; emails carry the key error and steps; `POST /api/incidents/bulk`; the Incidents page gained counts, filters, selection, bulk actions and the details. **Reports** (3.14): the status, site and security reports rebuilt in a certificate layout with less noise; report branding (`report_brand`, `GET`/`PUT /api/settings/reports`) and logo (`report-logo.jpg`, `/api/settings/reports/logo`); Settings > Reports; `pdf.rs` gained Courier, letter spacing, outlined rectangles and JPEG images. **Security**: new `posture.rs`, `GET /api/security/posture`, `GET /api/reports/security.pdf`, CVE ids of vulnerable packages, the posture on the Security page. **Dashboard**: 24-hour charts and a ring of target states; links to the status and security reports. 15 new tests (167). |
 | 1.8.0 | 0.13.0 | 2026-11-16 | **A blocked pull says what blocks it** (section 3.11). `pull_ff` no longer refuses for any local change to a tracked file: it refuses only when a path changed on this computer is also changed by the commits being pulled, and names those paths; other local changes are kept. This also applies to deploy and auto-deploy. New `git::pull_plan`, `file_diff`, `discard_changes` and `GET /api/targets/{id}/git/plan`, `GET …/git/diff?path=`, `POST …/git/discard`; undone changes are first copied to `<data>/git-backups/<target id>/<time>/`. Git Source shows the plan in a sentence, marks each local change, lists the incoming files, and offers Show change, Undo / Remove and "Undo these and pull". **Env files**: `GET /api/targets/{id}/env/files`; the Environment Variables section loads the project's `.env` when nothing is stored, or a chosen file, into its box. Section 6 gained the macOS install that was run over SSH. No schema change. 2 new tests (152). |
 | 1.7.0 | 0.12.0 | 2026-11-16 | **Analytics page** (`analytics.rs`, `api/analytics.rs`, `js/pages/analytics.js`, section 3.10): `GET /api/analytics?range=24h\|7d\|30d` works out, from the minute rows, runs, incidents, AI traces, scans and the monitor's counters, figures per target and for the machine (availability, response time, CPU, memory, outages, time to recover and between outages, runs, crash restarts, incidents, log lines), a memory trend that marks steady growth, a check of the last hour's response time against the time before, a reliability score whose every deduction is named, a timeline and a weekday-by-hour grid of failures in local time, a roll-up per project, and a list of findings. The page shows them with a sortable table that compares the targets. New sidebar entry and `chart` icon; Incidents and Analytics added to the command palette. Nothing is stored and there is no schema change. 8 new tests (150). |
 | 1.6.1 | 0.11.1 | 2026-11-16 | **Monitor view names the source of the lines.** The pipeline diagram drew the first five targets of the list, so with more than five targets a target printing millions of lines could be one of the hidden ones while the five shown stood at 0.0 lines/s. It now draws the five that printed the most (running first) and gives the rest a dashed box of their own ("+N OTHER", or "NOT IN THE LIST" for a process whose target the page does not know): before, the moving dots of an undrawn target were drawn on the line of the last box, as if that target had printed them; a table under it lists every target with lines, share, error lines, patterns and current rate, busiest first, and opens the target on a click. `GET /api/monitor/stats` gained `error_lines` per target (`Watch::seen_errors`); counters of deleted targets are dropped; the header says "lines since start" (the count is cumulative, the log view keeps the last 2,000 lines per target). **A companion process is not added twice** (`detect.rs`: `Worker::started_by`, `scripts_starting`): when a script in the project folder already starts the Django-Q cluster, the Celery worker or beat, or the npm process (a non-comment line with the command), `GET /api/fs/inspect` names it in `workers[].started_by`; the New target page then leaves "Also add" unticked and says why, and the Configuration tab and its confirmation warn. Found on a Mac where `start.sh` and the generated `portalcontrol_qcluster.sh` ran two clusters on one SQLite database and printed 17 million lines in an hour. No schema change. |
