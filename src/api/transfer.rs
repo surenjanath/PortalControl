@@ -35,7 +35,7 @@ pub(super) async fn export_config(State(state): State<Arc<AppState>>, Query(q): 
                 "env_vars": if with_values { t.env_vars.clone() } else { without_env_values(&t.env_vars) },
                 "schedule": t.schedule, "auto_deploy": t.auto_deploy, "auto_restart": t.auto_restart,
                 "db_file": t.db_file, "backup_on_deploy": t.backup_on_deploy,
-                "start_order": t.start_order, "python_env": t.python_env,
+                "start_order": t.start_order, "python_env": t.python_env, "git_dir": t.git_dir,
             })
         })
         .collect();

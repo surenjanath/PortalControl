@@ -214,6 +214,7 @@ mod tests {
             start_order: 0,
             python_env: None,
             webhook_secret: None,
+            git_dir: None,
         }
     }
 

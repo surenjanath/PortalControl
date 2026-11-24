@@ -23,6 +23,81 @@ const FETCH_INTERVAL: Duration = Duration::from_secs(300);
 /// How often the local working tree is re-inspected (no network).
 const INSPECT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The `git_dir` setting that searches upward from the working directory.
+pub const AUTO: &str = "auto";
+
+/// The folder of a target's repository (its working tree), from the
+/// working directory and the target's `git_dir` setting:
+///
+/// * empty: the working directory itself (what every target had before 0.14.0);
+/// * `auto`: the nearest folder at or above the working directory that holds
+///   a repository, for a project kept in a subfolder of one;
+/// * a folder: that folder, wherever it is; a relative path is taken from the
+///   working directory. Choosing the `.git` folder itself means its parent.
+pub fn repo_dir_of(working_directory: &str, git_dir: Option<&str>) -> PathBuf {
+    let base = Path::new(working_directory);
+    match git_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        None => base.to_path_buf(),
+        Some(s) if s.eq_ignore_ascii_case(AUTO) => Repository::discover(base)
+            .ok()
+            .and_then(|r| {
+                r.workdir().map(|w| PathBuf::from(w.to_string_lossy().trim_end_matches(['/', '\\'])))
+            })
+            .unwrap_or_else(|| base.to_path_buf()),
+        Some(s) => {
+            let p = Path::new(s);
+            let p = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+            if p.file_name().is_some_and(|n| n == ".git") {
+                p.parent().map(Path::to_path_buf).unwrap_or(p)
+            } else {
+                p
+            }
+        }
+    }
+}
+
+/// The repository folder of a target, as a string for the workers.
+pub fn repo_dir(t: &crate::db::Target) -> String {
+    repo_dir_of(&t.working_directory, t.git_dir.as_deref()).to_string_lossy().into_owned()
+}
+
+/// Check a `git_dir` setting before it is saved. `auto` is always accepted
+/// (a target need not be in a repository); a chosen folder must exist and
+/// hold a repository, so a typing error is caught at once.
+pub fn check_repo_dir(working_directory: &str, git_dir: &str) -> Result<(), String> {
+    if git_dir.eq_ignore_ascii_case(AUTO) {
+        return Ok(());
+    }
+    let dir = repo_dir_of(working_directory, Some(git_dir));
+    if !dir.is_dir() {
+        return Err(format!("the folder {} does not exist", dir.display()));
+    }
+    Repository::open(&dir)
+        .map(|_| ())
+        .map_err(|_| format!("{} is not a Git repository (it has no .git folder)", dir.display()))
+}
+
+/// Whether a file name is an env file that holds real values: `.env`,
+/// `.env.production`, `prod.env`, but not `.env.example` and the like.
+pub fn is_secret_env_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    (n == ".env" || n.starts_with(".env.") || n.ends_with(".env"))
+        && !["example", "sample", "template", "dist", "default"].iter().any(|w| n.contains(w))
+}
+
+/// Env files that are committed to the repository (in its index), so their
+/// secrets are in its history and on every clone. At most 20.
+pub fn tracked_env_files(dir: &Path) -> Vec<String> {
+    let Ok(repo) = Repository::open(dir) else { return Vec::new() };
+    let Ok(index) = repo.index() else { return Vec::new() };
+    index
+        .iter()
+        .filter_map(|e| String::from_utf8(e.path).ok())
+        .filter(|p| is_secret_env_name(p.rsplit('/').next().unwrap_or(p)))
+        .take(20)
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GitInfo {
     pub is_repo: bool,
@@ -975,14 +1050,8 @@ pub fn spawn_worker(state: Arc<AppState>) {
                 for t in targets {
                     let st = state.clone();
                     tokio::spawn(async move {
-                        let info = refresh_target(
-                            &st,
-                            t.id,
-                            t.working_directory.clone(),
-                            t.git_branch.clone(),
-                            do_fetch,
-                        )
-                        .await;
+                        let dir = repo_dir(&t);
+                        let info = refresh_target(&st, t.id, dir, t.git_branch.clone(), do_fetch).await;
                         if do_fetch && t.auto_deploy {
                             crate::automation::auto_deploy(&st, &t, &info).await;
                         }
@@ -1346,5 +1415,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         assert!(fetch(dir.path()).unwrap_err().contains("origin"));
+    }
+
+    #[test]
+    fn the_repository_can_be_above_or_away_from_the_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_path = root.path().join("repo");
+        let work = repo_path.join("src").join("app");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = init_repo(&repo_path);
+        let w = work.to_str().unwrap();
+        let same =
+            |a: PathBuf, b: &Path| std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap();
+
+        assert_eq!(repo_dir_of(w, None), work, "empty: the working directory");
+        assert!(same(repo_dir_of(w, Some("auto")), &repo_path), "auto: found above");
+        assert!(same(repo_dir_of(w, Some("../..")), &repo_path), "relative to the working directory");
+        assert_eq!(
+            repo_dir_of(w, Some(repo_path.join(".git").to_str().unwrap())),
+            repo_path,
+            ".git means its parent"
+        );
+        assert!(inspect(&repo_dir_of(w, Some("auto")), "main").is_repo);
+
+        assert!(check_repo_dir(w, "../..").is_ok());
+        assert!(check_repo_dir(w, "auto").is_ok());
+        assert!(check_repo_dir(w, ".").unwrap_err().contains("not a Git repository"));
+        assert!(check_repo_dir(w, "missing").unwrap_err().contains("does not exist"));
+        let lonely = tempfile::tempdir().unwrap();
+        let l = lonely.path().to_str().unwrap();
+        assert_eq!(repo_dir_of(l, Some("auto")), lonely.path(), "auto without a repository stays put");
+
+        std::fs::write(repo_path.join(".env"), "A=1\n").unwrap();
+        std::fs::write(repo_path.join(".env.example"), "A=\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".env")).unwrap();
+        index.add_path(Path::new(".env.example")).unwrap();
+        index.write().unwrap();
+        assert_eq!(tracked_env_files(&repo_path), [".env".to_string()]);
+        assert!(is_secret_env_name("prod.env") && !is_secret_env_name(".env.sample"));
     }
 }

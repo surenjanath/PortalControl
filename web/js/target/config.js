@@ -233,6 +233,38 @@ CFG.git = (ctx) => {
       }, () => {});
     };
     load();
+    // Where the repository is: the working directory (default), the nearest
+    // one above it, or any folder (like the Python environment).
+    const startRepo = !t.git_dir ? "" : t.git_dir === "auto" ? "auto" : "custom";
+    const repoMode = h("select", {},
+      h("option", { value: "" }, "The working directory"),
+      h("option", { value: "auto" }, "Search upward from the working directory"),
+      h("option", { value: "custom" }, "A folder I choose"));
+    repoMode.value = startRepo;
+    const repoPath = h("input", { type: "text", spellcheck: "false", value: startRepo === "custom" ? t.git_dir : "",
+      placeholder: navigator.platform.startsWith("Win") ? "D:\\repos\\my-site  or  .." : "/srv/repos/my-site  or  .." });
+    const repoResult = h("div", { class: "hint", style: "margin:-6px 0 14px" });
+    const repoSetting = () => (repoMode.value === "custom" ? repoPath.value.trim() : repoMode.value);
+    let repoSeq = 0;
+    const checkRepo = async () => {
+      repoWrap.style.display = repoMode.value === "custom" ? "" : "none";
+      if (repoMode.value === "custom" && !repoPath.value.trim()) return repoResult.replaceChildren("Choose or type the folder that holds the .git folder.");
+      const mine = ++repoSeq;
+      try {
+        const r = await api("GET", "/api/fs/repo?dir=" + encodeURIComponent(t.working_directory) + "&git_dir=" + encodeURIComponent(repoSetting()));
+        if (mine !== repoSeq) return;
+        repoResult.replaceChildren(r.error ? h("span", { class: "errtxt" }, r.error)
+          : r.found ? h("span", {}, "Repository found: ", h("span", { class: "mono" }, r.path), r.branch ? " \u00b7 on " + r.branch : "", r.remote_url ? [" \u00b7 ", h("span", { class: "mono" }, r.remote_url)] : "")
+          : h("span", {}, "No repository at ", h("span", { class: "mono" }, r.path), repoMode.value === "auto" ? " or in a folder above it." : "."));
+      } catch (e) { if (mine === repoSeq) repoResult.replaceChildren(h("span", { class: "errtxt" }, e.message)); }
+    };
+    const repoWrap = field("Repository folder", h("div", { class: "rowf", style: "flex-wrap:nowrap" }, repoPath,
+      btn("Browse\u2026", () => pickFolder(repoPath.value.trim() || t.working_directory, (p) => { repoPath.value = p; checkRepo(); }), "", "box")),
+      "The folder that holds the .git folder. A relative path is taken from the working directory.");
+    repoMode.onchange = checkRepo;
+    let repoTimer = null;
+    repoPath.oninput = () => { clearTimeout(repoTimer); repoTimer = setTimeout(checkRepo, 350); };
+    checkRepo();
     let lastHead = t.git && t.git.head + "|" + t.git.remote_head + "|" + t.git.dirty_files;
     ctx.onUpdate = () => { const x = T(id); const k = x && x.git && x.git.head + "|" + x.git.remote_head + "|" + x.git.dirty_files; if (k !== lastHead) { lastHead = k; load(); } };
     return [
@@ -240,7 +272,8 @@ CFG.git = (ctx) => {
       live((x) => {
         const g = x.git;
         if (!g) return h("div", { class: "box muted" }, "Inspecting repository\u2026");
-        if (!g.is_repo) return h("div", { class: "note-box" }, g.error || "This directory is not a Git repository, so there is nothing to track. Deployments still work.");
+        if (!g.is_repo) return h("div", { class: "note-box" }, g.error || ["No Git repository at ", h("span", { class: "mono" }, x.repo_dir || x.working_directory),
+          ", so there is nothing to track. Deployments still work. If the repository is in another folder, choose it under Git repository below."]);
         const canPull = plan ? plan.can_pull : g.behind > 0 && g.ahead === 0;
         return h("div", { class: "box", style: "margin-bottom:22px" },
           h("div", { class: "rowf", style: "margin-bottom:12px" }, gitTag(x),
@@ -255,9 +288,11 @@ CFG.git = (ctx) => {
           ]));
       }),
       saveForm(t, [
+        field("Git repository", repoMode, "Projects whose repository is not their working directory: a subfolder of a repository, or a repository kept elsewhere. Pull, deploy, rollback and the Git state all use it."),
+        repoWrap, repoResult,
         field("Branch to track", branch, "Compared against origin/<branch>. Origin is fetched every 5 minutes; fetching never changes your files."),
         check(auto, "Auto-deploy", "When origin has new commits, fast-forward the working tree and run the script (a running service is restarted). Skipped if a file edited on this computer is also changed by the new commits, or the branch has unpushed commits."),
-      ], () => ({ git_branch: branch.value, auto_deploy: auto.checked })),
+      ], () => ({ git_dir: repoSetting(), git_branch: branch.value, auto_deploy: auto.checked }), "Git settings saved"),
       h("h3", {}, "Changes on this computer"), changes, diffBox, incoming, h("h3", {}, "Commits"), commits,
     ];
 };

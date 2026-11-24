@@ -25,12 +25,47 @@ function deploymentsView() {
   };
   return def;
 }
+// The security posture (posture.rs): score, grade and what to improve, most
+// serious first; the same findings make up the security assessment report.
+const POSTURE_LEVEL = { high: ["err", "High"], medium: ["warn", "Medium"], low: ["info", "Low"] };
+function postureBox(p, err) {
+  if (err) return h("div", { class: "note-box err" }, "The security checks could not be worked out: " + err);
+  if (!p) return h("div", { class: "box muted", style: "margin-bottom:18px" }, "Working out the security checks…");
+  const ps = p.posture;
+  const cls = ps.grade === "A" || ps.grade === "B" ? "ok" : ps.grade === "C" ? "warn" : "err";
+  const shown = ps.findings.slice(0, 12);
+  return h("div", { class: "box posture", style: "margin-bottom:18px" },
+    h("div", { class: "posture-top" },
+      h("div", { class: "grade " + cls, title: "100 minus 15 per high, 6 per medium and 2 per low finding" }, ps.grade, h("small", {}, ps.score + " / 100")),
+      h("div", { class: "grow" }, h("b", {}, ps.findings.length ? ps.findings.length + " thing" + (ps.findings.length === 1 ? "" : "s") + " to improve" : "Nothing to improve was found"),
+        h("div", { class: "muted small", style: "margin-top:4px" }, ps.high + " high · " + ps.medium + " medium · " + ps.low + " low · " + p.attacks_30d + " attack" + (p.attacks_30d === 1 ? "" : "s") + " in the last 30 days"),
+        h("div", { class: "rowf", style: "margin-top:10px" }, reportLink("/api/reports/security.pdf", "Security assessment (PDF)", "sm"))),
+      h("div", { class: "posture-checks" }, ps.checks.map((c) => h("div", { title: c.detail }, h("span", { class: "dot " + (c.ok ? "ok" : "warn") }), c.name, h("span", { class: "dim" }, " · " + c.detail))))),
+    shown.map((f) => {
+      const [lc, lw] = POSTURE_LEVEL[f.level] || ["", f.level];
+      return h("div", { class: "attn-row", style: "align-items:flex-start" }, h("span", { class: "tag " + lc, style: "min-width:58px;text-align:center" }, lw),
+        h("div", { class: "grow" }, h("div", {}, f.target_id ? h("a", { class: "nm", href: "#/target/" + f.target_id + "/security" }, f.area) : h("b", {}, f.area), " — ", h("b", {}, f.title)),
+          h("div", { class: "muted small", style: "margin-top:2px" }, f.detail), h("div", { class: "small", style: "margin-top:2px" }, h("b", {}, "Fix: "), f.fix)));
+    }),
+    ps.findings.length > shown.length ? h("div", { class: "dim small", style: "padding-top:8px" }, "+ " + (ps.findings.length - shown.length) + " more in the security assessment report") : null);
+}
 function securityView() {
+  let posture = null, perr = null, at = 0;
+  const top = h("div");
+  const load = () => {
+    at = Date.now();
+    api("GET", "/api/security/posture").then((x) => { posture = x; perr = null; top.replaceChildren(postureBox(posture, perr)); },
+      (e) => { perr = e.message; top.replaceChildren(postureBox(posture, perr)); });
+  };
   return simple("security", () => {
+    // The checks read files and the database: once a minute, not on every refresh.
+    if (Date.now() - at > 60000) load();
+    if (!top.childNodes.length) top.replaceChildren(postureBox(posture, perr));
     const scanned = targets.filter((t) => t.scan);
     return [
-      h("div", { class: "head" }, h("div", { class: "grow" }, h("h1", {}, "Security"), h("p", { class: "sub" }, "Static analysis and dependency audit results for every target.")),
+      h("div", { class: "head" }, h("div", { class: "grow" }, h("h1", {}, "Security"), h("p", { class: "sub" }, "What to improve, worked out from PortalControl's settings and every target's scans, configuration and attacks; then the scan results per target.")),
         btn("Scan all targets", () => targets.filter((t) => !t.scan_running).forEach(doScan), "hl", "shield", { disabled: !targets.length })),
+      top,
       h("div", { class: "grid g-tiles", style: "margin-bottom:18px" },
         tile("Targets scanned", [scanned.length, h("small", {}, " / " + targets.length)]),
         tile("Critical issues", scanned.reduce((n, t) => n + t.scan.critical_issues_found, 0), "high-severity bandit findings", scanned.some((t) => t.scan.critical_issues_found) ? "err" : null),

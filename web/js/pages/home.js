@@ -67,10 +67,56 @@ function attentionPanel(list) {
 }
 const reportLink = (href, label, cls) => h("a", { class: "btn " + (cls || ""), href, download: "", title: "Download a PDF report" }, icon("download"), label);
 
+// A ring split by the state of every target, with a legend.
+const DONUT = [["ok", "Running or deployed"], ["info", "Deploying or checking"], ["warn", "Needs a look"], ["err", "Failing"], ["off", "Stopped or never run"]];
+function stateDonut(list) {
+  const counts = DONUT.map(([c]) => list.filter((t) => tStatus(t).cls === c).length);
+  const total = list.length || 1, r = 15.9155; // circumference 100
+  const color = (c) => "var(--" + (c === "off" ? "muted" : c) + ")";
+  let offset = 25;
+  const arcs = counts.map((n, i) => {
+    if (!n) return null;
+    const len = (n / total) * 100;
+    const arc = s("circle", { cx: "21", cy: "21", r: String(r), fill: "none", stroke: color(DONUT[i][0]), "stroke-width": "5", "stroke-dasharray": len + " " + (100 - len), "stroke-dashoffset": String(offset) });
+    offset -= len;
+    return arc;
+  });
+  return h("div", {},
+    h("div", { class: "chart-h" }, h("b", {}, "Applications by state"), h("span", { class: "dim small" }, "right now")),
+    h("div", { class: "donut-row" },
+      s("svg", { viewBox: "0 0 42 42", class: "donut", role: "img", "aria-label": DONUT.map(([, label], i) => counts[i] + " " + label.toLowerCase()).join(", ") },
+        s("circle", { cx: "21", cy: "21", r: String(r), fill: "none", stroke: "var(--line)", "stroke-width": "5" }), arcs,
+        s("text", { x: "21", y: "24", "text-anchor": "middle", class: "donut-n" }, String(list.length))),
+      h("div", { class: "donut-legend" }, DONUT.map(([c, label], i) => h("div", { class: counts[i] ? null : "dim" }, h("i", { style: "background:" + color(c) }), label, h("b", {}, counts[i]))))));
+}
+
 function dashboardView() {
   let runs = [];
   const def = { key: "dashboard" };
   let c;
+  // The last 24 hours of everything, from the analytics (read once a minute).
+  let an = null, anAt = 0;
+  const loadAn = () => {
+    anAt = Date.now();
+    api("GET", "/api/analytics?range=24h").then((x) => { an = x; if (view.key === def.key && !c.querySelector(".chart:hover")) paint(); }, () => {});
+  };
+  const charts = () => {
+    if (!targets.length) return null;
+    const pts = (k) => (an ? an.series.map((p) => ({ t: p.t, v: p[k] })).filter((p) => p.v !== null && p.v !== undefined) : []);
+    const sm = an && an.summary;
+    const wait = (text) => (an ? text : "Loading…");
+    const o = (extra) => Object.assign({ height: 120, stamp: fmtClock }, extra);
+    return [h("h2", {}, "Last 24 hours", h("a", { href: "#/analytics", class: "dim small", style: "font-weight:400;margin-left:10px" }, "more in Analytics")),
+      h("div", { class: "grid g2 dash-charts" },
+        h("div", { class: "box" }, chartBlock("Availability", sm && sm.availability_pct !== null ? anPct(sm.availability_pct) : "", pts("availability"),
+          o({ max: 100, fmt: (v) => Math.round(v) + "%", note: "health probes answered", empty: wait("No health probes recorded"), label: "Share of health probes answered" }))),
+        h("div", { class: "box" }, chartBlock("Response time", sm && sm.latency_p50 !== null ? fmtMs(sm.latency_p50) : "", pts("latency"),
+          o({ fmt: fmtMs, note: "health checks, averaged", empty: wait("No successful probes"), label: "Health check response time" }))),
+        h("div", { class: "box" }, an ? anTimeline(an) : h("p", { class: "muted" }, "Loading…")),
+        h("div", { class: "box" }, stateDonut(targets)),
+        h("div", { class: "box" }, chartBlock("CPU", "", pts("cpu"), o({ minTop: 1, fmt: fmtPct, note: "all targets, share of all cores", empty: wait("Nothing was running"), label: "CPU of all targets" }))),
+        h("div", { class: "box" }, chartBlock("Memory", "", pts("mem"), o({ fmt: fmtBytes, note: "all targets added up", empty: wait("Nothing was running"), label: "Memory of all targets" }))))];
+  };
   const paint = () => {
     if (!loaded) return c.replaceChildren(h("p", { class: "muted" }, "Loading\u2026"));
     const running = targets.filter((t) => t.running).length;
@@ -85,7 +131,8 @@ function dashboardView() {
     const memPct = hl && sys.host.mem_total ? (hl.mem_used / sys.host.mem_total) * 100 : 0;
     c.replaceChildren(
       h("div", { class: "head" }, h("div", { class: "grow" }, h("h1", {}, "Dashboard"), h("p", { class: "sub" }, "Deployments, health and Git state of every registered project on this machine.")),
-        h("div", { class: "rowf" }, targets.length ? reportLink("/api/reports/overall.pdf", "PDF report") : null, h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target"))),
+        h("div", { class: "rowf" }, targets.length ? [reportLink("/api/reports/overall.pdf", "Status report"), reportLink("/api/reports/security.pdf", "Security report")] : null,
+          h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target"))),
       h("div", { class: "grid g-tiles" },
         tile("Targets", [running, h("small", {}, " / " + targets.length + " running")], targets.filter((t) => t.run_mode === "SERVICE").length + " service(s), " + targets.filter((t) => t.run_mode !== "SERVICE").length + " task(s)"),
         tile("Health", probed.length ? [healthy, h("small", {}, " / " + probed.length + " reachable")] : "-", probed.length ? "probed every 15 s" : "no health URLs configured", probed.length && healthy < probed.length ? "err" : null),
@@ -97,11 +144,12 @@ function dashboardView() {
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "Host CPU"), h("div", { class: "val" }, hl.cpu.toFixed(0), h("small", {}, " %")), h("div", { class: "bar" }, h("i", { style: "width:" + Math.min(100, hl.cpu) + "%" })), h("div", { class: "note" }, sys.host.cpus + " logical cores")),
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "Host memory"), h("div", { class: "val" }, fmtBytes(hl.mem_used), h("small", {}, " / " + fmtBytes(sys.host.mem_total))), h("div", { class: "bar" }, h("i", { style: "width:" + memPct + "%" })), h("div", { class: "note" }, memPct.toFixed(0) + "% in use")),
         h("div", { class: "box tile" }, h("div", { class: "lbl" }, "PortalControl"), h("div", { class: "val" }, fmtBytes(hl.manager_mem)), h("div", { class: "note" }, "manager memory \u00b7 up " + fmtUp(sys.uptime_secs)))) : null,
+      charts(),
       targets.length ? byProject(targets).map(([name, list]) => [
         h("h2", { class: "proj-h" }, h("a", { class: "plink", href: projHref(name) }, name), h("span", { class: "dim small", style: "font-weight:400" }, "  " + list.filter((t) => t.running).length + " of " + list.length + " running"),
           list.some((t) => tStatus(t).cls === "err") ? h("span", { class: "tag err", style: "margin-left:8px" }, list.filter((t) => tStatus(t).cls === "err").length + " failing") : null,
           h("a", { class: "dim small", href: projHref(name), style: "font-weight:400;margin-left:10px" }, "terminals"),
-          h("a", { class: "dim small", href: "/api/reports/project/" + encodeURIComponent(name), download: "", style: "font-weight:400;margin-left:10px", title: "Download this project's PDF report" }, "PDF report")),
+          h("a", { class: "dim small", href: "/api/reports/project/" + encodeURIComponent(name), download: "", style: "font-weight:400;margin-left:10px", title: "Download this project's site report (PDF)" }, "site report")),
         h("div", { class: "grid g-cards" }, list.map(targetCard))])
         : [h("h2", {}, "Projects"), empty("No targets yet", "Point PortalControl at a project folder and its deploy script to get started.", h("a", { class: "btn hl", href: "#/new" }, icon("plus"), "New target"))],
       h("div", { class: "grid g2", style: "margin-top:8px" },
@@ -111,7 +159,12 @@ function dashboardView() {
           h("div", { class: "box" }, activity.length ? activity.slice(0, 8).map((e) => feedRow(e, true)) : h("span", { class: "muted" }, "No activity since the manager started.")))));
   };
   def.build = () => { c = h("div"); paint(); def.update(); return c; };
-  def.update = () => { paint(); api("GET", "/api/runs?limit=6").then((x) => { runs = x; if (view.key === def.key) paint(); }, () => {}); };
+  def.update = () => {
+    // A chart under the pointer is not redrawn, so its tooltip stays.
+    if (!c.querySelector(".chart:hover")) paint();
+    if (Date.now() - anAt > 60000) loadAn();
+    api("GET", "/api/runs?limit=6").then((x) => { runs = x; if (view.key === def.key && !c.querySelector(".chart:hover")) paint(); }, () => {});
+  };
   return def;
 }
 

@@ -344,6 +344,32 @@ pub(super) async fn fs_pyenv(Query(q): Params) -> AppResult {
     Ok(ok(shown))
 }
 
+/// What a target's Git repository setting leads to: `?dir=` (the working
+/// directory) and `?git_dir=` (empty, `auto` or a folder). Nothing is stored.
+pub(super) async fn fs_repo(Query(q): Params) -> AppResult {
+    let dir = q.get("dir").map(|d| d.trim().trim_matches('"').to_string()).unwrap_or_default();
+    if dir.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "dir is required"));
+    }
+    let setting = q.get("git_dir").map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default();
+    let shown = tokio::task::spawn_blocking(move || {
+        let check = if setting.is_empty() { Ok(()) } else { git::check_repo_dir(&dir, &setting) };
+        let path = git::repo_dir_of(&dir, Some(&setting));
+        let info = git::inspect(&path, "main");
+        json!({
+            "path": path.to_string_lossy(),
+            "found": info.is_repo,
+            "branch": info.checked_out_branch,
+            "remote_url": info.remote_url,
+            "head_summary": info.head_summary,
+            "error": check.err(),
+        })
+    })
+    .await
+    .map_err(|e| internal(e.to_string()))?;
+    Ok(ok(shown))
+}
+
 pub(super) async fn fs_port(State(state): State<Arc<AppState>>, Query(q): Params) -> AppResult {
     let Some(port) = q.get("port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0) else {
         return Err(fail(StatusCode::BAD_REQUEST, "port must be a number between 1 and 65535"));

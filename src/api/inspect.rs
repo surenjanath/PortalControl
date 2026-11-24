@@ -26,7 +26,7 @@ pub(super) async fn list_scans(State(state): State<Arc<AppState>>, Path(id): Pat
 
 pub(super) async fn git_refresh(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
-    let info = git::refresh_target(&state, id, t.working_directory, t.git_branch, true).await;
+    let info = git::refresh_target(&state, id, git::repo_dir(&t), t.git_branch, true).await;
     Ok(ok(json!(info)))
 }
 
@@ -41,7 +41,7 @@ pub(super) async fn git_pull(State(state): State<Arc<AppState>>, Path(id): Path<
 pub(super) async fn git_log(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     let commits = tokio::task::spawn_blocking(move || {
-        git::recent_commits(std::path::Path::new(&t.working_directory), &t.git_branch, 30)
+        git::recent_commits(std::path::Path::new(&git::repo_dir(&t)), &t.git_branch, 30)
     })
     .await
     .map_err(|e| internal(e.to_string()))?
@@ -52,7 +52,7 @@ pub(super) async fn git_log(State(state): State<Arc<AppState>>, Path(id): Path<i
 pub(super) async fn git_changes(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     let files = tokio::task::spawn_blocking(move || {
-        git::changed_files(std::path::Path::new(&t.working_directory), 200)
+        git::changed_files(std::path::Path::new(&git::repo_dir(&t)), 200)
     })
     .await
     .map_err(|e| internal(e.to_string()))?
@@ -128,7 +128,7 @@ pub(super) async fn env_files(
 pub(super) async fn git_plan(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> AppResult {
     let t = load_target(&state, id).await?;
     let plan = tokio::task::spawn_blocking(move || {
-        git::pull_plan(std::path::Path::new(&t.working_directory), &t.git_branch)
+        git::pull_plan(std::path::Path::new(&git::repo_dir(&t)), &t.git_branch)
     })
     .await
     .map_err(|e| internal(e.to_string()))?
@@ -145,7 +145,7 @@ pub(super) async fn git_diff(
     let t = load_target(&state, id).await?;
     let path = q.get("path").cloned().unwrap_or_default();
     let diff = tokio::task::spawn_blocking(move || {
-        git::file_diff(std::path::Path::new(&t.working_directory), &t.git_branch, &path)
+        git::file_diff(std::path::Path::new(&git::repo_dir(&t)), &t.git_branch, &path)
     })
     .await
     .map_err(|e| internal(e.to_string()))?
@@ -171,7 +171,7 @@ pub(super) async fn git_discard(
         .join("git-backups")
         .join(id.to_string())
         .join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
-    let dir = t.working_directory.clone();
+    let dir = git::repo_dir(&t);
     let done = tokio::task::spawn_blocking(move || {
         git::discard_changes(std::path::Path::new(&dir), &req.paths, &backup)
     })
@@ -189,7 +189,7 @@ pub(super) async fn git_discard(
             done.backup
         ),
     );
-    git::refresh_target(&state, id, t.working_directory, t.git_branch, false).await;
+    git::refresh_target(&state, id, git::repo_dir(&t), t.git_branch, false).await;
     Ok(ok(json!(done)))
 }
 

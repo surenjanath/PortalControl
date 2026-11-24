@@ -96,6 +96,18 @@ pub(super) fn clean_input(mut t: TargetInput) -> Result<TargetInput, String> {
         }
         _ => None,
     };
+
+    t.git_dir = match t.git_dir.take().map(|s| s.trim().trim_matches('"').to_string()) {
+        Some(s) if s.eq_ignore_ascii_case(git::AUTO) => Some(git::AUTO.to_string()),
+        Some(s) if !s.is_empty() => {
+            if s.chars().count() > 500 {
+                return Err("Git repository: the path is limited to 500 characters".into());
+            }
+            git::check_repo_dir(&t.working_directory, &s).map_err(|e| format!("Git repository: {e}"))?;
+            Some(s)
+        }
+        _ => None,
+    };
     Ok(t)
 }
 
@@ -112,7 +124,7 @@ pub(super) async fn load_target(state: &Arc<AppState>, id: i64) -> Result<Target
 /// new or edited target fills in without waiting for the periodic workers.
 pub(super) fn refresh_in_background(state: &Arc<AppState>, t: &Target) {
     let st = state.clone();
-    let (id, dir, branch) = (t.id, t.working_directory.clone(), t.git_branch.clone());
+    let (id, dir, branch) = (t.id, git::repo_dir(t), t.git_branch.clone());
     tokio::spawn(async move {
         git::refresh_target(&st, id, dir, branch, true).await;
     });
@@ -174,6 +186,7 @@ pub(super) async fn target_view(state: &Arc<AppState>, t: Target, extras: &mut E
         state.restart_queue.lock().map(|q| q.iter().any(|(id, _)| *id == t.id)).unwrap_or(false);
     let scan = extras.scans.remove(&t.id);
     let last_run = extras.last_runs.remove(&t.id);
+    let repo_dir = extras.repo_dirs.remove(&t.id).unwrap_or_else(|| t.working_directory.clone());
 
     let mut v = serde_json::to_value(&t).unwrap_or_else(|_| json!({}));
     v["running"] = json!(running);
@@ -190,6 +203,8 @@ pub(super) async fn target_view(state: &Arc<AppState>, t: Target, extras: &mut E
     v["next_run"] = json!(automation::next_run(t.schedule.as_deref()));
     v["env_count"] = json!(runner::parse_env(&t.env_vars).map(|e| e.len()).unwrap_or(0));
     v["python"] = extras.python.remove(&t.id).unwrap_or(Value::Null);
+    // The folder the Git state is read from (see `git::repo_dir`).
+    v["repo_dir"] = json!(repo_dir);
     v
 }
 
@@ -201,22 +216,27 @@ pub(super) struct Extras {
     pub(super) scans: HashMap<i64, crate::db::ScanReport>,
     pub(super) last_runs: HashMap<i64, crate::db::RunRecord>,
     pub(super) python: HashMap<i64, Value>,
+    pub(super) repo_dirs: HashMap<i64, String>,
 }
 
 pub(super) async fn load_extras(state: &Arc<AppState>, targets: &[Target]) -> Extras {
     let (scans, last_runs) = tokio::join!(state.db.latest_scan_summaries(), state.db.last_runs());
-    // Looking for Python environments touches the disk: off the async threads.
-    let wanted: Vec<(i64, String, Option<String>)> =
-        targets.iter().map(|t| (t.id, t.working_directory.clone(), t.python_env.clone())).collect();
-    let python = tokio::task::spawn_blocking(move || {
-        wanted
-            .into_iter()
-            .map(|(id, dir, env)| (id, pyenv::describe(std::path::Path::new(&dir), env.as_deref())))
-            .collect()
+    // Looking for Python environments and repositories touches the disk: off
+    // the async threads.
+    let wanted: Vec<Target> = targets.to_vec();
+    let (python, repo_dirs) = tokio::task::spawn_blocking(move || {
+        let python = wanted
+            .iter()
+            .map(|t| {
+                (t.id, pyenv::describe(std::path::Path::new(&t.working_directory), t.python_env.as_deref()))
+            })
+            .collect();
+        let repos = wanted.iter().map(|t| (t.id, git::repo_dir(t))).collect();
+        (python, repos)
     })
     .await
     .unwrap_or_default();
-    Extras { scans: scans.unwrap_or_default(), last_runs: last_runs.unwrap_or_default(), python }
+    Extras { scans: scans.unwrap_or_default(), last_runs: last_runs.unwrap_or_default(), python, repo_dirs }
 }
 
 /// The view of one target, for the routes that return a single one.

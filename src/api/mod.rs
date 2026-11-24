@@ -102,6 +102,7 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("js/pages/incidents.js", JS, include_str!("../../web/js/pages/incidents.js")),
     ("js/pages/analytics.js", JS, include_str!("../../web/js/pages/analytics.js")),
     ("js/settings/monitor.js", JS, include_str!("../../web/js/settings/monitor.js")),
+    ("js/settings/reports.js", JS, include_str!("../../web/js/settings/reports.js")),
     ("js/core/app.js", JS, include_str!("../../web/js/core/app.js")),
     ("js/login.js", JS, include_str!("../../web/js/login.js")),
 ];
@@ -167,6 +168,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/git/clone", post(clone))
         .route("/api/incidents", get(incidents_list))
         .route("/api/incidents/{id}/status", post(incident_status))
+        .route("/api/incidents/bulk", post(incidents_bulk))
         .route("/api/incidents/{id}/act", post(incident_act))
         .route("/api/settings/monitor", get(monitor_get).put(monitor_put))
         .route("/api/settings/alerts", get(alerts_get).put(alerts_put))
@@ -189,6 +191,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/system/tools", get(tools_status))
         .route("/api/reports/overall.pdf", get(report_overall))
         .route("/api/reports/project/{name}", get(report_project))
+        .route("/api/reports/security.pdf", get(report_security))
+        .route("/api/security/posture", get(security_posture))
+        .route("/api/settings/reports", get(brand_get).put(brand_put))
+        .route("/api/settings/reports/logo", get(logo_get).put(logo_put).delete(logo_delete))
         .route("/api/system/tools/install", post(tools_install))
         .route("/ws", get(ws_upgrade))
         .route("/assets/{*path}", get(asset))
@@ -203,6 +209,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/list", get(fs_list))
         .route("/api/fs/port", get(fs_port))
         .route("/api/fs/pyenv", get(fs_pyenv))
+        .route("/api/fs/repo", get(fs_repo))
         .route("/api/fs/starter", post(fs_starter))
         .route("/api/projects/{name}/start", post(project_start))
         .route("/api/projects/{name}/stop", post(project_stop))

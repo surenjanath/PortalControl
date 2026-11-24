@@ -42,6 +42,49 @@ pub(super) async fn incident_status(
     Ok(ok(json!({"id": id, "status": status})))
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct BulkRequest {
+    pub(super) ids: Vec<i64>,
+    /// `resolved`, `dismissed`, `open` or `delete`.
+    pub(super) action: String,
+}
+
+/// Change or delete many incidents at once (the Incidents page's selection).
+pub(super) async fn incidents_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BulkRequest>,
+) -> AppResult {
+    let mut ids = req.ids;
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "select at least one incident"));
+    }
+    if ids.len() > 500 {
+        return Err(fail(StatusCode::BAD_REQUEST, "at most 500 incidents at once"));
+    }
+    let (changed, word) = match req.action.as_str() {
+        "delete" => (state.db.delete_incidents(ids).await.map_err(internal)?, "deleted"),
+        "resolved" | "dismissed" | "open" => {
+            let status: &'static str = match req.action.as_str() {
+                "resolved" => "resolved",
+                "dismissed" => "dismissed",
+                _ => "open",
+            };
+            let note = if status == "open" { String::new() } else { format!("Marked {status} in bulk") };
+            (state.db.set_incidents_status(ids, status, note).await.map_err(internal)?, status)
+        }
+        _ => return Err(fail(StatusCode::BAD_REQUEST, "action must be resolved, dismissed, open or delete")),
+    };
+    let msg = match word {
+        "open" => format!("{changed} incident(s) reopened"),
+        _ => format!("{changed} incident(s) {word}"),
+    };
+    state.activity(if word == "deleted" { "warn" } else { "info" }, "ai", None, msg.clone());
+    state.emit(json!({"type": "incident", "bulk": true}));
+    Ok(ok(json!({"changed": changed, "action": req.action, "message": msg})))
+}
+
 /// Carry out the incident's suggested action, now that a person asked for
 /// it. Only the action stored with the incident can run, and only if it is
 /// still on offer for the target.
