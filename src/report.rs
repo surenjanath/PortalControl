@@ -1374,7 +1374,7 @@ fn notable_events(l: &mut Layout, input: &Input, targets: &[&Value]) {
         );
         return;
     }
-    events.sort_by(|a, b| b.0.cmp(&a.0));
+    events.sort_by_key(|e| std::cmp::Reverse(e.0));
     let rows: Vec<Vec<Cell>> = events.into_iter().take(16).map(|(_, row)| row).collect();
     l.table(&[("When", 0.17), ("Application", 0.2), ("Event", 0.25), ("Detail", 0.38)], &rows, 1);
 }
