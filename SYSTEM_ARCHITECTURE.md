@@ -7,8 +7,8 @@ file explains how it *works*.
 
 | | |
 | --- | --- |
-| Document version | 1.9.1 |
-| Application version | 0.14.0 (`Cargo.toml`) |
+| Document version | 1.9.2 |
+| Application version | 0.14.1 (`Cargo.toml`) |
 | Last updated | 2026-11-24 |
 
 ## 1. System Overview
@@ -554,8 +554,9 @@ prepared_by, signatory_title, note}` under the settings key `report_brand` (leng
 checked). Without an organisation name the reports name `report::DEFAULT_ORG`,
 InsightFusionTech. `PUT /api/settings/reports/logo` takes a JPEG (grey or RGB, baseline or
 progressive, at most 1 MB) as the body and writes `report-logo.jpg` to the data folder;
-`GET` returns it and `DELETE` removes it. Settings > Reports converts any picture the
-browser can read to a JPEG on white of at most 900 by 400 pixels before sending it.
+`GET` returns it and `DELETE` removes it. Settings > Reports reads the chosen picture as a `data:` URL (the
+Content-Security-Policy refuses `blob:` images) and converts it to a JPEG on white of at
+most 900 by 400 pixels before sending it.
 
 **Security posture.** `posture::assess` turns facts into findings (high, medium, low),
 each with what was found and what to do, and checks of PortalControl itself. Score: 100
@@ -968,6 +969,7 @@ is committed.
 
 | Document | Application | Date | Changes |
 | --- | --- | --- | --- |
+| 1.9.2 | 0.14.1 | 2026-11-24 | **Fix: no logo could be uploaded.** Settings > Reports loaded the chosen picture from a `blob:` URL, which the dashboard's Content-Security-Policy (`img-src 'self' data:`) refuses, so every file was reported as "not a picture the browser can read". The picture is now read as a `data:` URL (`FileReader`). Checked in Chrome with a transparent PNG and an SVG through the file input. 0.14.0 had been checked by sending a JPEG to the API directly, which missed this. |
 | 1.9.1 | 0.14.0 | 2026-11-24 | Release workflow: an existing release that lacks the Windows or macOS download is built again. v0.14.0 was published with Windows only because GitHub found no macOS runner and cancelled that job; re-runs then skipped because the release existed. CI fix: `sort_by_key` in `report.rs` for clippy 1.100. No code or schema change. |
 | 1.9.0 | 0.14.0 | 2026-11-24 | **Git repository folder** (3.12): new column `portal_targets.git_dir` (empty, `auto`, a folder), `git::repo_dir`, `check_repo_dir`, `GET /api/fs/repo`, `repo_dir` in the target view; every Git operation uses it; Git Source gained the choice with Browse. **Incidents** (3.13): new column `incidents.details` (context, run, signals, history, diagnosis, AI fields, source); new `diagnose.rs` explains incidents without a model and suggests an offered fix; the model's schema gained `key_error`, `steps`, `confidence`; emails carry the key error and steps; `POST /api/incidents/bulk`; the Incidents page gained counts, filters, selection, bulk actions and the details. **Reports** (3.14): the status, site and security reports rebuilt in a certificate layout with less noise; report branding (`report_brand`, `GET`/`PUT /api/settings/reports`) and logo (`report-logo.jpg`, `/api/settings/reports/logo`); Settings > Reports; `pdf.rs` gained Courier, letter spacing, outlined rectangles and JPEG images. **Security**: new `posture.rs`, `GET /api/security/posture`, `GET /api/reports/security.pdf`, CVE ids of vulnerable packages, the posture on the Security page. **Dashboard**: 24-hour charts and a ring of target states; links to the status and security reports. 15 new tests (167). |
 | 1.8.0 | 0.13.0 | 2026-11-16 | **A blocked pull says what blocks it** (section 3.11). `pull_ff` no longer refuses for any local change to a tracked file: it refuses only when a path changed on this computer is also changed by the commits being pulled, and names those paths; other local changes are kept. This also applies to deploy and auto-deploy. New `git::pull_plan`, `file_diff`, `discard_changes` and `GET /api/targets/{id}/git/plan`, `GET …/git/diff?path=`, `POST …/git/discard`; undone changes are first copied to `<data>/git-backups/<target id>/<time>/`. Git Source shows the plan in a sentence, marks each local change, lists the incoming files, and offers Show change, Undo / Remove and "Undo these and pull". **Env files**: `GET /api/targets/{id}/env/files`; the Environment Variables section loads the project's `.env` when nothing is stored, or a chosen file, into its box. Section 6 gained the macOS install that was run over SSH. No schema change. 2 new tests (152). |

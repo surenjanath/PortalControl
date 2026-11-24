@@ -5,25 +5,31 @@
 
 // Any picture the browser can show, as a JPEG on white, at most 900 x 400 px:
 // the PDF writer embeds JPEGs as they are, so no image library is needed.
+// The picture is read as a data: URL: the dashboard's Content-Security-Policy
+// allows images from 'self' and data: only, so a blob: URL would be refused.
 function logoToJpeg(file) {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const nw = img.naturalWidth || 600, nh = img.naturalHeight || 200;
-      const scale = Math.min(1, 900 / nw, 400 / nh);
-      const w = Math.max(1, Math.round(nw * scale)), ht = Math.max(1, Math.round(nh * scale));
-      const c = document.createElement("canvas");
-      c.width = w; c.height = ht;
-      const g = c.getContext("2d");
-      g.fillStyle = "#ffffff"; g.fillRect(0, 0, w, ht);
-      g.drawImage(img, 0, 0, w, ht);
-      URL.revokeObjectURL(url);
-      c.toBlob((b) => (b ? resolve(b) : reject(new Error("The picture could not be converted"))), "image/jpeg", 0.92);
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("This file is not a picture the browser can read")); };
-    img.src = url;
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("The file could not be read"));
+    reader.onload = () => drawLogo(reader.result, resolve, reject);
+    reader.readAsDataURL(file);
   });
+}
+function drawLogo(url, resolve, reject) {
+  const img = new Image();
+  img.onload = () => {
+    const nw = img.naturalWidth || 600, nh = img.naturalHeight || 200;
+    const scale = Math.min(1, 900 / nw, 400 / nh);
+    const w = Math.max(1, Math.round(nw * scale)), ht = Math.max(1, Math.round(nh * scale));
+    const c = document.createElement("canvas");
+    c.width = w; c.height = ht;
+    const g = c.getContext("2d");
+    g.fillStyle = "#ffffff"; g.fillRect(0, 0, w, ht);
+    g.drawImage(img, 0, 0, w, ht);
+    c.toBlob((b) => (b ? resolve(b) : reject(new Error("The picture could not be converted"))), "image/jpeg", 0.92);
+  };
+  img.onerror = () => reject(new Error("This file is not a picture the browser can read"));
+  img.src = url;
 }
 
 SET.reports = () => {
